@@ -1,7 +1,7 @@
 use serde::Serialize;
 use sqlx::Row;
 
-use crate::live::LiveEvent;
+use crate::live::{HubEvent, LiveEvent};
 use crate::state::State;
 
 #[derive(Clone, Serialize)]
@@ -50,13 +50,13 @@ pub async fn record(st: &State, row: &UsageRow) -> Result<(), sqlx::Error> {
         .flatten()
         .and_then(|r| r.try_get::<String, _>("name").ok());
 
-    let user_name = sqlx::query("SELECT name FROM users WHERE id = ?")
+    let user_name = sqlx::query("SELECT username FROM users WHERE id = ?")
         .bind(row.user_id)
         .fetch_optional(&st.pool)
         .await
         .ok()
         .flatten()
-        .and_then(|r| r.try_get::<String, _>("name").ok());
+        .and_then(|r| r.try_get::<String, _>("username").ok());
 
     let event = LiveEvent {
         id,
@@ -72,6 +72,6 @@ pub async fn record(st: &State, row: &UsageRow) -> Result<(), sqlx::Error> {
         streamed: row.streamed,
         created_at: row.created_at.clone(),
     };
-    let _ = st.hub.send(event);
+    let _ = st.hub.send(HubEvent::Usage(event));
     Ok(())
 }

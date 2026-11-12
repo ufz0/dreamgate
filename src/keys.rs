@@ -33,7 +33,7 @@ pub async fn list(AxumState(st): AxumState<State>, caller: Caller) -> Response {
     // An admin sees every key; everyone else sees their own.
     let sql = if caller.role == "admin" {
         "SELECT k.id, k.name, k.key, k.model, k.connection_id, k.enabled, k.rpm_limit, k.token_cap, \
-                k.created_at, c.name AS connection, u.name AS owner, \
+                k.created_at, c.name AS connection, u.username AS owner, \
                 COUNT(r.id) AS requests, COALESCE(SUM(r.total_tokens), 0) AS tokens \
          FROM api_keys k LEFT JOIN usage r ON r.api_key_id = k.id \
          LEFT JOIN connections c ON c.id = k.connection_id \
@@ -41,7 +41,7 @@ pub async fn list(AxumState(st): AxumState<State>, caller: Caller) -> Response {
          GROUP BY k.id ORDER BY tokens DESC"
     } else {
         "SELECT k.id, k.name, k.key, k.model, k.connection_id, k.enabled, k.rpm_limit, k.token_cap, \
-                k.created_at, c.name AS connection, u.name AS owner, \
+                k.created_at, c.name AS connection, u.username AS owner, \
                 COUNT(r.id) AS requests, COALESCE(SUM(r.total_tokens), 0) AS tokens \
          FROM api_keys k LEFT JOIN usage r ON r.api_key_id = k.id \
          LEFT JOIN connections c ON c.id = k.connection_id \

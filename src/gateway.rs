@@ -9,6 +9,7 @@ use serde_json::{json, Value};
 use sqlx::Row;
 
 use crate::api::error;
+use crate::presence::{self, Active};
 use crate::registry::{self, Connection};
 use crate::state::State;
 use crate::tokens;
@@ -98,32 +99,41 @@ async fn enforce_limits(st: &State, key: &KeyInfo) -> Option<Response> {
             ));
         }
     }
-    // The account limit counts the current day only and resets at 00:00 UTC, matching the
-    // UTC text the usage rows are stored as. Checked after the key cap, so a key cannot be
-    // used to work around it.
-    let account = sqlx::query("SELECT name, daily_token_cap FROM users WHERE id = ?")
+    // The account is checked before its limits, because a disabled account cannot use a key at
+    // all. The account limit counts the current day only and resets at 00:00 UTC, matching the
+    // UTC text the usage rows are stored as. It is checked after the key cap, so a key cannot
+    // be used to work around it.
+    let account = sqlx::query("SELECT username, enabled, daily_token_cap FROM users WHERE id = ?")
         .bind(key.user_id)
         .fetch_optional(&st.pool)
         .await
         .ok()
         .flatten();
-    if let Some(account) = account
-        && let Some(cap) = account.get::<Option<i64>, _>("daily_token_cap") {
-        let used = sqlx::query(
-            "SELECT COALESCE(SUM(total_tokens), 0) AS used FROM usage \
-             WHERE user_id = ? AND strftime('%Y-%m-%d', created_at) = date('now')",
-        )
-            .bind(key.user_id)
-            .fetch_one(&st.pool)
-            .await
-            .map(|row| row.get::<i64, _>("used"))
-            .unwrap_or(0);
-        if used >= cap {
+    if let Some(account) = account {
+        if account.get::<i64, _>("enabled") == 0 {
             return Some(error(
-                StatusCode::TOO_MANY_REQUESTS,
-                "token_cap",
-                format!("account '{}' has used its daily token limit of {cap}", account.get::<String, _>("name")),
+                StatusCode::FORBIDDEN,
+                "account_disabled",
+                format!("account '{}' is disabled", account.get::<String, _>("username")),
             ));
+        }
+        if let Some(cap) = account.get::<Option<i64>, _>("daily_token_cap") {
+            let used = sqlx::query(
+                "SELECT COALESCE(SUM(total_tokens), 0) AS used FROM usage \
+                 WHERE user_id = ? AND strftime('%Y-%m-%d', created_at) = date('now')",
+            )
+                .bind(key.user_id)
+                .fetch_one(&st.pool)
+                .await
+                .map(|row| row.get::<i64, _>("used"))
+                .unwrap_or(0);
+            if used >= cap {
+                return Some(error(
+                    StatusCode::TOO_MANY_REQUESTS,
+                    "token_cap",
+                    format!("account '{}' has used its daily token limit of {cap}", account.get::<String, _>("username")),
+                ));
+            }
         }
     }
     None
@@ -147,9 +157,22 @@ fn build_payload(body: &Value, model: &str) -> Value {
     payload
 }
 
+// The text a response part carries. Reasoning models put their thinking in reasoning_content
+// (or reasoning) beside the answer, and it is part of what the model produced, so both count as
+// generated text when the upstream reports no usage.
+const TEXT_PARTS: [&str; 3] = ["content", "reasoning_content", "reasoning"];
+
+fn text_of(part: &Value) -> String {
+    TEXT_PARTS
+        .iter()
+        .filter_map(|key| part.get(key).and_then(Value::as_str))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 // Forwarded bytes go to the client unchanged; this only reads complete SSE lines to
 // count tokens, so upstreams with non-standard stream bodies still work.
-fn scan_line(line: &[u8], content: &mut String, reported: &mut Option<(i64, i64)>) {
+fn scan_line(line: &[u8], generated: &mut String, reported: &mut Option<(i64, i64)>) {
     let Ok(text) = std::str::from_utf8(line) else {
         return;
     };
@@ -170,16 +193,24 @@ fn scan_line(line: &[u8], content: &mut String, reported: &mut Option<(i64, i64)
         }
     }
     for choice in value.get("choices").and_then(Value::as_array).into_iter().flatten() {
-        if let Some(text) = choice.get("delta").and_then(|d| d.get("content")).and_then(Value::as_str) {
-            content.push_str(text);
+        let Some(delta) = choice.get("delta") else {
+            continue;
+        };
+        let text = text_of(delta);
+        if text.is_empty() {
+            continue;
         }
+        if !generated.is_empty() {
+            generated.push(' ');
+        }
+        generated.push_str(&text);
     }
 }
 
-fn drain_buffer(buffer: &mut Vec<u8>, content: &mut String, reported: &mut Option<(i64, i64)>) {
+fn drain_buffer(buffer: &mut Vec<u8>, generated: &mut String, reported: &mut Option<(i64, i64)>) {
     while let Some(index) = buffer.iter().position(|byte| *byte == b'\n') {
         let line: Vec<u8> = buffer.drain(..=index).collect();
-        scan_line(&line[..line.len() - 1], content, reported);
+        scan_line(&line[..line.len() - 1], generated, reported);
     }
 }
 
@@ -189,26 +220,33 @@ async fn record(st: &State, row: &UsageRow) {
     }
 }
 
-fn stream_body(
+// What the stream task still needs after the handler has returned, passed as one value rather
+// than as eight arguments.
+struct StreamContext {
     st: State,
     key: KeyInfo,
     conn: Connection,
+    model: String,
+    present: Active,
+}
+
+fn stream_body(
+    ctx: StreamContext,
     upstream: reqwest::Response,
     started: Instant,
     prompt_tokens: i64,
-    model: String,
 ) -> impl futures_util::Stream<Item = Result<Bytes, BoxError>> {
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, BoxError>>(64);
     tokio::spawn(async move {
         let mut buffer: Vec<u8> = Vec::new();
-        let mut content = String::new();
+        let mut generated = String::new();
         let mut reported: Option<(i64, i64)> = None;
         let mut incoming = upstream.bytes_stream();
         while let Some(chunk) = incoming.next().await {
             match chunk {
                 Ok(bytes) => {
                     buffer.extend_from_slice(&bytes);
-                    drain_buffer(&mut buffer, &mut content, &mut reported);
+                    drain_buffer(&mut buffer, &mut generated, &mut reported);
                     if tx.send(Ok(bytes)).await.is_err() {
                         break; // the client disconnected mid-stream
                     }
@@ -221,13 +259,13 @@ fn stream_body(
         }
         let (prompt, completion, estimated) = match reported {
             Some((p, c)) => (p, c, false),
-            None => (prompt_tokens, tokens::estimate_tokens(&content), true),
+            None => (prompt_tokens, tokens::estimate_tokens(&generated), true),
         };
         let row = UsageRow {
-            api_key_id: key.id,
-            user_id: key.user_id,
-            connection_id: Some(conn.id),
-            model: Some(model),
+            api_key_id: ctx.key.id,
+            user_id: ctx.key.user_id,
+            connection_id: Some(ctx.conn.id),
+            model: Some(ctx.model),
             prompt_tokens: prompt,
             completion_tokens: completion,
             total_tokens: prompt + completion,
@@ -237,9 +275,12 @@ fn stream_body(
             estimated,
             created_at: crate::clock::now(),
         };
-        if let Err(err) = usage::record(&st, &row).await {
+        if let Err(err) = usage::record(&ctx.st, &row).await {
             tracing::warn!("usage record failed: {err}");
         }
+        // Released here rather than when the handler returned, so a stream is still counted
+        // while it is running.
+        drop(ctx.present);
     });
     stream::unfold(rx, |mut rx| async move { rx.recv().await.map(|item| (item, rx)) })
 }
@@ -255,6 +296,9 @@ pub async fn chat_completions(AxumState(st): AxumState<State>, headers: HeaderMa
     if !key.enabled {
         return error(StatusCode::FORBIDDEN, "key_disabled", "this key is disabled");
     }
+    // Counted from here, so a request that is refused by a limit still marks the account as
+    // active; the guard is released when the request finishes, including for a stream.
+    let present = presence::track(&st, key.user_id);
     if let Some(blocked) = enforce_limits(&st, &key).await {
         return blocked;
     }
@@ -296,7 +340,14 @@ pub async fn chat_completions(AxumState(st): AxumState<State>, headers: HeaderMa
             *out.status_mut() = status;
             out.headers_mut().insert(header::CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
             out.headers_mut().insert(header::CACHE_CONTROL, HeaderValue::from_static("no-cache"));
-            *out.body_mut() = Body::from_stream(stream_body(st.clone(), key.clone(), conn.clone(), upstream, started, prompt_tokens, model));
+            let ctx = StreamContext {
+                st: st.clone(),
+                key: key.clone(),
+                conn: conn.clone(),
+                model,
+                present,
+            };
+            *out.body_mut() = Body::from_stream(stream_body(ctx, upstream, started, prompt_tokens));
             return out;
         }
 
@@ -314,8 +365,10 @@ pub async fn chat_completions(AxumState(st): AxumState<State>, headers: HeaderMa
             .and_then(|value| value.get("choices").and_then(Value::as_array))
             .into_iter()
             .flatten()
-            .filter_map(|choice| choice.get("message").and_then(|m| m.get("content")).and_then(Value::as_str))
-            .collect::<String>();
+            .filter_map(|choice| choice.get("message").map(text_of))
+            .filter(|text| !text.is_empty())
+            .collect::<Vec<_>>()
+            .join(" ");
         let (prompt, completion) = match block {
             Some(block) => (
                 block.get("prompt_tokens").and_then(Value::as_i64).unwrap_or(prompt_tokens),

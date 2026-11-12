@@ -1,16 +1,17 @@
 use std::str::FromStr;
 
 use sqlx::Row;
-use sqlx::sqlite::{SqliteConnectOptions, SqlitePool, SqlitePoolOptions};
+use sqlx::sqlite::{Sqlite, SqliteConnectOptions, SqlitePool, SqlitePoolOptions};
+use sqlx::Executor;
 
 pub const SCHEMA: &[&str] = &[
     "CREATE TABLE IF NOT EXISTS users (
         id INTEGER PRIMARY KEY,
-        email TEXT NOT NULL UNIQUE,
-        name TEXT NOT NULL,
+        username TEXT NOT NULL UNIQUE,
         password_hash TEXT NOT NULL,
         role TEXT NOT NULL DEFAULT 'user',
         daily_token_cap INTEGER,
+        enabled INTEGER NOT NULL DEFAULT 1,
         created_at TEXT NOT NULL
     )",
     "CREATE TABLE IF NOT EXISTS sessions (
@@ -57,10 +58,26 @@ pub const SCHEMA: &[&str] = &[
         estimated INTEGER NOT NULL DEFAULT 0,
         created_at TEXT NOT NULL
     )",
+    "CREATE TABLE IF NOT EXISTS settings (
+        key TEXT PRIMARY KEY,
+        value TEXT NOT NULL
+    )",
     "CREATE INDEX IF NOT EXISTS idx_usage_created ON usage (created_at)",
     "CREATE INDEX IF NOT EXISTS idx_usage_key ON usage (api_key_id)",
     "CREATE INDEX IF NOT EXISTS idx_usage_user ON usage (user_id)",
 ];
+
+async fn has_column<'e, E>(db: E, column: &str) -> Result<bool, sqlx::Error>
+where
+    E: Executor<'e, Database = Sqlite>,
+{
+    let count = sqlx::query("SELECT COUNT(*) AS n FROM pragma_table_info('users') WHERE name = ?")
+        .bind(column)
+        .fetch_one(db)
+        .await?
+        .get::<i64, _>("n");
+    Ok(count > 0)
+}
 
 pub async fn connect(url: &str) -> Result<SqlitePool, sqlx::Error> {
     let options = SqliteConnectOptions::from_str(url)?.create_if_missing(true);
@@ -71,24 +88,77 @@ pub async fn connect(url: &str) -> Result<SqlitePool, sqlx::Error> {
     for statement in SCHEMA {
         sqlx::query(*statement).execute(&pool).await?;
     }
-    // The account limit counts one day, so the column is named for that. A database created
-    // when it was a lifetime cap has it under the old name, and the values still apply.
-    let current = sqlx::query("SELECT COUNT(*) AS n FROM pragma_table_info('users') WHERE name = 'daily_token_cap'")
-        .fetch_one(&pool)
-        .await?
-        .get::<i64, _>("n");
-    if current == 0 {
-        let legacy = sqlx::query("SELECT COUNT(*) AS n FROM pragma_table_info('users') WHERE name = 'token_cap'")
-            .fetch_one(&pool)
-            .await?
-            .get::<i64, _>("n");
-        let statement = if legacy > 0 {
+    migrate(&pool).await?;
+    sqlx::query("PRAGMA journal_mode = WAL").execute(&pool).await?;
+    Ok(pool)
+}
+
+// Accounts are identified by a username now, and the account limit counts one day. A database
+// created before either change is moved to the current columns; the values already stored still
+// apply to the accounts that were created under the old names.
+pub async fn migrate(pool: &SqlitePool) -> Result<(), sqlx::Error> {
+    // An email with a UNIQUE constraint cannot be dropped, so a table that still has one is
+    // rebuilt in the current shape.
+    if has_column(pool, "email").await? {
+        return rebuild_accounts(pool).await;
+    }
+    if !has_column(pool, "daily_token_cap").await? {
+        let statement = if has_column(pool, "token_cap").await? {
             "ALTER TABLE users RENAME COLUMN token_cap TO daily_token_cap"
         } else {
             "ALTER TABLE users ADD COLUMN daily_token_cap INTEGER"
         };
-        sqlx::query(statement).execute(&pool).await?;
+        sqlx::query(statement).execute(pool).await?;
     }
-    sqlx::query("PRAGMA journal_mode = WAL").execute(&pool).await?;
-    Ok(pool)
+    // A database created with a display name keeps it as the username, which keeps the existing
+    // accounts and their sessions working; the email address is dropped with it.
+    if !has_column(pool, "username").await? {
+        let statement = if has_column(pool, "name").await? {
+            "ALTER TABLE users RENAME COLUMN name TO username"
+        } else {
+            "ALTER TABLE users ADD COLUMN username TEXT NOT NULL DEFAULT ''"
+        };
+        sqlx::query(statement).execute(pool).await?;
+    }
+    if has_column(pool, "email").await? {
+        sqlx::query("ALTER TABLE users DROP COLUMN email").execute(pool).await?;
+    }
+    if !has_column(pool, "enabled").await? {
+        sqlx::query("ALTER TABLE users ADD COLUMN enabled INTEGER NOT NULL DEFAULT 1").execute(pool).await?;
+    }
+    Ok(())
+}
+
+// Foreign keys are switched off for the copy because dropping the table the sessions, keys and
+// usage rows point at takes them with it; the account rows keep their ids, so those references
+// still resolve against the rebuilt table.
+async fn rebuild_accounts(pool: &SqlitePool) -> Result<(), sqlx::Error> {
+    let mut conn = pool.acquire().await?;
+    let source_name = if has_column(conn.as_mut(), "name").await? { "name" } else { "username" };
+    let source_cap = if has_column(conn.as_mut(), "token_cap").await? { "token_cap" } else { "daily_token_cap" };
+    sqlx::query("PRAGMA foreign_keys = OFF").execute(conn.as_mut()).await?;
+    sqlx::query(
+        "CREATE TABLE users_new (
+            id INTEGER PRIMARY KEY,
+            username TEXT NOT NULL UNIQUE,
+            password_hash TEXT NOT NULL,
+            role TEXT NOT NULL DEFAULT 'user',
+            daily_token_cap INTEGER,
+            enabled INTEGER NOT NULL DEFAULT 1,
+            created_at TEXT NOT NULL
+        )",
+    )
+    .execute(conn.as_mut())
+    .await?;
+    let copy = format!(
+        "INSERT INTO users_new (id, username, password_hash, role, daily_token_cap, enabled, created_at) \
+         SELECT id, {source_name}, password_hash, role, {source_cap}, 1, created_at FROM users"
+    );
+    sqlx::query(sqlx::AssertSqlSafe(copy.as_str())).execute(conn.as_mut()).await?;
+    sqlx::query("DROP TABLE users").execute(conn.as_mut()).await?;
+    sqlx::query("ALTER TABLE users_new RENAME TO users").execute(conn.as_mut()).await?;
+    // The rest of the application relies on ON DELETE CASCADE, so this connection goes back with
+    // foreign keys on.
+    sqlx::query("PRAGMA foreign_keys = ON").execute(conn.as_mut()).await?;
+    Ok(())
 }

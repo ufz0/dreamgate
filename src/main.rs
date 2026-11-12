@@ -18,16 +18,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         pool,
         http: reqwest::Client::builder().timeout(std::time::Duration::from_secs(120)).build()?,
         hub: live::hub(),
+        presence: Default::default(),
     };
 
     tokio::spawn(registry::health_checker(st.clone()));
 
-    let addr = std::env::var("DREAMGATE_ADDR").unwrap_or_else(|_| "127.0.0.1:8787".to_string());
-    println!("DreamGate listening on http://{addr}");
-    println!("  gateway:   POST /v1/chat/completions (OpenAI compatible)");
-    println!("  dashboard: http://{addr}/");
-
+    let addr = std::env::var("DREAMGATE_ADDR").unwrap_or_else(|_| "0.0.0.0:8787".to_string());
     let listener = tokio::net::TcpListener::bind(&addr).await?;
+    let bound = listener.local_addr()?;
+    println!("DreamGate listening on {bound}");
+    println!("  gateway:   POST /v1/chat/completions (OpenAI compatible)");
+    println!("  dashboard: http://127.0.0.1:{}/", bound.port());
+
     axum::serve(listener, build_router(st)).await?;
     Ok(())
 }

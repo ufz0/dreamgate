@@ -13,15 +13,15 @@
   <div>
     <h1>DreamGate</h1>
     <p>One key in front of any OpenAI-compatible endpoint. Everything that crosses it is counted, per key and per account.</p>
-    <p class="note">The first account to register becomes the admin.</p>
+    <p class="note" id="first-account-note">The first account to register becomes the admin.</p>
   </div>
   <form class="entry-form" id="auth-form">
     <div class="switch" role="group" aria-label="Account">
       <button type="button" id="mode-register" aria-pressed="true">Register</button>
       <button type="button" id="mode-login" aria-pressed="false">Sign in</button>
     </div>
-    <label id="name-field">Name<input name="name" autocomplete="name" required></label>
-    <label>Email<input name="email" type="email" autocomplete="email" required></label>
+    <p class="note" id="register-note" hidden>Self-registration is closed, so an admin has to open it before a new account can be made.</p>
+    <label>Username<input name="username" autocomplete="username" required></label>
     <label>Password<input name="password" type="password" minlength="8" required></label>
     <button type="submit" id="auth-submit">Register</button>
     <p class="notice" id="auth-error" role="status"></p>
@@ -43,6 +43,7 @@
       <a href="#/keys" data-view="keys"><span class="icon" data-icon="keys"></span><span>Keys</span><span class="count" id="count-keys"></span></a>
       <a href="#/connections" data-view="connections"><span class="icon" data-icon="connections"></span><span>Connections</span><span class="count" id="count-connections"></span><span class="count danger" id="count-connections-down"></span></a>
       <a href="#/connect" data-view="connect"><span class="icon" data-icon="client"></span><span>Connect a client</span></a>
+      <a href="#/sandbox" data-view="sandbox"><span class="icon" data-icon="sandbox"></span><span>Sandbox</span></a>
       <a href="#/accounts" data-view="accounts" id="nav-accounts"><span class="icon" data-icon="accounts"></span><span>Accounts</span></a>
     </nav>
     <div class="sidebar-foot">
@@ -77,6 +78,10 @@
 
         <dl class="panel" id="support"></dl>
         <p class="note">Times and the today figures count the UTC day, which is when a daily account limit resets.</p>
+
+        <h2>Right now</h2>
+        <dl class="panel" id="presence"></dl>
+        <p class="note">Online means a request came through the gateway from that account in the last five minutes. Generating means one is in flight now. This clears when the gateway is restarted.</p>
 
         <h2>Token rate, last 24 hours</h2>
         <div class="chart" id="chart-hourly"></div>
@@ -185,12 +190,42 @@
         <p class="note">The health endpoint answers <code>ok</code> without a key, which is what a health probe checks.</p>
       </section>
 
+      <section class="view" data-view="sandbox" hidden>
+        <h1>Sandbox</h1>
+        <p class="lede">Chat with any model a connection serves, through the same gateway the clients use, so what happens here is counted the same way.</p>
+        <div class="field">
+          <span>Key</span>
+          <p class="help">The key decides which connection is used. A key that pins a model always uses that one.</p>
+          <div class="menu-wrap" id="sandbox-key-menu"></div>
+        </div>
+        <div class="field">
+          <span>Model</span>
+          <p class="help">Taken from the model list of the connection this key resolves to.</p>
+          <div class="menu-wrap" id="sandbox-model-menu"></div>
+          <p class="note" id="sandbox-model-note" hidden></p>
+        </div>
+        <ul class="transcript" id="transcript" aria-live="polite"></ul>
+        <form id="chat-form">
+          <label class="field">Message<textarea name="message" rows="3" placeholder="Ask something"></textarea></label>
+          <p class="value-line">
+            <button type="submit" id="chat-send">Send</button>
+            <button type="button" class="secondary" id="chat-clear">Clear chat</button>
+          </p>
+        </form>
+        <p class="note">The conversation is kept in this page only. It is not written to the request history beyond the usual usage rows.</p>
+      </section>
+
       <section class="view" data-view="accounts" hidden>
         <h1>Accounts</h1>
-        <p class="lede">The account limit counts what an account used today and resets at 00:00 UTC. A key can have its own cap, which does not reset; the account limit applies on top of it.</p>
+        <p class="lede">An admin can rename an account, set a new password, disable it, or delete it. The daily limit counts what an account used today and resets at 00:00 UTC; a key can have its own cap, which does not reset, and the account limit applies on top of it. Disabling signs the account out and its keys stop working, and deleting takes the account, its keys and everything recorded for it. The account you are signed in with cannot be deleted.</p>
+        <div class="field" id="registration-field" hidden>
+          <span>Self-registration</span>
+          <p class="help">Closed as soon as the first account exists. While it is open, anyone can register; the first account to register is the admin.</p>
+          <div class="menu-wrap" id="registration-menu"></div>
+        </div>
         <div class="table">
           <table id="accounts">
-            <thead><tr><th>Account</th><th>Daily limit</th><th>Used today</th><th>Requests</th><th>Tokens</th></tr></thead>
+            <thead><tr><th>Account</th><th>Daily limit</th><th>Used today</th><th>Requests</th><th>Tokens</th><th></th></tr></thead>
             <tbody id="accounts-body"></tbody>
           </table>
         </div>

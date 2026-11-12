@@ -105,13 +105,13 @@ async fn grouped(st: &State, scoped: bool, user_id: i64, sql: &str) -> Result<Ve
 
 // Accounts with no usage still appear, because that is where an admin sets a limit. The day
 // figure is what a daily limit is measured against, so it is reported next to it. Ordered by
-// name rather than by usage so a new account is never pushed off the page it is set on.
+// username rather than by usage so a new account is never pushed off the page it is set on.
 async fn accounts(st: &State) -> Result<Vec<serde_json::Value>, sqlx::Error> {
     let rows = sqlx::query(
-        "SELECT u.id, u.name, u.email, u.daily_token_cap, COUNT(r.id) AS requests, \
+        "SELECT u.id, u.username, u.enabled, u.daily_token_cap, COUNT(r.id) AS requests, \
                 COALESCE(SUM(r.total_tokens), 0) AS tokens, \
                 COALESCE(SUM(CASE WHEN strftime('%Y-%m-%d', r.created_at) = date('now') THEN r.total_tokens ELSE 0 END), 0) AS used_today \
-         FROM users u LEFT JOIN usage r ON r.user_id = u.id GROUP BY u.id ORDER BY u.name LIMIT 20",
+         FROM users u LEFT JOIN usage r ON r.user_id = u.id GROUP BY u.id ORDER BY u.username LIMIT 20",
     )
     .fetch_all(&st.pool)
     .await?;
@@ -120,8 +120,8 @@ async fn accounts(st: &State) -> Result<Vec<serde_json::Value>, sqlx::Error> {
         .map(|row| {
             json!({
                 "id": row.get::<i64, _>("id"),
-                "name": row.get::<String, _>("name"),
-                "email": row.get::<String, _>("email"),
+                "username": row.get::<String, _>("username"),
+                "enabled": row.get::<i64, _>("enabled") != 0,
                 "daily_token_cap": row.get::<Option<i64>, _>("daily_token_cap"),
                 "requests": row.get::<i64, _>("requests"),
                 "tokens": row.get::<i64, _>("tokens"),
@@ -171,7 +171,7 @@ pub async fn summary(AxumState(st): AxumState<State>, caller: Caller) -> Respons
 pub async fn recent(AxumState(st): AxumState<State>, caller: Caller) -> Response {
     let scoped = caller.role != "admin";
     let sql = format!(
-        "SELECT r.id, k.name AS key_name, u.name AS user_name, r.model, r.prompt_tokens, \
+        "SELECT r.id, k.name AS key_name, u.username AS user_name, r.model, r.prompt_tokens, \
                 r.completion_tokens, r.total_tokens, r.latency_ms, r.status, r.streamed, r.created_at \
          FROM usage r JOIN api_keys k ON k.id = r.api_key_id JOIN users u ON u.id = r.user_id \
          {scope} ORDER BY r.id DESC LIMIT 50",

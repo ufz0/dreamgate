@@ -250,6 +250,39 @@ main { max-width: 48rem; margin: 0 auto; padding: 12px 20px 64px; width: 100%; }
 .feed li .tokens { color: var(--text); text-align: right; }
 .feed li.arrived { background: var(--bg-raised); border-radius: var(--radius-sm); }
 
+/* Transcript — the Sandbox conversation. Speakers are named, and the accent marks which side
+   of the exchange is yours; model answers keep their line breaks. */
+
+.transcript { list-style: none; margin: 0 0 20px; padding: 0; }
+
+.transcript li { border-top: 1px solid var(--border); padding: 12px 0; }
+
+.transcript .who { display: block; font-size: 13px; color: var(--text-muted); margin-bottom: 4px; }
+.transcript .user .who { color: var(--accent); }
+
+.transcript p {
+  margin: 0;
+  font-size: 14px;
+  line-height: 1.6;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.transcript .empty { color: var(--text-muted); font-size: 13px; }
+
+/* A reasoning section is the model's own working, not its answer, so it reads quieter and
+   separate from the reply. It stays hidden until an upstream streams any. */
+.transcript .reasoning {
+  margin: 0 0 10px;
+  padding: 10px 12px;
+  background: var(--bg-subtle);
+  border-left: 2px solid var(--border);
+  border-radius: var(--radius-md);
+}
+
+.transcript .reasoning .label { display: block; font-size: 13px; color: var(--text-muted); margin-bottom: 4px; }
+.transcript .reasoning p { font-size: 13px; color: var(--text-muted); }
+
 /* Tables */
 
 .table { overflow-x: auto; }
@@ -362,11 +395,11 @@ td .clamp { max-width: 240px; overflow: hidden; text-overflow: ellipsis; white-s
 /* Forms: one column, labels above fields */
 
 .field { display: grid; gap: 6px; margin-bottom: 16px; font-size: 14px; }
-.field input, .field select { width: 100%; }
+.field input, .field select, .field textarea { width: 100%; }
 /* A menu inside a field has to be as wide as the fields around it. */
 .field .menu-wrap, .field .menu-button { width: 100%; }
 
-input, select {
+input, select, textarea {
   background: var(--surface);
   border: 1px solid var(--border);
   border-radius: var(--radius-sm);
@@ -428,6 +461,9 @@ button.secondary:hover { background: var(--bg-hover); }
 
 .inline-field { display: flex; align-items: center; gap: 8px; }
 .inline-field input { width: 110px; }
+/* An account row applies one field at a time, so a row can hold two of these. */
+.stack { display: grid; gap: 6px; }
+.stack .inline-field input { width: 150px; }
 
 /* Collapsed detail */
 
@@ -465,7 +501,7 @@ dialog h2 { margin: 0 0 8px; font-size: 16px; }
 dialog p { margin: 0 0 16px; color: var(--text-muted); font-size: 14px; }
 dialog .actions { display: flex; gap: 10px; justify-content: flex-end; }
 
-input:focus-visible, select:focus-visible, button:focus-visible, a:focus-visible, .expand:focus-visible {
+input:focus-visible, select:focus-visible, textarea:focus-visible, button:focus-visible, a:focus-visible, .expand:focus-visible {
   outline: 2px solid var(--accent);
   outline-offset: 2px;
 }

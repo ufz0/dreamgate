@@ -1,5 +1,5 @@
 use axum::body::{Body, Bytes};
-use axum::extract::State as AxumState;
+use axum::extract::{State as AxumState};
 use axum::http::{header, HeaderValue};
 use axum::response::{IntoResponse, Response};
 use futures_util::{stream, StreamExt};
@@ -8,10 +8,17 @@ use serde_json::json;
 use tokio::sync::broadcast;
 
 use crate::auth::Caller;
+use crate::presence::PresenceEvent;
 use crate::state::{Hub, State};
 use crate::stats;
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
+
+#[derive(Clone, Serialize)]
+pub enum HubEvent {
+    Usage(LiveEvent),
+    Presence(PresenceEvent),
+}
 
 #[derive(Clone, Serialize)]
 pub struct LiveEvent {
@@ -41,17 +48,25 @@ pub async fn stream_events(AxumState(st): AxumState<State>, caller: Caller) -> R
     let receiver = st.hub.subscribe();
 
     let body = stream::once(async move { Ok::<_, BoxError>(Bytes::from(format!("data: {snapshot}\n\n"))) }).chain(
-        stream::unfold(receiver, move |mut receiver| {
-            async move {
+        stream::unfold(receiver, move |mut receiver| async move {
+            loop {
                 let event = match receiver.recv().await {
                     Ok(event) => event,
                     Err(_) => return None,
                 };
-                if scoped && event.user_id != user_id {
-                    return None;
+                // Presence is a count, so it goes to everyone; usage is scoped to the account
+                // that owns it. Skipping an event must not end the stream for the client.
+                match &event {
+                    HubEvent::Usage(usage) if scoped && usage.user_id != user_id => continue,
+                    HubEvent::Usage(usage) => {
+                        let payload = json!({ "type": "usage", "event": usage }).to_string();
+                        return Some((Ok::<_, BoxError>(Bytes::from(format!("data: {payload}\n\n"))), receiver));
+                    }
+                    HubEvent::Presence(presence) => {
+                        let payload = json!({ "type": "presence", "presence": presence }).to_string();
+                        return Some((Ok::<_, BoxError>(Bytes::from(format!("data: {payload}\n\n"))), receiver));
+                    }
                 }
-                let payload = json!({ "type": "usage", "event": event }).to_string();
-                Some((Ok::<_, BoxError>(Bytes::from(format!("data: {payload}\n\n"))), receiver))
             }
         }),
     );

@@ -13,6 +13,7 @@ const ICONS = {
   connections: '<path d="M9 3v5M15 3v5M8 8h8v6a4 4 0 0 1-8 0z"/>',
   client: '<path d="M9 7l-5 5 5 5M15 7l5 5-5 5"/>',
   accounts: '<circle cx="12" cy="9" r="4"/><path d="M4 20a8 8 0 0 1 16 0"/>',
+  sandbox: '<path d="M4 5h16v11H9l-5 4z"/><path d="M8 10h8"/>',
   check: '<circle cx="12" cy="12" r="9"/><path d="M8.5 12.5l2.5 2.5 5-5"/>',
   alert: '<path d="M12 4l8 14H4z"/><path d="M12 9v4"/>',
   chevron: '<path d="M9 6l6 6-6 6"/>',
@@ -40,9 +41,18 @@ const state = {
   view: 'overview',
   connectKey: null,
   theme: 'system',
+  // The entry screen falls back to offering Register when the setting could not be read, so a
+  // first account is never blocked by a failed request.
+  settings: { open_registration: true, has_accounts: false },
+  presence: { online: 0, generating: 0, users: [] },
+  chat: [],
+  models: [],
+  modelNote: '',
+  sandboxKey: null,
+  sandboxModel: null,
 };
 
-const VIEWS = ['overview', 'activity', 'keys', 'connections', 'connect', 'accounts'];
+const VIEWS = ['overview', 'activity', 'keys', 'connections', 'connect', 'sandbox', 'accounts'];
 
 async function api(path, init) {
   const response = await fetch(path, { credentials: 'same-origin', ...init });
@@ -112,6 +122,12 @@ function chooseOption(option) {
     state.connectKey = option.dataset.value;
     renderConnect();
   }
+  if (wrap.dataset.name === 'sandbox-key') {
+    state.sandboxKey = option.dataset.value;
+    loadModels().then(() => renderSandbox());
+  }
+  if (wrap.dataset.name === 'sandbox-model') state.sandboxModel = option.dataset.value;
+  if (wrap.dataset.name === 'registration') setRegistration(option.dataset.value === 'open');
 }
 
 // Views
@@ -122,6 +138,7 @@ const RENDER = {
   keys: renderKeys,
   connections: renderConnections,
   connect: renderConnect,
+  sandbox: renderSandbox,
   accounts: renderAccounts,
 };
 
@@ -142,6 +159,9 @@ function route() {
   }
   for (const view of document.querySelectorAll('.view')) view.hidden = view.dataset.view !== state.view;
   render(false);
+  // A model list comes from the upstream, so it is read when the Sandbox is opened rather than
+  // on every page load.
+  if (state.view === 'sandbox' && !state.models.length && state.keys.length) loadModels().then(() => renderSandbox());
 }
 
 function render(arrived) {
@@ -163,14 +183,20 @@ function renderNav() {
 // Data
 
 async function load() {
+  state.settings = await api('/api/settings');
   state.summary = await api('/api/stats/summary');
   state.keys = (await api('/api/keys')).keys;
   state.connections = (await api('/api/connections')).connections;
   state.events = (await api('/api/stats/recent')).events;
+  await refreshPresence();
   buildAxes();
   showShell();
   route();
   subscribe();
+}
+
+async function refreshPresence() {
+  state.presence = await api('/api/presence');
 }
 
 async function refresh(path) {
@@ -187,6 +213,11 @@ function subscribe() {
     const payload = JSON.parse(message.data);
     if (payload.type === 'snapshot') {
       state.summary.totals = payload.totals;
+      render(false);
+      return;
+    }
+    if (payload.type === 'presence') {
+      state.presence = payload.presence;
       render(false);
       return;
     }
@@ -309,6 +340,7 @@ function empty(message) {
 function renderOverview(arrived) {
   renderGate();
   renderReadout();
+  renderPresence();
   renderCharts();
   renderFeed(arrived);
 }
@@ -361,6 +393,22 @@ function renderReadout() {
     ['Errors (status 400 or worse)', nf.format(t.errors || 0)],
   ];
   $('support').innerHTML = rows
+    .map(([label, value]) => `<div class="row"><dt>${esc(label)}</dt><dd>${esc(value)}</dd></div>`)
+    .join('');
+}
+
+// Presence is a live count, so it comes from the hub rather than from stored rows.
+function renderPresence() {
+  const present = state.presence;
+  const rows = [
+    ['Online accounts', present.online ? nf.format(present.online) : 'none'],
+    ['Generating now', present.generating ? nf.format(present.generating) : 'none'],
+  ];
+  // Names are scoped like the rest of the stats: the endpoint only returns them to an admin.
+  if (state.me.role === 'admin') {
+    for (const user of present.users) rows.push([user.username, 'generating']);
+  }
+  $('presence').innerHTML = rows
     .map(([label, value]) => `<div class="row"><dt>${esc(label)}</dt><dd>${esc(value)}</dd></div>`)
     .join('');
 }
@@ -509,28 +557,230 @@ function renderConnect() {
   $('connect-copy').disabled = !key;
 }
 
+// Sandbox. Chat through the same gateway a client uses, so the key is sent as the Bearer
+// token and the request is counted like any other. The conversation itself stays in this page.
+
+async function loadModels() {
+  const key = state.sandboxKey || state.keys[0]?.key;
+  state.models = [];
+  state.modelNote = '';
+  if (!key) {
+    state.modelNote = 'Create a key first. The Sandbox sends it as the Bearer token.';
+    return;
+  }
+  try {
+    const data = await api('/v1/models', { headers: { authorization: `Bearer ${key}` } });
+    state.models = (data.data ?? []).map((model) => model.id);
+    if (!state.models.length) state.modelNote = 'That connection did not list any models. Check it on the Connections page.';
+  } catch (err) {
+    state.modelNote = String(err?.message || 'The model list could not be read.');
+  }
+}
+
+function renderSandbox() {
+  const key = state.keys.find((k) => k.key === state.sandboxKey) || state.keys[0];
+  state.sandboxKey = key ? key.key : '';
+  renderMenu(
+    $('sandbox-key-menu'),
+    'sandbox-key',
+    state.keys.length ? state.keys.map((k) => ({ value: k.key, label: k.name })) : [{ value: '', label: 'no key yet' }],
+    state.sandboxKey,
+    'Key',
+  );
+
+  const options = state.models.length ? state.models.map((id) => ({ value: id, label: id })) : [{ value: '', label: 'no model available' }];
+  if (!options.some((o) => o.value === state.sandboxModel)) state.sandboxModel = options[0].value;
+  renderMenu($('sandbox-model-menu'), 'sandbox-model', options, state.sandboxModel, 'Model');
+
+  const note = $('sandbox-model-note');
+  note.textContent = state.modelNote;
+  note.hidden = !state.modelNote;
+
+  renderTranscript();
+  $('chat-send').disabled = !state.sandboxKey || !state.sandboxModel;
+}
+
+// A turn is the speaker line, then the reasoning the model streamed as its own section, then the
+// answer. Reasoning is kept apart because it is the model's working, not what it is saying to you.
+function turnHtml(turn) {
+  const name = turn.role === 'user' ? 'You' : esc(turn.model || 'model');
+  const reasoning = turn.role === 'assistant'
+    ? `<div class="reasoning"${turn.reasoning ? '' : ' hidden'}><span class="label">Reasoning</span><p>${esc(turn.reasoning || '')}</p></div>`
+    : '';
+  return `<li class="turn ${turn.role}"><span class="who">${name}</span>${reasoning}<p class="answer">${esc(turn.content)}</p></li>`;
+}
+
+function renderTranscript() {
+  const list = $('transcript');
+  list.innerHTML = state.chat.length
+    // Each turn keeps the model that answered it, so a later change of model does not
+    // relabel an earlier answer.
+    ? state.chat.map(turnHtml).join('')
+    : '<li class="turn empty">Nothing said yet. Pick a key and a model, then ask something.</li>';
+}
+
+async function sendChat(text) {
+  const key = state.sandboxKey;
+  const model = state.sandboxModel;
+  if (!key || !model) {
+    notice('Pick a key and a model first.', 'error');
+    return;
+  }
+  state.chat.push({ role: 'user', content: text });
+  const turn = { role: 'assistant', content: '', reasoning: '', model };
+  state.chat.push(turn);
+
+  // Read the stream the way a client would: complete SSE lines, keeping the answer as it
+  // arrives. A non-streaming answer still works because the body falls back to JSON. The last
+  // turn is this one, so it is looked up again on each paint rather than held.
+  const paint = () => {
+    const row = $('transcript').lastElementChild;
+    if (!row) return;
+    const section = row.querySelector('.reasoning');
+    if (section) {
+      section.hidden = !turn.reasoning;
+      section.querySelector('p').textContent = turn.reasoning;
+    }
+    const answer = row.querySelector('.answer');
+    if (answer) answer.textContent = turn.content;
+  };
+  renderTranscript();
+  $('chat-send').disabled = true;
+  try {
+    const response = await fetch('/v1/chat/completions', {
+      method: 'POST',
+      credentials: 'same-origin',
+      headers: { authorization: `Bearer ${key}`, 'content-type': 'application/json' },
+      body: JSON.stringify({ model, stream: true, messages: state.chat.map(({ role, content }) => ({ role, content })) }),
+    });
+    if (!response.ok) {
+      const body = await response.json().catch(() => ({}));
+      turn.content = body?.error?.message || `The gateway answered ${response.status}.`;
+    } else if ((response.headers.get('content-type') || '').includes('text/event-stream')) {
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = '';
+      let finished = false;
+      while (!finished) {
+        const chunk = await reader.read();
+        if (chunk.done) break;
+        buffer += decoder.decode(chunk.value, { stream: true });
+        for (;;) {
+          const index = buffer.indexOf('\n');
+          if (index === -1) break;
+          const line = buffer.slice(0, index).trim();
+          buffer = buffer.slice(index + 1);
+          if (!line.startsWith('data:')) continue;
+          const data = line.slice(5).trim();
+          if (data === '[DONE]') {
+            finished = true;
+            break;
+          }
+          let value;
+          try {
+            value = JSON.parse(data);
+          } catch {
+            continue; // an upstream line we cannot read is skipped, not fatal
+          }
+          const delta = value.choices?.[0]?.delta;
+          if (!delta) continue;
+          // Reasoning arrives in its own field, before or beside the answer, depending on the
+          // upstream. Both are kept so the section fills in as it streams.
+          const thinking = delta.reasoning_content ?? delta.reasoning;
+          if (typeof thinking === 'string' && thinking) turn.reasoning += thinking;
+          if (typeof delta.content === 'string' && delta.content) turn.content += delta.content;
+          if (turn.reasoning || turn.content) paint();
+        }
+      }
+    } else {
+      const body = await response.json();
+      const message = body?.choices?.[0]?.message;
+      turn.reasoning = message?.reasoning_content ?? message?.reasoning ?? '';
+      turn.content = message?.content || '';
+    }
+    if (!turn.content && !turn.reasoning) turn.content = 'The answer came back empty.';
+  } catch (err) {
+    turn.content = String(err?.message || 'The request failed.');
+    console.error(err);
+  }
+  paint();
+  $('chat-send').disabled = false;
+}
+
 // Accounts. The view is admin-only, so the limit control is always editable here.
 function renderAccounts() {
+  renderRegistration();
   $('accounts-body').innerHTML = state.summary.users.length
     ? state.summary.users
         .map((user) => {
           const cap = user.daily_token_cap;
           const over = cap !== null && user.used_today >= cap;
+          const disabled = !user.enabled;
+          const name = esc(user.username);
           return `<tr>
-            <td><span class="clamp">${esc(user.name)}</span><br><span class="clamp">${esc(user.email)}</span></td>
+            <td>
+              <span class="stack">
+                <span class="inline-field">
+                  <input class="username" value="${name}" data-for="${user.id}" aria-label="Username for ${name}">
+                  <button class="secondary" data-rename="${user.id}">Rename</button>
+                </span>
+                <span class="inline-field">
+                  <input class="password" data-for="${user.id}" placeholder="new password" aria-label="New password for ${name}">
+                  <button class="secondary" data-password="${user.id}">Set password</button>
+                </span>
+                ${disabled ? '<span class="danger">disabled</span>' : ''}
+              </span>
+            </td>
             <td>
               <span class="inline-field">
-                <input class="cap" type="number" min="1" value="${cap ?? ''}" placeholder="no limit" data-for="${user.id}" aria-label="Daily limit for ${esc(user.name)}">
+                <input class="cap" type="number" min="1" value="${cap ?? ''}" placeholder="no limit" data-for="${user.id}" aria-label="Daily limit for ${name}">
                 <button class="secondary" data-limit="${user.id}">Set limit</button>
               </span>
             </td>
             <td class="num">${nf.format(user.used_today)}${over ? ' <span class="danger">over</span>' : ''}</td>
             <td class="num">${nf.format(user.requests)}</td>
             <td class="num">${nf.format(user.tokens)}</td>
+            <td class="num">
+              <button class="link" data-status="${user.id}" data-enabled="${user.enabled}">${disabled ? 'Enable' : 'Disable'}</button>
+              ${user.id === state.me.id ? '<span class="muted">signed in</span>' : `<button class="link danger" data-account="${user.id}">Delete</button>`}
+            </td>
           </tr>`;
         })
         .join('')
-    : '<tr><td colspan="5">No account yet. The first account to register becomes the admin.</td>';
+    : '<tr><td colspan="6">No account yet. The first account to register becomes the admin.</td>';
+}
+
+// Registration is closed by default as soon as the first account exists, so the control is
+// shown to an admin only.
+function renderRegistration() {
+  const admin = state.me.role === 'admin';
+  $('registration-field').hidden = !admin;
+  if (!admin) return;
+  renderMenu(
+    $('registration-menu'),
+    'registration',
+    [
+      { value: 'closed', label: 'Closed' },
+      { value: 'open', label: 'Open' },
+    ],
+    state.settings.open_registration ? 'open' : 'closed',
+    'Self-registration',
+  );
+}
+
+async function setRegistration(open) {
+  try {
+    await api('/api/settings', {
+      method: 'PATCH',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ open_registration: open }),
+    });
+    state.settings.open_registration = open;
+    renderAccounts();
+    notice(open ? 'Self-registration is open. Anyone can make an account.' : 'Self-registration is closed.');
+  } catch (err) {
+    report(err);
+  }
 }
 
 // Shell and auth
@@ -539,13 +789,24 @@ function showAuth() {
   $('auth').hidden = false;
   $('shell').hidden = true;
   $('account').textContent = '';
+  renderAuth();
+}
+
+// The entry screen offers Register only while registration is open. Once an account exists it
+// is closed by default, so the screen opens on Sign in and says why.
+function renderAuth() {
+  const open = state.settings.open_registration;
+  $('first-account-note').hidden = state.settings.has_accounts;
+  $('mode-register').hidden = !open;
+  $('register-note').hidden = open;
+  if (!open) setMode('login');
 }
 
 function showShell() {
   $('auth').hidden = true;
   $('shell').hidden = false;
   const role = state.me.role === 'admin' ? '<br>admin' : '';
-  $('account').innerHTML = `<b>${esc(state.me.name)}</b><br>${esc(state.me.email)}${role}`;
+  $('account').innerHTML = `<b>${esc(state.me.username)}</b>${role}`;
   renderMenu($('theme-menu'), 'theme', [
     { value: 'system', label: 'System' },
     { value: 'light', label: 'Light' },
@@ -560,7 +821,7 @@ function setMode(next) {
   $('mode-register').setAttribute('aria-pressed', String(mode === 'register'));
   $('mode-login').setAttribute('aria-pressed', String(mode === 'login'));
   $('auth-submit').textContent = mode === 'register' ? 'Register' : 'Sign in';
-  $('name-field').hidden = mode === 'login';
+  // The username is the identity for both paths, so the field stays in whichever mode is open.
   notice('');
 }
 
@@ -741,24 +1002,56 @@ $('connection-form').addEventListener('submit', async (event) => {
   }
 });
 
-// Setting a limit is not destructive, so it runs straight away.
+$('chat-form').addEventListener('submit', async (event) => {
+  event.preventDefault();
+  const form = event.target;
+  const text = (Object.fromEntries(new FormData(form)).message || '').trim();
+  if (!text) return;
+  form.reset();
+  await sendChat(text);
+});
+
+// The conversation is only in this page, so clearing it needs no confirmation until there is
+// something to lose.
+$('chat-clear').addEventListener('click', () => {
+  if (!state.chat.length) return;
+  confirmAction('Clear chat', 'Clear this conversation? It is kept in this page only.', 'Clear', () => {
+    state.chat = [];
+    renderTranscript();
+  });
+});
+
+// One field per request, so changing a password does not touch the limit. None of these are
+// destructive except deleting the account, so they run straight away.
+async function changeAccount(user, body, message) {
+  try {
+    await api(`/api/users/${user.id}`, {
+      method: 'PATCH',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    await refresh('stats');
+    notice(message);
+  } catch (err) {
+    report(err);
+  }
+}
+
+function account(id) {
+  return state.summary.users.find((user) => user.id === Number(id));
+}
+
+function fieldValue(user, kind) {
+  return document.querySelector(`input.${kind}[data-for="${user.id}"]`).value.trim();
+}
+
 async function setLimit(user, raw) {
   const value = raw === '' ? null : Number(raw);
   if (value !== null && (!Number.isInteger(value) || value < 1)) {
     notice('Daily limit must be a whole number of at least 1, or empty to clear it.', 'error');
     return;
   }
-  try {
-    await api(`/api/users/${user.id}`, {
-      method: 'PATCH',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ daily_token_cap: value }),
-    });
-    await refresh('stats');
-    notice(`Set limit for ${user.name} to ${value ? nf.format(value) : 'none'}.`);
-  } catch (err) {
-    report(err);
-  }
+  await changeAccount(user, { daily_token_cap: value }, `Set the daily limit for ${user.username} to ${value ? nf.format(value) : 'none'}.`);
 }
 
 document.addEventListener('click', async (event) => {
@@ -775,8 +1068,47 @@ document.addEventListener('click', async (event) => {
     return;
   }
   if (button.dataset.limit) {
-    const user = state.summary.users.find((u) => u.id === Number(button.dataset.limit));
-    await setLimit(user, document.querySelector(`input.cap[data-for="${user.id}"]`).value.trim());
+    const user = account(button.dataset.limit);
+    await setLimit(user, fieldValue(user, 'cap'));
+    return;
+  }
+  if (button.dataset.rename) {
+    const user = account(button.dataset.rename);
+    const value = fieldValue(user, 'username');
+    if (!value) {
+      notice('Type a username first.', 'error');
+      return;
+    }
+    await changeAccount(user, { username: value }, `Renamed "${user.username}" to "${value}".`);
+    return;
+  }
+  if (button.dataset.password) {
+    const user = account(button.dataset.password);
+    const value = fieldValue(user, 'password');
+    if (value.length < 8) {
+      notice('A new password must be at least 8 characters.', 'error');
+      return;
+    }
+    await changeAccount(user, { password: value }, `Set a new password for "${user.username}".`);
+    return;
+  }
+  if (button.dataset.status) {
+    const user = account(button.dataset.status);
+    const enabled = button.dataset.enabled !== 'true';
+    await changeAccount(
+      user,
+      { enabled },
+      enabled ? `Enabled "${user.username}".` : `Disabled "${user.username}". They are signed out and their keys do not work.`,
+    );
+    return;
+  }
+  if (button.dataset.account) {
+    const user = account(button.dataset.account);
+    confirmAction('Delete account', `Delete "${user.username}"? Their keys and everything recorded for this account go with it.`, 'Delete', async () => {
+      await api(`/api/users/${user.id}`, { method: 'DELETE' });
+      await refresh('stats');
+      notice(`Deleted "${user.username}".`);
+    });
     return;
   }
   if (button.dataset.toggle) {
@@ -826,9 +1158,24 @@ paintIcons(document);
 applyTheme(localStorage.getItem('dreamgate-theme') || 'system');
 setSignal('down', 'not connected');
 
-api('/api/me')
+// Settings come first: the entry screen decides whether Register is offered before anyone is
+// signed in.
+api('/api/settings')
+  .then((settings) => {
+    state.settings = settings;
+    renderAuth();
+  })
+  .catch((err) => notice(String(err?.message || 'Could not read whether registration is open.'), 'error'))
+  .then(() => api('/api/me'))
   .then((account) => {
     state.me = account;
     return load();
   })
   .catch(() => showAuth());
+
+// The online window passes with time as well as with an event, so the panel is refreshed on a
+// timer in addition to the live stream.
+setInterval(() => {
+  if (!state.me) return;
+  refreshPresence().then(() => render(false)).catch(() => {});
+}, 30000);

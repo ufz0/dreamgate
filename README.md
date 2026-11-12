@@ -12,12 +12,19 @@ services.
 cargo run
 ```
 
-Then open <http://127.0.0.1:8787/>. The first account to register is the admin; everyone
-after that is a normal user. Admins see every key and every account; users see their own.
+Then open <http://127.0.0.1:8787/>. The server binds every interface by default, so clients on the
+network can reach the same port. Accounts sign in with a username and a password; there are
+no email addresses. The first account to register is the admin; everyone after that is a normal
+user. An admin is the only one who can change an account, and sees every key and every account;
+users see their own.
+
+A database written before this change is migrated on start: the stored display name becomes the
+username, the email column is dropped, and existing accounts keep their limits and are enabled by
+default.
 
 Environment variables:
 
-- `DREAMGATE_ADDR` — listen address, default `127.0.0.1:8787`
+- `DREAMGATE_ADDR` — listen address, default `0.0.0.0:8787`
 - `DREAMGATE_DB` — SQLite path, default `data/dreamgate.db`
 
 ## Using it
@@ -50,6 +57,10 @@ and llama.cpp builds), the gateway estimates them and marks the row as estimated
 streaming, the gateway adds `stream_options: {"include_usage": true}` so upstreams that can
 report usage will.
 
+An estimate counts everything the model produced, not only the answer. Reasoning models put their
+working in `reasoning_content` (or `reasoning`) beside the reply, and that text is counted as
+generated. The Sandbox shows it as its own section above the answer when an upstream sends it.
+
 Requests are recorded with the key, user, model, token counts, latency and status, and
 connections are health-checked every 30 seconds. A key with no connection routes to any
 enabled connection by priority, and a connection that is down or fails at the transport
@@ -57,27 +68,52 @@ level falls over to the next one.
 
 ## Dashboard
 
-Open it at the address above. It is a no-build single-page app with six views routed by the
-URL hash (`#/overview`, `#/activity`, `#/keys`, `#/connections`, `#/connect`, `#/accounts`):
+Open it at the address above. It is a no-build single-page app with seven views routed by the
+URL hash (`#/overview`, `#/activity`, `#/keys`, `#/connections`, `#/connect`, `#/sandbox`,
+`#/accounts`):
 
 - **Overview** — the gate readout (client → key → upstream, following the key and the
   connection the last request actually used, which is not necessarily the first key),
-  totals including today's, token rate per hour, requests per day.
+  totals including today's, a "Right now" panel for who is online and generating, token rate
+  per hour, requests per day.
 - **Activity** — every recorded request, newest first, plus usage by model.
 - **Keys** — create, copy, disable and delete keys, with per-key usage, and a note when a
   key's binding points at a connection that is turned off.
 - **Connections** — add and health-check upstreams.
 - **Connect a client** — the base URL, a key picker, a copyable curl request.
-- **Accounts** — per-account totals and the daily token limit an admin can set for each
-  account, with what each account has used today, admin-only.
+- **Sandbox** — chat with any model a connection serves, through the same gateway the clients
+  use, so the request is recorded like any other. Pick a key and a model from the connection's
+  model list; the answer streams in as it arrives and the conversation stays in this page. A
+  model that sends reasoning gets it as a separate section above the answer.
+- **Accounts** — per-account totals and everything an admin can do to an account: the daily
+  token limit, a new username, a new password, disable, delete. Admin-only. This is also where
+  an admin opens or closes self-registration.
 
 The dashboard reads `/api/stats/summary` and subscribes to `/api/live`, so the readout, the
-charts and the activity table update as traffic arrives — rows land in the current view without
-a reload, and nothing polls. Per-key figures are always shown; the per-account view is
-admin-only.
+charts, the presence panel and the activity table update as traffic arrives — rows land in the
+current view without a reload, and nothing polls. Per-key figures are always shown; the
+per-account view is admin-only.
+
+Presence is measured in the process, not stored: an account is online while a request of theirs
+came through the gateway in the last five minutes, and generating while one is in flight. The
+panel is empty until there is traffic and clears when the gateway restarts, which is why it is a
+live reading rather than a figure in the database. Names in that panel are shown to an admin
+only, like the rest of the per-account data.
+
+Self-registration is closed by default as soon as the first account exists, because the first
+account to register is the admin. An admin can open it again from the Accounts view. While it is
+closed the entry screen opens on Sign in and `POST /api/register` answers 403, so opening
+registration is the only way a new account can appear — there is no admin form for creating one.
+
+An account is identified by its username, and the only fields are the username, the password,
+the role, the daily limit and whether it is enabled. Disabling an account signs it out, refuses
+its keys at the gateway with 403, and stops a new sign-in; deleting it takes the account, its
+keys, its sessions and everything recorded for it, because those reference it with
+`ON DELETE CASCADE`. An admin cannot delete the account they are signed in with. Changing one
+field changes only that field, so setting a password does not clear a limit.
 
 It follows the system theme with a manual light/dark toggle, the sidebar collapses to an icon
-rail and becomes a drawer under 768px, and deleting a key or removing a connection asks for
+rail and becomes a drawer under 768px, and deleting a key, an account or a connection asks for
 confirmation first.
 
 ## Tests
@@ -87,8 +123,13 @@ cargo test
 ```
 
 The suite runs the gateway against a mock OpenAI-compatible upstream and covers usage
-recording, estimation when the upstream reports nothing, SSE pass-through, upstream failover,
+recording, estimation when the upstream reports nothing including reasoning text, SSE
+pass-through, upstream failover,
 the model recorded for a streamed request when nothing is pinned to a key or a connection,
 per-key limits and their validation, per-account daily token limits including the day
-boundary and the admin-only rule for setting one, and the admin/user scoping of the stats
-queries.
+boundary and the admin-only rule for setting one, the admin/user scoping of the stats
+queries, the registration setting being read before sign in and closed by default after the
+first account, the account actions (disable, rename, new password, delete) and what they do to a
+sign-in, a key and the recorded usage, the presence counts while a request is in flight, and the
+migration of a database written with the old columns (a display name, an email, a lifetime cap)
+to the current shape.

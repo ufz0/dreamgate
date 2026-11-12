@@ -17,8 +17,7 @@ pub const COOKIE_NAME: &str = "dg_session";
 #[derive(Clone)]
 pub struct Caller {
     pub id: i64,
-    pub email: String,
-    pub name: String,
+    pub username: String,
     pub role: String,
 }
 
@@ -55,7 +54,7 @@ pub async fn require_session(AxumState(st): AxumState<State>, mut req: Request, 
         return error(StatusCode::UNAUTHORIZED, "invalid_session", "not signed in");
     };
     let row = match sqlx::query(
-        "SELECT u.id, u.email, u.name, u.role FROM sessions s JOIN users u ON u.id = s.user_id WHERE s.token = ?",
+        "SELECT u.id, u.username, u.role FROM sessions s JOIN users u ON u.id = s.user_id WHERE s.token = ?",
     )
     .bind(&token)
     .fetch_optional(&st.pool)
@@ -69,8 +68,7 @@ pub async fn require_session(AxumState(st): AxumState<State>, mut req: Request, 
     };
     req.extensions_mut().insert(Caller {
         id: row.get::<i64, _>("id"),
-        email: row.get::<String, _>("email"),
-        name: row.get::<String, _>("name"),
+        username: row.get::<String, _>("username"),
         role: row.get::<String, _>("role"),
     });
     next.run(req).await
@@ -97,22 +95,24 @@ fn with_cookie(mut resp: Response, token: &str) -> Response {
 
 #[derive(Deserialize)]
 pub struct RegisterBody {
-    pub email: String,
-    pub name: String,
+    pub username: String,
     pub password: String,
 }
 
 pub async fn register(AxumState(st): AxumState<State>, Json(body): Json<RegisterBody>) -> Response {
-    let email = body.email.trim().to_lowercase();
-    let name = body.name.trim().to_string();
-    if email.is_empty() || !email.contains('@') {
-        return error(StatusCode::BAD_REQUEST, "invalid_request", "email is required");
-    }
-    if name.is_empty() {
-        return error(StatusCode::BAD_REQUEST, "invalid_request", "name is required");
+    let username = body.username.trim().to_string();
+    if username.is_empty() || username.chars().any(char::is_whitespace) {
+        return error(StatusCode::BAD_REQUEST, "invalid_request", "username is required and cannot contain spaces");
     }
     if body.password.len() < 8 {
         return error(StatusCode::BAD_REQUEST, "invalid_request", "password must be at least 8 characters");
+    }
+    if !crate::settings::can_register(&st).await {
+        return error(
+            StatusCode::FORBIDDEN,
+            "registration_closed",
+            "self-registration is closed. Ask an admin to open it.",
+        );
     }
 
     let count = match sqlx::query("SELECT COUNT(*) AS n FROM users").fetch_one(&st.pool).await {
@@ -127,10 +127,9 @@ pub async fn register(AxumState(st): AxumState<State>, Json(body): Json<Register
     };
 
     let row = match sqlx::query(
-        "INSERT INTO users (email, name, password_hash, role, created_at) VALUES (?, ?, ?, ?, ?) RETURNING id",
+        "INSERT INTO users (username, password_hash, role, created_at) VALUES (?, ?, ?, ?) RETURNING id",
     )
-    .bind(&email)
-    .bind(&name)
+    .bind(&username)
     .bind(&hash)
     .bind(role)
     .bind(crate::clock::now())
@@ -145,20 +144,20 @@ pub async fn register(AxumState(st): AxumState<State>, Json(body): Json<Register
         Ok(token) => token,
         Err(err) => return error(StatusCode::INTERNAL_SERVER_ERROR, "server_error", err.to_string()),
     };
-    let resp = Json(json!({ "id": id, "email": email, "name": name, "role": role })).into_response();
+    let resp = Json(json!({ "id": id, "username": username, "role": role })).into_response();
     with_cookie(resp, &token)
 }
 
 #[derive(Deserialize)]
 pub struct LoginBody {
-    pub email: String,
+    pub username: String,
     pub password: String,
 }
 
 pub async fn login(AxumState(st): AxumState<State>, Json(body): Json<LoginBody>) -> Response {
-    let email = body.email.trim().to_lowercase();
-    let row = match sqlx::query("SELECT id, name, password_hash, role FROM users WHERE email = ?")
-        .bind(&email)
+    let username = body.username.trim().to_string();
+    let row = match sqlx::query("SELECT id, username, password_hash, role, enabled FROM users WHERE username = ?")
+        .bind(&username)
         .fetch_optional(&st.pool)
         .await
     {
@@ -166,10 +165,13 @@ pub async fn login(AxumState(st): AxumState<State>, Json(body): Json<LoginBody>)
         Err(err) => return error(StatusCode::INTERNAL_SERVER_ERROR, "server_error", err.to_string()),
     };
     let Some(row) = row else {
-        return error(StatusCode::UNAUTHORIZED, "invalid_credentials", "no account for that email");
+        return error(StatusCode::UNAUTHORIZED, "invalid_credentials", "no account for that username");
     };
     if !bcrypt::verify(&body.password, &row.get::<String, _>("password_hash")).unwrap_or(false) {
         return error(StatusCode::UNAUTHORIZED, "invalid_credentials", "password does not match");
+    }
+    if row.get::<i64, _>("enabled") == 0 {
+        return error(StatusCode::FORBIDDEN, "account_disabled", "this account is disabled");
     }
     let id = row.get::<i64, _>("id");
     let token = match create_session(&st, id).await {
@@ -178,8 +180,7 @@ pub async fn login(AxumState(st): AxumState<State>, Json(body): Json<LoginBody>)
     };
     let resp = Json(json!({
         "id": id,
-        "email": email,
-        "name": row.get::<String, _>("name"),
+        "username": row.get::<String, _>("username"),
         "role": row.get::<String, _>("role"),
     }))
     .into_response();
@@ -202,5 +203,5 @@ pub async fn logout(AxumState(st): AxumState<State>, req: Request) -> Response {
 }
 
 pub async fn me(caller: Caller) -> Response {
-    Json(json!({ "id": caller.id, "email": caller.email, "name": caller.name, "role": caller.role })).into_response()
+    Json(json!({ "id": caller.id, "username": caller.username, "role": caller.role })).into_response()
 }
