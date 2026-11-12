@@ -1,0 +1,184 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>DreamGate</title>
+<link rel="icon" href="favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<section class="entry" id="auth" hidden>
+  <div class="entry-intro">
+    <div class="mark">
+      <svg viewBox="0 0 24 24" aria-hidden="true">
+        <path d="M4 3v18M20 3v18M4 8h6M14 8h6M4 16h6M14 16h6" />
+      </svg>
+      <span>DreamGate</span>
+    </div>
+    <p class="lede">One key in front of any OpenAI-compatible endpoint. Everything that crosses it is counted, per key and per account.</p>
+    <p class="note">Register the first account and it becomes the admin.</p>
+  </div>
+  <form class="entry-form" id="auth-form">
+    <div class="switch" role="group" aria-label="Account">
+      <button type="button" id="mode-register" aria-pressed="true">Register</button>
+      <button type="button" id="mode-login" aria-pressed="false">Sign in</button>
+    </div>
+    <label id="name-field">Name<input name="name" autocomplete="name" required></label>
+    <label>Email<input name="email" type="email" autocomplete="email" required></label>
+    <label>Password<input name="password" type="password" minlength="8" required></label>
+    <button type="submit" id="auth-submit">Register</button>
+    <p class="notice" id="auth-error" role="status"></p>
+  </form>
+</section>
+
+<div class="shell" id="shell" hidden>
+  <aside class="rail">
+    <div class="mark">
+      <svg viewBox="0 0 24 24" aria-hidden="true">
+        <path d="M4 3v18M20 3v18M4 8h6M14 8h6M4 16h6M14 16h6" />
+      </svg>
+      <span>DreamGate</span>
+    </div>
+    <p class="signal" id="signal"><span class="dot" id="signal-dot"></span><span id="signal-text">not connected</span></p>
+    <nav class="nav" aria-label="DreamGate">
+      <a href="#/overview" data-view="overview">Overview</a>
+      <a href="#/activity" data-view="activity">Activity</a>
+      <a href="#/keys" data-view="keys">Keys<span class="count" id="count-keys"></span></a>
+      <a href="#/connections" data-view="connections">Connections<span class="count" id="count-connections"></span></a>
+      <a href="#/connect" data-view="connect">Connect a client</a>
+      <a href="#/accounts" data-view="accounts" id="nav-accounts">Accounts</a>
+    </nav>
+    <div class="rail-foot">
+      <p class="account" id="account"></p>
+      <button type="button" id="sign-out">Sign out</button>
+    </div>
+  </aside>
+
+  <main>
+    <p class="notice" id="notice" role="status"></p>
+
+    <section class="view" data-view="overview" hidden>
+      <h1>Overview</h1>
+      <div class="schematic">
+        <div class="leg">
+          <p class="label">client</p>
+          <p class="value">OpenWebUI, curl, any OpenAI client</p>
+        </div>
+        <span class="wire"></span>
+        <div class="leg">
+          <p class="label">DreamGate key</p>
+          <p class="value" id="gate-key">no key yet</p>
+        </div>
+        <span class="wire live" id="gate-wire"></span>
+        <div class="leg">
+          <p class="label">upstream</p>
+          <p class="value" id="gate-upstream">no connection yet</p>
+        </div>
+      </div>
+      <p class="read" id="gate-read">Nothing has crossed the gate yet.</p>
+
+      <p class="readout" id="total-tokens">0</p>
+      <p class="readout-note" id="readout-note">tokens counted so far</p>
+
+      <dl class="panel" id="support"></dl>
+
+      <h2>Token rate, last 24 hours</h2>
+      <div class="chart" id="chart-hourly"></div>
+
+      <h2>Requests per day, last 14 days</h2>
+      <div class="chart" id="chart-daily"></div>
+
+      <h2>Live traffic</h2>
+      <ul class="feed" id="feed" aria-live="polite"></ul>
+    </section>
+
+    <section class="view" data-view="activity" hidden>
+      <h1>Activity</h1>
+      <p class="lede">Every request that crossed the gate, newest first, with what it cost. New rows arrive as they happen.</p>
+      <table id="activity">
+        <thead id="activity-head"></thead>
+        <tbody id="activity-body"></tbody>
+      </table>
+      <h2>Usage by model</h2>
+      <table id="models">
+        <thead><tr><th>Model</th><th>Requests</th><th>Tokens</th></tr></thead>
+        <tbody id="models-body"></tbody>
+      </table>
+    </section>
+
+    <section class="view" data-view="keys" hidden>
+      <h1>Keys</h1>
+      <p class="lede">Clients use a DreamGate key. The upstream key stays server-side, so a key can be disabled or capped without touching the runtime.</p>
+      <form class="row" id="key-form">
+        <input name="name" placeholder="Key name" required>
+        <select name="connection"><option value="">Any enabled connection</option></select>
+        <input name="model" placeholder="Model (optional)">
+        <input name="rpm_limit" type="number" min="1" placeholder="Requests per minute">
+        <input name="token_cap" type="number" min="1" placeholder="Token cap">
+        <button type="submit">Create key</button>
+      </form>
+      <table id="keys">
+        <thead>
+          <tr><th>Key</th><th>Connection</th><th>Model</th><th>Limits</th><th>Requests</th><th>Tokens</th><th></th></tr>
+        </thead>
+        <tbody id="keys-body"></tbody>
+      </table>
+    </section>
+
+    <section class="view" data-view="connections" hidden>
+      <h1>Connections</h1>
+      <p class="lede">Any endpoint that speaks the OpenAI API. A key with no connection bound to it uses the healthiest highest-priority one.</p>
+      <form class="row" id="connection-form">
+        <input name="name" placeholder="Connection name" required>
+        <input name="base_url" placeholder="Base URL, e.g. http://127.0.0.1:11434" required>
+        <input name="api_key" placeholder="Upstream key (optional)">
+        <input name="default_model" placeholder="Default model (optional)">
+        <input name="priority" type="number" placeholder="Priority, lowest first">
+        <button type="submit">Add connection</button>
+      </form>
+      <table id="connections">
+        <thead>
+          <tr><th>Connection</th><th>Base URL</th><th>Default model</th><th>Priority</th><th>Health</th><th></th></tr>
+        </thead>
+        <tbody id="connections-body"></tbody>
+      </table>
+      <p class="note">Checked every 30 seconds. A connection that fails at the transport level falls over to the next one.</p>
+    </section>
+
+    <section class="view" data-view="connect" hidden>
+      <h1>Connect a client</h1>
+      <ol class="steps">
+        <li>
+          <h3>API base</h3>
+          <p class="value-line"><span id="connect-base"></span><button type="button" class="link" data-copy-from="connect-base">Copy base URL</button></p>
+        </li>
+        <li>
+          <h3>API key</h3>
+          <p class="value-line"><select id="connect-key"></select><button type="button" class="link" id="connect-copy">Copy key</button></p>
+        </li>
+        <li>
+          <h3>Model</h3>
+          <p class="note" id="connect-model">Create a key first.</p>
+        </li>
+      </ol>
+      <h2>Same request with curl</h2>
+      <pre class="snippet" id="connect-curl"></pre>
+      <p class="value-line"><button type="button" class="link" data-copy-from="connect-curl">Copy snippet</button></p>
+      <p class="note"><span id="connect-health"></span> answers <code>ok</code> without a key, which is what a health probe checks.</p>
+    </section>
+
+    <section class="view" data-view="accounts" hidden>
+      <h1>Accounts</h1>
+      <table id="accounts">
+        <thead><tr><th>Account</th><th>Requests</th><th>Tokens</th></tr></thead>
+        <tbody id="accounts-body"></tbody>
+      </table>
+    </section>
+  </main>
+</div>
+
+<script src="app.js"></script>
+</body>
+</html>
