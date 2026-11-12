@@ -137,8 +137,7 @@ body {
 .brand svg .accent { stroke: var(--accent); }
 
 .shell[data-collapsed="true"] .brand span,
-.shell[data-collapsed="true"] .nav span:not(.icon),
-.shell[data-collapsed="true"] .sidebar-foot { display: none; }
+.shell[data-collapsed="true"] .nav span:not(.icon) { display: none; }
 
 /* The list is the part of the rail that scrolls, and only when it actually overflows.
    Without align-content: start the single implicit grid row stretches to the full rail
@@ -168,6 +167,15 @@ body {
 
 /* Pinned to the bottom of the rail: margin-top auto takes whatever the list does not need. */
 .sidebar-foot { margin-top: auto; padding: 6px; display: grid; gap: 8px; flex: none; }
+
+/* Sign out and the theme control are the pair that has to stay reachable in a collapsed rail, so
+   there the labels go and the glyphs remain, stacked to fit 52px; the chevron is dropped because
+   only the glyph identifies the control at that width. */
+.foot-row { display: flex; align-items: center; gap: 8px; }
+.shell[data-collapsed="true"] .account,
+.shell[data-collapsed="true"] .foot-row span:not(.icon),
+.shell[data-collapsed="true"] .foot-row .icon:last-child { display: none; }
+.shell[data-collapsed="true"] .foot-row { flex-direction: column; }
 
 .account { color: var(--text-muted); font-size: 13px; margin: 0; }
 .account b { font-weight: 600; color: var(--text); }
@@ -226,6 +234,11 @@ main {
 .read b { color: var(--text); font-weight: 400; }
 
 /* Readout */
+
+/* The two figures at the top answer different questions — what crossed the gate, and what a model
+   generated — so they read side by side, and stack only when the window is narrow. */
+.readout-pair { display: flex; flex-wrap: wrap; gap: 24px; }
+.readout-pair > div { flex: 1 1 240px; }
 
 .readout { margin: 0 0 4px; font: 400 34px/1.2 var(--font-mono); font-variant-numeric: tabular-nums; color: var(--text); }
 .readout-note { margin: 0 0 20px; color: var(--text-muted); font-size: 13px; }

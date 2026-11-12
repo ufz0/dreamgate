@@ -85,7 +85,8 @@ URL hash (`#/overview`, `#/activity`, `#/keys`, `#/connections`, `#/connect`, `#
 
 - **Overview** — the gate readout (client → key → upstream, following the key and the
   connection the last request actually used, which is not necessarily the first key), the count of
-  every token that has ever crossed the gate from any account, then this account's own totals
+  every token that has ever crossed the gate from any account beside the count of the tokens the
+  models generated, which leaves the prompt text out, then this account's own totals
   including today's, a "Right now" panel for who is online and generating, and the token rate per
   hour and requests per day for this account. Totals across accounts are in the Accounts view.
 - **Activity** — every recorded request, newest first, plus usage by model.
@@ -140,9 +141,10 @@ because those reference it with `ON DELETE CASCADE`. An admin cannot delete the 
 signed in with. Changing one field changes only that field, so setting a password does not clear a
 limit.
 
-It follows the system theme with a manual light/dark toggle, the sidebar collapses to an icon
-rail and becomes a drawer under 768px, and deleting a key, an account or a connection asks for
-confirmation first.
+It follows the system theme with a manual light/dark toggle next to Sign out, the sidebar collapses
+to an icon rail and becomes a drawer under 768px, and deleting a key, an account or a connection
+asks for confirmation first. There is no connection-status chip in the header: the live stream
+reconnects on its own, and a request that arrives moves the counters.
 
 ## Tests
 

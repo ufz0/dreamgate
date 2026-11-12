@@ -23,6 +23,7 @@ const ICONS = {
   chevron: '<path d="M9 6l6 6-6 6"/>',
   panel: '<rect x="3" y="4" width="18" height="16" rx="2"/><path d="M9 4v16"/>',
   exit: '<path d="M15 4H6a2 2 0 0 0-2 2v12a2 2 0 0 0 2 2h9"/><path d="M16 12h5M19 9l3 3-3 3"/>',
+  theme: '<circle cx="12" cy="12" r="8"/><path d="M12 4v16"/>',
 };
 
 function icon(name) {
@@ -117,13 +118,15 @@ async function copy(text) {
 }
 
 // Menus replace the native select: a button plus a list, closed on outside click and
-// Escape, navigable with the arrow keys.
-function renderMenu(container, name, options, current, label) {
+// Escape, navigable with the arrow keys. A glyph is for the menu that has to work in a
+// collapsed rail, where the label text is not shown.
+function renderMenu(container, name, options, current, label, glyph) {
   const picked = options.find((o) => o.value === current) || options[0];
   container.dataset.name = name;
   container.dataset.value = picked ? picked.value : '';
   container.innerHTML = `
     <button type="button" class="menu-button" aria-haspopup="listbox" aria-expanded="false" aria-label="${esc(label)}">
+      ${glyph ? `<span class="icon">${icon(glyph)}</span>` : ''}
       <span>${esc(picked ? picked.label : label)}</span>
       <span class="icon">${icon('chevron')}</span>
     </button>
@@ -266,6 +269,9 @@ const isToday = (value) => String(value).slice(0, 10) === new Date().toISOString
 function countTotals(totals, event) {
   if (!totals) return;
   totals.total_tokens = num(totals.total_tokens) + event.total_tokens;
+  // What a model generated is the answer side on its own, so the generation counter keeps its own
+  // figure rather than reading the total.
+  totals.completion_tokens = num(totals.completion_tokens) + event.completion_tokens;
   totals.requests = num(totals.requests) + 1;
   // The day figures are what a daily account limit is measured against.
   if (isToday(event.created_at)) {
@@ -306,17 +312,8 @@ function subscribe() {
     const wire = $('gate-wire');
     wire.classList.add('arrive');
     setTimeout(() => wire.classList.remove('arrive'), 180);
-    setSignal('ok', 'listening');
     render(true);
   };
-  state.live.onerror = () => setSignal('down', 'connection lost, retrying');
-}
-
-function setSignal(kind, text) {
-  const chip = $('signal');
-  chip.className = `chip ${kind}`;
-  chip.querySelector('[data-icon]').innerHTML = icon(kind === 'ok' ? 'check' : 'alert');
-  $('signal-text').textContent = text;
 }
 
 // Time axes. Buckets persist between renders so a live event can add to them.
@@ -445,9 +442,11 @@ function renderGate() {
 }
 
 // The two totals are different questions, so they are read from different parts of the summary:
-// the top one is the whole gate, the one below the gate diagram is this account.
+// the top pair is the whole gate (all tokens, and the generated side of it alone), the one below
+// the gate diagram is this account.
 function renderReadout() {
   $('global-tokens').textContent = nf.format(state.summary.global?.total_tokens || 0);
+  $('generated-tokens').textContent = nf.format(state.summary.global?.completion_tokens || 0);
 
   const t = state.summary.self;
   $('total-tokens').textContent = nf.format(t.total_tokens || 0);
@@ -941,7 +940,7 @@ function showShell() {
     { value: 'system', label: 'System' },
     { value: 'light', label: 'Light' },
     { value: 'dark', label: 'Dark' },
-  ], state.theme, 'Theme');
+  ], state.theme, 'Theme', 'theme');
 }
 
 let mode = 'register';
@@ -1319,7 +1318,6 @@ document.addEventListener('click', async (event) => {
 
 paintIcons(document);
 applyTheme(localStorage.getItem('dreamgate-theme') || 'system');
-setSignal('down', 'not connected');
 
 // Settings come first: the entry screen decides whether Register is offered before anyone is
 // signed in.

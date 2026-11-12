@@ -49,7 +49,10 @@
     </nav>
     <div class="sidebar-foot">
       <p class="account" id="account"></p>
-      <button type="button" class="ghost" id="sign-out"><span class="icon" data-icon="exit"></span><span>Sign out</span></button>
+      <div class="foot-row">
+        <button type="button" class="ghost" id="sign-out"><span class="icon" data-icon="exit"></span><span>Sign out</span></button>
+        <div class="menu-wrap" id="theme-menu"></div>
+      </div>
     </div>
   </aside>
 
@@ -57,16 +60,22 @@
     <header class="topbar">
       <button type="button" class="ghost" id="toggle-rail" aria-label="Collapse sidebar" aria-expanded="true"><span class="icon" data-icon="panel"></span></button>
       <span class="spacer"></span>
-      <p class="chip" id="signal"><span class="icon" data-icon="check"></span><span id="signal-text">not connected</span></p>
-      <div class="menu-wrap" id="theme-menu"></div>
     </header>
     <main>
       <p class="notice" id="notice" role="status"></p>
 
       <section class="view" data-view="overview" hidden>
         <h1>Overview</h1>
-        <p class="readout" id="global-tokens">0</p>
-        <p class="readout-note">tokens through the gate in total, every account and key</p>
+        <div class="readout-pair">
+          <div>
+            <p class="readout" id="global-tokens">0</p>
+            <p class="readout-note">tokens through the gate in total, every account and key</p>
+          </div>
+          <div>
+            <p class="readout" id="generated-tokens">0</p>
+            <p class="readout-note">only what the models generated, so the text sent in is not counted</p>
+          </div>
+        </div>
 
         <div class="schematic">
           <div class="leg"><span class="icon" data-icon="client"></span><span class="value">client</span></div>
