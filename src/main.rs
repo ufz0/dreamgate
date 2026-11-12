@@ -19,6 +19,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         http: reqwest::Client::builder().timeout(std::time::Duration::from_secs(120)).build()?,
         hub: live::hub(),
         presence: Default::default(),
+        attempts: Default::default(),
     };
 
     tokio::spawn(registry::health_checker(st.clone()));

@@ -7,6 +7,7 @@ use sqlx::Row;
 use std::time::Duration;
 
 use crate::api::error;
+use crate::auth::Caller;
 use crate::state::State;
 
 #[derive(Clone)]
@@ -98,7 +99,7 @@ pub struct CreateConnection {
     pub priority: Option<i64>,
 }
 
-pub async fn list(AxumState(st): AxumState<State>) -> Response {
+pub async fn list(AxumState(st): AxumState<State>, caller: Caller) -> Response {
     let rows = sqlx::query(
         "SELECT id, name, base_url, api_key, default_model, enabled, priority, health, last_checked_at \
          FROM connections ORDER BY priority ASC, id ASC",
@@ -106,15 +107,19 @@ pub async fn list(AxumState(st): AxumState<State>) -> Response {
     .fetch_all(&st.pool)
     .await
     .unwrap_or_default();
+    // An upstream key is a secret, so it is returned to an admin alone. The rest of the row is
+    // what any signed-in account needs for the gate readout and the model list.
+    let admin = caller.role == "admin";
     let out: Vec<serde_json::Value> = rows
         .iter()
         .map(|row| {
             let c = row_to_connection(row);
+            let api_key = if admin { c.api_key.clone() } else { None };
             json!({
                 "id": c.id,
                 "name": c.name,
                 "base_url": c.base_url,
-                "api_key": c.api_key,
+                "api_key": api_key,
                 "default_model": c.default_model,
                 "enabled": c.enabled,
                 "priority": c.priority,
@@ -126,7 +131,10 @@ pub async fn list(AxumState(st): AxumState<State>) -> Response {
     Json(json!({ "connections": out })).into_response()
 }
 
-pub async fn create(AxumState(st): AxumState<State>, Json(body): Json<CreateConnection>) -> Response {
+pub async fn create(AxumState(st): AxumState<State>, caller: Caller, Json(body): Json<CreateConnection>) -> Response {
+    if caller.role != "admin" {
+        return error(StatusCode::FORBIDDEN, "forbidden", "only an admin can add a connection");
+    }
     let name = body.name.trim().to_string();
     let base_url = body.base_url.trim().to_string();
     if name.is_empty() || base_url.is_empty() {
@@ -153,7 +161,10 @@ pub async fn create(AxumState(st): AxumState<State>, Json(body): Json<CreateConn
     }
 }
 
-pub async fn remove(AxumState(st): AxumState<State>, Path(id): Path<i64>) -> Response {
+pub async fn remove(AxumState(st): AxumState<State>, Path(id): Path<i64>, caller: Caller) -> Response {
+    if caller.role != "admin" {
+        return error(StatusCode::FORBIDDEN, "forbidden", "only an admin can remove a connection");
+    }
     let result = sqlx::query("DELETE FROM connections WHERE id = ?").bind(id).execute(&st.pool).await;
     match result {
         Ok(_) => Json(json!({ "ok": true })).into_response(),
@@ -161,7 +172,10 @@ pub async fn remove(AxumState(st): AxumState<State>, Path(id): Path<i64>) -> Res
     }
 }
 
-pub async fn health_check(AxumState(st): AxumState<State>, Path(id): Path<i64>) -> Response {
+pub async fn health_check(AxumState(st): AxumState<State>, Path(id): Path<i64>, caller: Caller) -> Response {
+    if caller.role != "admin" {
+        return error(StatusCode::FORBIDDEN, "forbidden", "only an admin can check a connection");
+    }
     let row = sqlx::query(
         "SELECT id, name, base_url, api_key, default_model, enabled, priority, health, last_checked_at \
          FROM connections WHERE id = ?",

@@ -7,6 +7,7 @@ use axum::response::{IntoResponse, Json, Response};
 use futures_util::{stream, StreamExt};
 use serde_json::{json, Value};
 use sqlx::Row;
+use sqlx::sqlite::SqliteRow;
 
 use crate::api::error;
 use crate::presence::{self, Active};
@@ -65,6 +66,28 @@ async fn lookup_key(st: &State, raw: &str) -> Option<KeyInfo> {
     })
 }
 
+// A disabled account cannot use a key at all. Both gateway endpoints read the account the same
+// way, so a key on its own cannot reach an upstream for an account that is turned off.
+async fn account_row(st: &State, user_id: i64) -> Option<SqliteRow> {
+    sqlx::query("SELECT username, enabled, daily_token_cap FROM users WHERE id = ?")
+        .bind(user_id)
+        .fetch_optional(&st.pool)
+        .await
+        .ok()
+        .flatten()
+}
+
+fn disabled_account(row: &SqliteRow) -> Option<Response> {
+    if row.get::<i64, _>("enabled") == 0 {
+        return Some(error(
+            StatusCode::FORBIDDEN,
+            "account_disabled",
+            format!("account '{}' is disabled", row.get::<String, _>("username")),
+        ));
+    }
+    None
+}
+
 async fn enforce_limits(st: &State, key: &KeyInfo) -> Option<Response> {
     if let Some(limit) = key.rpm_limit {
         let recent = sqlx::query(
@@ -103,37 +126,26 @@ async fn enforce_limits(st: &State, key: &KeyInfo) -> Option<Response> {
     // all. The account limit counts the current day only and resets at 00:00 UTC, matching the
     // UTC text the usage rows are stored as. It is checked after the key cap, so a key cannot
     // be used to work around it.
-    let account = sqlx::query("SELECT username, enabled, daily_token_cap FROM users WHERE id = ?")
-        .bind(key.user_id)
-        .fetch_optional(&st.pool)
-        .await
-        .ok()
-        .flatten();
-    if let Some(account) = account {
-        if account.get::<i64, _>("enabled") == 0 {
+    let account = account_row(st, key.user_id).await?;
+    if let Some(blocked) = disabled_account(&account) {
+        return Some(blocked);
+    }
+    if let Some(cap) = account.get::<Option<i64>, _>("daily_token_cap") {
+        let used = sqlx::query(
+            "SELECT COALESCE(SUM(total_tokens), 0) AS used FROM usage \
+             WHERE user_id = ? AND strftime('%Y-%m-%d', created_at) = date('now')",
+        )
+            .bind(key.user_id)
+            .fetch_one(&st.pool)
+            .await
+            .map(|row| row.get::<i64, _>("used"))
+            .unwrap_or(0);
+        if used >= cap {
             return Some(error(
-                StatusCode::FORBIDDEN,
-                "account_disabled",
-                format!("account '{}' is disabled", account.get::<String, _>("username")),
+                StatusCode::TOO_MANY_REQUESTS,
+                "token_cap",
+                format!("account '{}' has used its daily token limit of {cap}", account.get::<String, _>("username")),
             ));
-        }
-        if let Some(cap) = account.get::<Option<i64>, _>("daily_token_cap") {
-            let used = sqlx::query(
-                "SELECT COALESCE(SUM(total_tokens), 0) AS used FROM usage \
-                 WHERE user_id = ? AND strftime('%Y-%m-%d', created_at) = date('now')",
-            )
-                .bind(key.user_id)
-                .fetch_one(&st.pool)
-                .await
-                .map(|row| row.get::<i64, _>("used"))
-                .unwrap_or(0);
-            if used >= cap {
-                return Some(error(
-                    StatusCode::TOO_MANY_REQUESTS,
-                    "token_cap",
-                    format!("account '{}' has used its daily token limit of {cap}", account.get::<String, _>("username")),
-                ));
-            }
         }
     }
     None
@@ -433,6 +445,9 @@ pub async fn list_models(AxumState(st): AxumState<State>, headers: HeaderMap) ->
     };
     if !key.enabled {
         return error(StatusCode::FORBIDDEN, "key_disabled", "this key is disabled");
+    }
+    if let Some(blocked) = account_row(&st, key.user_id).await.as_ref().and_then(disabled_account) {
+        return blocked;
     }
     let Some(conn) = registry::candidates(&st, key.connection_id).await.first().cloned() else {
         return error(StatusCode::BAD_GATEWAY, "no_upstream", "no enabled connection is available for this key");

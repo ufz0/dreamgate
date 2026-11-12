@@ -29,6 +29,7 @@ async fn test_state() -> State {
         http: reqwest::Client::new(),
         hub: live::hub(),
         presence: Default::default(),
+        attempts: Default::default(),
     }
 }
 
@@ -826,6 +827,10 @@ async fn a_disabled_account_cannot_sign_in_or_use_its_key() {
     let response = gateway_call(&router, &key, json!({ "messages": [{ "role": "user", "content": "hi" }] })).await;
     assert_eq!(response.status(), StatusCode::FORBIDDEN);
     assert_eq!(json_body(response).await["error"]["type"], "account_disabled");
+
+    // The model list is the same gateway path with the same key, so it is refused the same way.
+    let response = call(&router, Request::get("/v1/models").header("authorization", format!("Bearer {key}")).body(Body::empty()).unwrap()).await;
+    assert_eq!(response.status(), StatusCode::FORBIDDEN, "a key alone does not reach an upstream for an account that is off");
 }
 
 #[tokio::test]
@@ -1177,4 +1182,136 @@ async fn presence_counts_an_account_while_its_request_is_running() {
 async fn endpoint_urls_follow_the_openai_convention() {
     assert_eq!(dreamgate::registry::endpoint("http://localhost:11434", "models"), "http://localhost:11434/v1/models");
     assert_eq!(dreamgate::registry::endpoint("https://api.example.com/v1/", "models"), "https://api.example.com/v1/models");
+}
+
+#[tokio::test]
+async fn only_an_admin_can_change_a_connection_and_read_the_key_it_carries() {
+    let st = test_state().await;
+    let router = build_router(st.clone());
+    let admin = register(&router, "ada").await;
+    open_registration(&router, &admin).await;
+    no_approval(&router, &admin).await;
+    let member = register(&router, "ben").await;
+
+    let (status, created) = post_json(
+        &router,
+        "/api/connections",
+        &admin,
+        json!({ "name": "test", "base_url": "http://127.0.0.1:1", "api_key": "upstream-secret" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let id = created["id"].as_i64().unwrap();
+
+    // The page shows a connection to every account, because the gate readout and the model list
+    // need it. The key it carries is a secret, so that part goes to an admin alone.
+    let member_view = get_json(&router, "/api/connections", &member).await;
+    assert_eq!(member_view["connections"][0]["name"], "test", "the connection itself is still readable");
+    assert!(member_view["connections"][0]["api_key"].is_null());
+    let admin_view = get_json(&router, "/api/connections", &admin).await;
+    assert_eq!(admin_view["connections"][0]["api_key"], "upstream-secret");
+
+    // Adding, removing and checking a connection is admin-only in the page, so the rule has to be
+    // on the routes as well rather than only on the view.
+    let (status, _) = post_json(&router, "/api/connections", &member, json!({ "name": "another", "base_url": "http://127.0.0.1:2" })).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let (status, _) = post_json(&router, &format!("/api/connections/{id}/check"), &member, json!({})).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let (status, _) = send_json(&router, http::Method::DELETE, &format!("/api/connections/{id}"), &member, json!({})).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    // For an admin the same routes work as they always did.
+    let (status, _) = post_json(&router, &format!("/api/connections/{id}/check"), &admin, json!({})).await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _) = send_json(&router, http::Method::DELETE, &format!("/api/connections/{id}"), &admin, json!({})).await;
+    assert_eq!(status, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn a_sign_in_does_not_say_which_part_was_wrong() {
+    let st = test_state().await;
+    let router = build_router(st.clone());
+    register(&router, "ada").await;
+
+    let (_, unknown) = post_json(&router, "/api/login", "", json!({ "username": "ben", "password": "test-password" })).await;
+    let (_, mismatch) = post_json(&router, "/api/login", "", json!({ "username": "ada", "password": "wrong-password" })).await;
+    assert_eq!(unknown["error"]["message"], "username or password is not correct");
+    assert_eq!(mismatch["error"]["message"], unknown["error"]["message"], "an attempt cannot list the accounts");
+}
+
+#[tokio::test]
+async fn sign_in_attempts_for_one_account_are_bounded() {
+    let st = test_state().await;
+    let router = build_router(st.clone());
+    register(&router, "ada").await;
+
+    for _ in 0..10 {
+        let (status, _) = post_json(&router, "/api/login", "", json!({ "username": "ada", "password": "wrong-password" })).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+    // The eleventh attempt is refused even with the right password, so the loop is bounded rather
+    // than paid for with a bcrypt hash per call.
+    let (status, body) = post_json(&router, "/api/login", "", json!({ "username": "ada", "password": "test-password" })).await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(body["error"]["type"], "too_many_attempts");
+
+    // The window is per account, so another account is not limited by what was tried against the
+    // first one.
+    let (status, _) = post_json(&router, "/api/login", "", json!({ "username": "nobody", "password": "wrong-password" })).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn a_session_older_than_the_window_the_cookie_last_is_refused() {
+    let st = test_state().await;
+    let router = build_router(st.clone());
+    let admin = register(&router, "ada").await;
+    let admin_id = get_json(&router, "/api/me", &admin).await["id"].as_i64().unwrap();
+
+    sqlx::query("INSERT INTO sessions (token, user_id, created_at) VALUES (?, ?, datetime('now', '-31 days'))")
+        .bind("kept-token")
+        .bind(admin_id)
+        .execute(&st.pool)
+        .await
+        .unwrap();
+
+    let response = call(&router, Request::get("/api/me").header("cookie", "dg_session=kept-token").body(Body::empty()).unwrap()).await;
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "a token that is kept and replayed does not work forever");
+
+    // The account itself is still signed in with its own session.
+    let response = call(&router, Request::get("/api/me").header("cookie", &admin).body(Body::empty()).unwrap()).await;
+    assert_eq!(response.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn the_session_cookie_is_marked_secure_only_when_the_request_arrived_over_tls() {
+    let st = test_state().await;
+    let router = build_router(st.clone());
+    let body = json!({ "username": "ada", "password": "test-password" }).to_string();
+
+    let plain = call(
+        &router,
+        Request::post("/api/register").header("content-type", "application/json").body(Body::from(body.clone())).unwrap(),
+    )
+    .await;
+    assert_eq!(plain.status(), StatusCode::OK);
+    let plain_cookie = plain.headers().get("set-cookie").unwrap().to_str().unwrap();
+    assert!(plain_cookie.contains("HttpOnly") && plain_cookie.contains("SameSite=Lax"));
+    assert!(!plain_cookie.contains("Secure"), "plain HTTP cannot promise a secure cookie");
+
+    // Behind a TLS-terminating proxy the same response can promise it, and the proxy header is
+    // what says so.
+    let tls = call(
+        &router,
+        Request::post("/api/login")
+            .header("content-type", "application/json")
+            .header("x-forwarded-proto", "https")
+            .body(Body::from(body))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(tls.status(), StatusCode::OK);
+    let cookie = tls.headers().get("set-cookie").unwrap().to_str().unwrap();
+    assert!(cookie.contains("Secure"), "the cookie is marked Secure when the request came over TLS");
+    assert!(cookie.contains("Max-Age=2592000"), "the cookie and the stored session last the same window");
 }
