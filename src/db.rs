@@ -1,5 +1,6 @@
 use std::str::FromStr;
 
+use sqlx::Row;
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePool, SqlitePoolOptions};
 
 pub const SCHEMA: &[&str] = &[
@@ -9,6 +10,7 @@ pub const SCHEMA: &[&str] = &[
         name TEXT NOT NULL,
         password_hash TEXT NOT NULL,
         role TEXT NOT NULL DEFAULT 'user',
+        daily_token_cap INTEGER,
         created_at TEXT NOT NULL
     )",
     "CREATE TABLE IF NOT EXISTS sessions (
@@ -68,6 +70,24 @@ pub async fn connect(url: &str) -> Result<SqlitePool, sqlx::Error> {
         .await?;
     for statement in SCHEMA {
         sqlx::query(*statement).execute(&pool).await?;
+    }
+    // The account limit counts one day, so the column is named for that. A database created
+    // when it was a lifetime cap has it under the old name, and the values still apply.
+    let current = sqlx::query("SELECT COUNT(*) AS n FROM pragma_table_info('users') WHERE name = 'daily_token_cap'")
+        .fetch_one(&pool)
+        .await?
+        .get::<i64, _>("n");
+    if current == 0 {
+        let legacy = sqlx::query("SELECT COUNT(*) AS n FROM pragma_table_info('users') WHERE name = 'token_cap'")
+            .fetch_one(&pool)
+            .await?
+            .get::<i64, _>("n");
+        let statement = if legacy > 0 {
+            "ALTER TABLE users RENAME COLUMN token_cap TO daily_token_cap"
+        } else {
+            "ALTER TABLE users ADD COLUMN daily_token_cap INTEGER"
+        };
+        sqlx::query(statement).execute(&pool).await?;
     }
     sqlx::query("PRAGMA journal_mode = WAL").execute(&pool).await?;
     Ok(pool)

@@ -103,6 +103,34 @@ async fn grouped(st: &State, scoped: bool, user_id: i64, sql: &str) -> Result<Ve
         .collect())
 }
 
+// Accounts with no usage still appear, because that is where an admin sets a limit. The day
+// figure is what a daily limit is measured against, so it is reported next to it. Ordered by
+// name rather than by usage so a new account is never pushed off the page it is set on.
+async fn accounts(st: &State) -> Result<Vec<serde_json::Value>, sqlx::Error> {
+    let rows = sqlx::query(
+        "SELECT u.id, u.name, u.email, u.daily_token_cap, COUNT(r.id) AS requests, \
+                COALESCE(SUM(r.total_tokens), 0) AS tokens, \
+                COALESCE(SUM(CASE WHEN strftime('%Y-%m-%d', r.created_at) = date('now') THEN r.total_tokens ELSE 0 END), 0) AS used_today \
+         FROM users u LEFT JOIN usage r ON r.user_id = u.id GROUP BY u.id ORDER BY u.name LIMIT 20",
+    )
+    .fetch_all(&st.pool)
+    .await?;
+    Ok(rows
+        .iter()
+        .map(|row| {
+            json!({
+                "id": row.get::<i64, _>("id"),
+                "name": row.get::<String, _>("name"),
+                "email": row.get::<String, _>("email"),
+                "daily_token_cap": row.get::<Option<i64>, _>("daily_token_cap"),
+                "requests": row.get::<i64, _>("requests"),
+                "tokens": row.get::<i64, _>("tokens"),
+                "used_today": row.get::<i64, _>("used_today"),
+            })
+        })
+        .collect())
+}
+
 async fn build_summary(st: &State, caller: &Caller) -> Result<serde_json::Value, sqlx::Error> {
     let scoped = caller.role != "admin";
     let admin = caller.role == "admin";
@@ -121,18 +149,7 @@ async fn build_summary(st: &State, caller: &Caller) -> Result<serde_json::Value,
         ),
     )
     .await?;
-    let users = if admin {
-        grouped(
-            st,
-            false,
-            caller.id,
-            "SELECT u.name AS name, u.email AS email, COUNT(r.id) AS requests, COALESCE(SUM(r.total_tokens), 0) AS tokens \
-             FROM users u JOIN usage r ON r.user_id = u.id GROUP BY u.id ORDER BY tokens DESC LIMIT 20",
-        )
-        .await?
-    } else {
-        Vec::new()
-    };
+    let users = if admin { accounts(st).await? } else { Vec::new() };
 
     Ok(json!({
         "scope": if admin { "all" } else { "self" },

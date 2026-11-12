@@ -10,6 +10,7 @@ pub mod state;
 pub mod stats;
 pub mod tokens;
 pub mod usage;
+pub mod users;
 
 use axum::{middleware, routing, Router};
 use tower_http::services::ServeDir;
@@ -30,6 +31,7 @@ pub fn build_router(st: State) -> Router {
         .route("/live", routing::get(live::stream_events))
         .route("/keys", routing::get(keys::list).post(keys::create))
         .route("/keys/{id}", routing::patch(keys::update).delete(keys::delete))
+        .route("/users/{id}", routing::patch(users::set_cap))
         .route("/connections", routing::get(registry::list).post(registry::create))
         .route("/connections/{id}", routing::delete(registry::remove))
         .route("/connections/{id}/check", routing::post(registry::health_check))

@@ -28,7 +28,10 @@ Environment variables:
    model.
 2. Create a key. A DreamGate key is what clients use — the upstream key stays server-side.
    Optionally bind a key to one connection, pin a model, or set a requests-per-minute limit
-   and a token cap.
+   and a token cap. An admin can set a token limit for any account from the Accounts view;
+   that limit counts the tokens used in the current day and resets at 00:00 UTC, and it
+   applies on top of a key's own cap, so a key cannot be used to work around it. Clearing
+   the value clears the limit.
 3. Point a client at the gateway, for example OpenWebUI:
    - API base: `http://127.0.0.1:8787/v1`
    - API key: the DreamGate key
@@ -57,18 +60,25 @@ level falls over to the next one.
 Open it at the address above. It is a no-build single-page app with six views routed by the
 URL hash (`#/overview`, `#/activity`, `#/keys`, `#/connections`, `#/connect`, `#/accounts`):
 
-- **Overview** — the gate readout (client → key → upstream, naming the connection a key with
-  no binding would use), totals, token rate per hour, requests per day.
+- **Overview** — the gate readout (client → key → upstream, following the key and the
+  connection the last request actually used, which is not necessarily the first key),
+  totals including today's, token rate per hour, requests per day.
 - **Activity** — every recorded request, newest first, plus usage by model.
-- **Keys** — create, copy, disable and delete keys, with per-key usage.
+- **Keys** — create, copy, disable and delete keys, with per-key usage, and a note when a
+  key's binding points at a connection that is turned off.
 - **Connections** — add and health-check upstreams.
 - **Connect a client** — the base URL, a key picker, a copyable curl request.
-- **Accounts** — per-account totals, admin-only.
+- **Accounts** — per-account totals and the daily token limit an admin can set for each
+  account, with what each account has used today, admin-only.
 
 The dashboard reads `/api/stats/summary` and subscribes to `/api/live`, so the readout, the
 charts and the activity table update as traffic arrives — rows land in the current view without
 a reload, and nothing polls. Per-key figures are always shown; the per-account view is
 admin-only.
+
+It follows the system theme with a manual light/dark toggle, the sidebar collapses to an icon
+rail and becomes a drawer under 768px, and deleting a key or removing a connection asks for
+confirmation first.
 
 ## Tests
 
@@ -78,4 +88,7 @@ cargo test
 
 The suite runs the gateway against a mock OpenAI-compatible upstream and covers usage
 recording, estimation when the upstream reports nothing, SSE pass-through, upstream failover,
-per-key limits, and the admin/user scoping of the stats queries.
+the model recorded for a streamed request when nothing is pinned to a key or a connection,
+per-key limits and their validation, per-account daily token limits including the day
+boundary and the admin-only rule for setting one, and the admin/user scoping of the stats
+queries.

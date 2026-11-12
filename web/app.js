@@ -3,6 +3,31 @@ const $ = (id) => document.getElementById(id);
 const esc = (value) =>
   String(value).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 
+// A snapshot can arrive with empty totals, so live counting starts from 0 rather than undefined.
+const num = (value) => (Number.isFinite(value) ? value : 0);
+
+const ICONS = {
+  overview: '<path d="M4 17a8 8 0 0 1 16 0"/><path d="M12 14l4-3"/>',
+  activity: '<path d="M4 6h16M4 12h12M4 18h8"/>',
+  keys: '<circle cx="8.5" cy="12" r="3.5"/><path d="M12 12h9M18 12v4M21 12v-3"/>',
+  connections: '<path d="M9 3v5M15 3v5M8 8h8v6a4 4 0 0 1-8 0z"/>',
+  client: '<path d="M9 7l-5 5 5 5M15 7l5 5-5 5"/>',
+  accounts: '<circle cx="12" cy="9" r="4"/><path d="M4 20a8 8 0 0 1 16 0"/>',
+  check: '<circle cx="12" cy="12" r="9"/><path d="M8.5 12.5l2.5 2.5 5-5"/>',
+  alert: '<path d="M12 4l8 14H4z"/><path d="M12 9v4"/>',
+  chevron: '<path d="M9 6l6 6-6 6"/>',
+  panel: '<rect x="3" y="4" width="18" height="16" rx="2"/><path d="M9 4v16"/>',
+  exit: '<path d="M15 4H6a2 2 0 0 0-2 2v12a2 2 0 0 0 2 2h9"/><path d="M16 12h5M19 9l3 3-3 3"/>',
+};
+
+function icon(name) {
+  return `<svg viewBox="0 0 24 24" aria-hidden="true">${ICONS[name]}</svg>`;
+}
+
+function paintIcons(root) {
+  for (const el of root.querySelectorAll('[data-icon]')) el.innerHTML = icon(el.dataset.icon);
+}
+
 const state = {
   me: null,
   summary: { totals: {}, hourly: [], daily: [], models: [], users: [] },
@@ -14,6 +39,7 @@ const state = {
   live: null,
   view: 'overview',
   connectKey: null,
+  theme: 'system',
 };
 
 const VIEWS = ['overview', 'activity', 'keys', 'connections', 'connect', 'accounts'];
@@ -29,9 +55,63 @@ function postJson(path, body) {
   return api(path, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) });
 }
 
-function notice(message) {
+function notice(message, kind) {
   const target = $('shell').hidden ? $('auth-error') : $('notice');
-  if (target) target.textContent = message || '';
+  if (!target) return;
+  target.textContent = message || '';
+  target.className = kind === 'error' ? 'notice error' : 'notice';
+}
+
+// A plain sentence for the user; the raw driver text stays in the console.
+function report(err) {
+  const message = String(err?.message || '');
+  notice(message && message.length < 140 ? message : 'Something went wrong. Check the values and try again.', 'error');
+  console.error(err);
+}
+
+// Menus replace the native select: a button plus a list, closed on outside click and
+// Escape, navigable with the arrow keys.
+function renderMenu(container, name, options, current, label) {
+  const picked = options.find((o) => o.value === current) || options[0];
+  container.dataset.name = name;
+  container.dataset.value = picked ? picked.value : '';
+  container.innerHTML = `
+    <button type="button" class="menu-button" aria-haspopup="listbox" aria-expanded="false" aria-label="${esc(label)}">
+      <span>${esc(picked ? picked.label : label)}</span>
+      <span class="icon">${icon('chevron')}</span>
+    </button>
+    <ul class="menu" role="listbox" aria-label="${esc(label)}" hidden>
+      ${options.map((o) => `<li role="option" tabindex="-1" data-value="${esc(o.value)}" aria-selected="${o.value === (picked?.value ?? '')}">${esc(o.label)}</li>`).join('')}
+    </ul>`;
+}
+
+function closeMenus() {
+  for (const menu of document.querySelectorAll('.menu')) {
+    menu.hidden = true;
+    menu.closest('.menu-wrap').querySelector('.menu-button').setAttribute('aria-expanded', 'false');
+  }
+}
+
+function openMenu(wrap) {
+  const menu = wrap.querySelector('.menu');
+  closeMenus();
+  menu.hidden = false;
+  wrap.querySelector('.menu-button').setAttribute('aria-expanded', 'true');
+  const first = menu.querySelector('[aria-selected="true"]') || menu.querySelector('[role="option"]');
+  if (first) first.focus();
+}
+
+function chooseOption(option) {
+  const wrap = option.closest('.menu-wrap');
+  wrap.dataset.value = option.dataset.value;
+  wrap.querySelector('.menu-button span:first-child').textContent = option.textContent;
+  for (const item of wrap.querySelectorAll('[role="option"]')) item.setAttribute('aria-selected', String(item === option));
+  closeMenus();
+  if (wrap.dataset.name === 'theme') applyTheme(option.dataset.value);
+  if (wrap.dataset.name === 'connect-key') {
+    state.connectKey = option.dataset.value;
+    renderConnect();
+  }
 }
 
 // Views
@@ -71,13 +151,13 @@ function render(arrived) {
 
 function renderNav() {
   $('nav-accounts').hidden = state.me.role !== 'admin';
-  const keys = $('count-keys');
-  keys.textContent = state.keys.length ? String(state.keys.length) : '';
+  $('count-keys').textContent = state.keys.length ? String(state.keys.length) : '';
   const badge = $('count-connections');
   const down = state.connections.filter((c) => c.health === 'down').length;
   badge.textContent = state.connections.length ? String(state.connections.length) : '';
-  badge.classList.toggle('bad', down > 0);
-  if (down) badge.title = `${down} of ${state.connections.length} report down`;
+  const warned = $('count-connections-down');
+  warned.textContent = down ? `${down} down` : '';
+  warned.hidden = down === 0;
 }
 
 // Data
@@ -112,26 +192,33 @@ function subscribe() {
     }
     state.events.unshift(payload.event);
     state.events = state.events.slice(0, 50);
-    state.summary.totals.total_tokens += payload.event.total_tokens;
-    state.summary.totals.requests += 1;
-    addEvent(payload.event);
-    flash($('signal'), 'flash');
-    flash($('gate-wire'), 'arrive');
+    const event = payload.event;
+    const totals = state.summary.totals;
+    totals.total_tokens = num(totals.total_tokens) + event.total_tokens;
+    totals.requests = num(totals.requests) + 1;
+    // The day figures are what a daily account limit is measured against, so they have to
+    // move with the same event the feed does.
+    if (String(event.created_at).slice(0, 10) === new Date().toISOString().slice(0, 10)) {
+      totals.today_tokens = num(totals.today_tokens) + event.total_tokens;
+      totals.today_requests = num(totals.today_requests) + 1;
+      const account = state.summary.users.find((user) => user.id === event.user_id);
+      if (account) account.used_today = num(account.used_today) + event.total_tokens;
+    }
+    addEvent(event);
+    const wire = $('gate-wire');
+    wire.classList.add('arrive');
+    setTimeout(() => wire.classList.remove('arrive'), 180);
+    setSignal('ok', 'listening');
     render(true);
-    $('signal').classList.remove('stale');
-    $('signal-text').textContent = 'listening';
   };
-  state.live.onerror = () => {
-    $('signal').classList.add('stale');
-    $('signal-text').textContent = 'connection lost, retrying';
-  };
+  state.live.onerror = () => setSignal('down', 'connection lost, retrying');
 }
 
-function flash(el, className) {
-  if (!el) return;
-  el.classList.remove(className);
-  void el.offsetWidth;
-  el.classList.add(className);
+function setSignal(kind, text) {
+  const chip = $('signal');
+  chip.className = `chip ${kind}`;
+  chip.querySelector('[data-icon]').innerHTML = icon(kind === 'ok' ? 'check' : 'alert');
+  $('signal-text').textContent = text;
 }
 
 // Time axes. Buckets persist between renders so a live event can add to them.
@@ -145,7 +232,7 @@ function buildAxes() {
   }
   for (let i = 13; i >= 0; i -= 1) {
     const at = new Date(now - i * 86400 * 1000);
-    state.days.push({ key: at.toISOString().slice(0, 10), label: String(at.getUTCDay()), tokens: 0, requests: 0, errors: 0 });
+    state.days.push({ key: at.toISOString().slice(0, 10), label: at.toISOString().slice(5, 10), tokens: 0, requests: 0, errors: 0 });
   }
   for (const row of state.summary.hourly) {
     const bucket = state.hours.find((b) => b.key === row.bucket);
@@ -203,10 +290,13 @@ function barChart(buckets) {
   const bars = buckets
     .map((b, i) => {
       const h = Math.max(1, (b.requests / max) * (height - 34));
-      return `<rect class="bar" x="${(10 + i * slot + 2).toFixed(1)}" y="${(height - 24 - h).toFixed(1)}" width="${(slot - 4).toFixed(1)}" height="${h.toFixed(1)}"/>`;
+      const peak = b.requests === max && b.requests > 0;
+      return `<rect class="bar${peak ? ' peak' : ''}" x="${(10 + i * slot + 2).toFixed(1)}" y="${(height - 24 - h).toFixed(1)}" width="${(slot - 4).toFixed(1)}" height="${h.toFixed(1)}"/>`;
     })
     .join('');
-  const labels = buckets.map((b, i) => `<text class="axis" x="${(10 + i * slot + slot / 2 - 6).toFixed(1)}" y="${height - 6}">${b.label}</text>`).join('');
+  const labels = buckets
+    .map((b, i) => `<text class="axis" text-anchor="middle" x="${(10 + i * slot + slot / 2).toFixed(1)}" y="${height - 6}">${b.label}</text>`)
+    .join('');
   return svg(`<line class="grid" x1="10" x2="894" y1="${height - 24}" y2="${height - 24}"/>${bars}${labels}`, height, `Requests per day, last 14 days, peak ${nf.format(max)} requests in a day`);
 }
 
@@ -224,18 +314,24 @@ function renderOverview(arrived) {
 }
 
 function topConnection() {
-  return state.connections.filter((c) => c.enabled).sort((a, b) => a.priority - b.priority)[0] || null;
+  const enabled = state.connections.filter((c) => c.enabled).sort((a, b) => a.priority - b.priority);
+  // Same order the gateway uses: highest priority, skipping a connection that is down
+  // unless it is the only one left.
+  return enabled.find((c) => c.health !== 'down') || enabled[0] || null;
 }
 
 function renderGate() {
-  const key = state.keys[0];
-  const conn = topConnection();
-  $('gate-key').textContent = key ? key.name : 'no key yet';
+  // The path shown has to be the path a request actually took, so the key comes from the
+  // last event and the connection from that key's binding.
+  const last = state.events[0];
+  const key = last ? state.keys.find((k) => k.name === last.key) : null;
+  const bound = key && key.connection_id ? state.connections.find((c) => c.id === key.connection_id && c.enabled) : null;
+  const conn = bound || topConnection();
+  $('gate-key').textContent = last ? last.key : (state.keys.length ? state.keys[0].name : 'no key yet');
   $('gate-upstream').innerHTML = conn
-    ? `${esc(conn.name)} <span class="state ${esc(conn.health)}">${esc(conn.health)}</span>`
+    ? `${esc(conn.name)} <span class="chip ${conn.health === 'ok' ? 'ok' : 'down'}">${icon(conn.health === 'ok' ? 'check' : 'alert')}<span>${esc(conn.health)}</span></span>`
     : 'no connection yet';
 
-  const last = state.events[0];
   if (!last) {
     $('gate-read').textContent = 'Nothing has crossed the gate yet.';
     return;
@@ -245,15 +341,15 @@ function renderGate() {
     `<b>${esc(last.created_at.slice(11, 19))}</b>`,
     esc(last.model || 'no model'),
     `${nf.format(last.total_tokens)} tokens`,
-    `<span class="${last.status >= 400 ? 'bad' : ''}">${esc(last.status)}</span>`,
-  ].map((part) => `<span>${part}</span>`).join('');
+    `<span class="${last.status >= 400 ? 'danger' : ''}">${esc(last.status)}</span>`,
+  ].join(' ');
 }
 
 function renderReadout() {
   const t = state.summary.totals;
   $('total-tokens').textContent = nf.format(t.total_tokens || 0);
   $('readout-note').textContent =
-    state.me.role === 'admin' ? 'tokens counted so far, every account' : 'tokens counted so far, this account';
+    state.me.role === 'admin' ? 'tokens counted so far, every account' : 'tokens counted so far, this account only';
 
   const rows = [
     ['Requests', nf.format(t.requests || 0)],
@@ -262,7 +358,7 @@ function renderReadout() {
     ['Prompt tokens', nf.format(t.prompt_tokens || 0)],
     ['Completion tokens', nf.format(t.completion_tokens || 0)],
     ['Average latency', `${nf.format(t.avg_latency_ms || 0)} ms`],
-    ['Refused by limits', nf.format(t.errors || 0)],
+    ['Errors (status 400 or worse)', nf.format(t.errors || 0)],
   ];
   $('support').innerHTML = rows
     .map(([label, value]) => `<div class="row"><dt>${esc(label)}</dt><dd>${esc(value)}</dd></div>`)
@@ -285,7 +381,7 @@ function renderFeed(arrived) {
               <span>${esc(event.created_at.slice(11, 19))}</span>
               <span>${esc(event.key)}</span>
               <span>${esc(event.model || 'no model')}</span>
-              <span class="${event.status >= 400 ? 'bad' : ''}">${esc(event.status)}</span>
+              <span class="${event.status >= 400 ? 'danger' : ''}">${esc(event.status)}</span>
               <span class="tokens">${nf.format(event.total_tokens)}</span>
             </li>`,
         )
@@ -306,12 +402,12 @@ function renderActivity() {
           (event) =>
             `<tr>
               <td>${esc(event.created_at.slice(11, 19))}</td>
-              <td>${esc(event.key)}</td>
-              ${admin ? `<td>${esc(event.user)}</td>` : ''}
-              <td>${esc(event.model || 'no model')}</td>
+              <td><span class="clamp">${esc(event.key)}</span></td>
+              ${admin ? `<td><span class="clamp">${esc(event.user)}</span></td>` : ''}
+              <td><span class="clamp">${esc(event.model || 'no model')}</span></td>
               <td class="num">${nf.format(event.total_tokens)}</td>
               <td class="num">${nf.format(event.latency_ms)} ms</td>
-              <td class="num${event.status >= 400 ? ' bad' : ''}">${esc(event.status)}</td>
+              <td class="num${event.status >= 400 ? ' danger' : ''}">${esc(event.status)}</td>
             </tr>`,
         )
         .join('')
@@ -321,7 +417,7 @@ function renderActivity() {
     ? state.summary.models
         .map(
           (model) =>
-            `<tr><td>${esc(model.model)}</td><td class="num">${nf.format(model.requests)}</td><td class="num">${nf.format(model.tokens)}</td></tr>`,
+            `<tr><td><span class="clamp">${esc(model.model)}</span></td><td class="num">${nf.format(model.requests)}</td><td class="num">${nf.format(model.tokens)}</td></tr>`,
         )
         .join('')
     : `<tr><td colspan="3">No model has been used yet. Add a connection, then send a request with a key.</td></tr>`;
@@ -329,29 +425,37 @@ function renderActivity() {
 
 // Keys
 
+function connectionOptions() {
+  return [{ value: '', label: 'Any enabled connection' }, ...state.connections.map((c) => ({ value: String(c.id), label: c.name }))];
+}
+
 function renderKeys() {
   $('keys-body').innerHTML = state.keys.length
     ? state.keys
         .map(
-          (key) => `<tr>
-            <td><span title="${esc(key.key)}">${esc(key.name)}</span></td>
-            <td>${esc(key.connection || 'any')}</td>
-            <td>${esc(key.model || 'default')}</td>
+          (key) => {
+            // A binding to a disabled connection does not hold: the key uses another one.
+            const bound = key.connection_id ? state.connections.find((c) => c.id === key.connection_id) : null;
+            const binding = bound && !bound.enabled ? `${esc(bound.name)} <span class="muted">binding inactive</span>` : esc(key.connection || 'any');
+            return `<tr>
+            <td><span class="clamp" title="${esc(key.key)}">${esc(key.name)}</span></td>
+            <td>${binding}</td>
+            <td>${esc(key.model || 'the client model')}</td>
             <td>${key.rpm_limit ? `${key.rpm_limit}/min` : 'no limit'}<br>${key.token_cap ? nf.format(key.token_cap) : 'no cap'}</td>
             <td class="num">${nf.format(key.requests)}</td>
             <td class="num">${nf.format(key.tokens)}</td>
             <td class="num">
               <button class="link" data-copy="${esc(key.key)}">Copy key</button>
               <button class="link" data-toggle="${key.id}" data-enabled="${key.enabled}">${key.enabled ? 'Disable' : 'Enable'}</button>
-              <button class="link" data-delete="${key.id}">Delete</button>
+              <button class="link danger" data-delete="${key.id}">Delete</button>
             </td>
-          </tr>`,
+          </tr>`;
+          },
         )
         .join('')
-    : `<tr><td colspan="7">No key yet. Create one below, then use it as the Bearer token, or as x-api-key, against /v1/chat/completions.</td></tr>`;
+    : `<tr><td colspan="7">No key yet. Create one above, then use it as the Bearer token, or as x-api-key, against /v1/chat/completions.</td></tr>`;
 
-  const options = state.connections.map((c) => `<option value="${c.id}">${esc(c.name)}</option>`).join('');
-  $('key-form').connection.innerHTML = `<option value="">Any enabled connection</option>${options}`;
+  renderMenu($('connection-menu'), 'connection', connectionOptions(), $('connection-menu').dataset.value || '', 'Connection');
 }
 
 // Connections
@@ -361,14 +465,14 @@ function renderConnections() {
     ? state.connections
         .map(
           (connection) => `<tr>
-            <td>${esc(connection.name)}</td>
-            <td>${esc(connection.base_url)}</td>
+            <td><span class="clamp">${esc(connection.name)}</span></td>
+            <td><span class="clamp">${esc(connection.base_url)}</span></td>
             <td>${esc(connection.default_model || 'the model the client asks for')}</td>
             <td class="num">${esc(connection.priority)}</td>
-            <td><span class="state ${esc(connection.health)}">${esc(connection.health)}</span></td>
+            <td><span class="chip ${connection.health === 'ok' ? 'ok' : 'down'}">${icon(connection.health === 'ok' ? 'check' : 'alert')}<span>${esc(connection.health)}</span></span></td>
             <td class="num">
               <button class="link" data-check="${connection.id}">Check health</button>
-              <button class="link" data-drop="${connection.id}">Remove</button>
+              <button class="link danger" data-drop="${connection.id}">Remove</button>
             </td>
           </tr>`,
         )
@@ -381,20 +485,20 @@ function renderConnections() {
 function renderConnect() {
   const base = `${location.origin}/v1`;
   $('connect-base').textContent = base;
-  $('connect-health').textContent = `${location.origin}/health`;
 
-  const select = $('connect-key');
-  if (!state.connectKey && state.keys.length) state.connectKey = state.keys[0].key;
+  renderMenu(
+    $('connect-key-menu'),
+    'connect-key',
+    state.keys.length ? state.keys.map((k) => ({ value: k.key, label: k.name })) : [{ value: '', label: 'no key yet' }],
+    state.connectKey || '',
+    'API key',
+  );
+
   const key = state.keys.find((k) => k.key === state.connectKey) || state.keys[0];
-
-  select.innerHTML = state.keys.length
-    ? state.keys.map((k) => `<option value="${esc(k.key)}"${k.key === key?.key ? ' selected' : ''}>${esc(k.name)}</option>`).join('')
-    : '<option value="">no key yet</option>';
-
   $('connect-model').textContent = key
     ? key.model
       ? `This key always resolves to ${key.model}. Use GET ${base}/models to see what the connection serves.`
-      : 'Use whatever the key resolves to, or list it with GET ' + base + '/models.'
+      : `Use whatever the key resolves to, or list it with GET ${base}/models.`
     : 'Create a key first. The key is what the client sends.';
 
   $('connect-curl').textContent = key
@@ -402,19 +506,31 @@ function renderConnect() {
     : 'No key yet. Create one on the Keys page.';
 
   $('connect-copy').dataset.copy = key ? key.key : '';
+  $('connect-copy').disabled = !key;
 }
 
-// Accounts
-
+// Accounts. The view is admin-only, so the limit control is always editable here.
 function renderAccounts() {
   $('accounts-body').innerHTML = state.summary.users.length
     ? state.summary.users
-        .map(
-          (user) =>
-            `<tr><td>${esc(user.name)}<br>${esc(user.email)}</td><td class="num">${nf.format(user.requests)}</td><td class="num">${nf.format(user.tokens)}</td></tr>`,
-        )
+        .map((user) => {
+          const cap = user.daily_token_cap;
+          const over = cap !== null && user.used_today >= cap;
+          return `<tr>
+            <td><span class="clamp">${esc(user.name)}</span><br><span class="clamp">${esc(user.email)}</span></td>
+            <td>
+              <span class="inline-field">
+                <input class="cap" type="number" min="1" value="${cap ?? ''}" placeholder="no limit" data-for="${user.id}" aria-label="Daily limit for ${esc(user.name)}">
+                <button class="secondary" data-limit="${user.id}">Set limit</button>
+              </span>
+            </td>
+            <td class="num">${nf.format(user.used_today)}${over ? ' <span class="danger">over</span>' : ''}</td>
+            <td class="num">${nf.format(user.requests)}</td>
+            <td class="num">${nf.format(user.tokens)}</td>
+          </tr>`;
+        })
         .join('')
-    : `<tr><td colspan="3">No usage from any account yet. The first account to register becomes the admin.</td></tr>`;
+    : '<tr><td colspan="5">No account yet. The first account to register becomes the admin.</td>';
 }
 
 // Shell and auth
@@ -428,7 +544,13 @@ function showAuth() {
 function showShell() {
   $('auth').hidden = true;
   $('shell').hidden = false;
-  $('account').innerHTML = `${esc(state.me.name)}<br>${esc(state.me.email)}${state.me.role === 'admin' ? '<br>admin' : ''}`;
+  const role = state.me.role === 'admin' ? '<br>admin' : '';
+  $('account').innerHTML = `<b>${esc(state.me.name)}</b><br>${esc(state.me.email)}${role}`;
+  renderMenu($('theme-menu'), 'theme', [
+    { value: 'system', label: 'System' },
+    { value: 'light', label: 'Light' },
+    { value: 'dark', label: 'Dark' },
+  ], state.theme, 'Theme');
 }
 
 let mode = 'register';
@@ -448,8 +570,49 @@ async function submitAuth(form) {
     state.me = await postJson(`/api/${mode}`, data);
     await load();
   } catch (err) {
-    notice(err.message);
+    report(err);
   }
+}
+
+// Confirm dialog for destructive actions
+
+function confirmAction(title, text, action, run) {
+  const dialog = $('confirm');
+  $('confirm-title').textContent = title;
+  $('confirm-text').textContent = text;
+  $('confirm-ok').textContent = action;
+  $('confirm-ok').onclick = async () => {
+    dialog.close();
+    try {
+      await run();
+    } catch (err) {
+      report(err);
+    }
+  };
+  dialog.showModal();
+}
+
+// Theme and sidebar
+
+function applyTheme(value) {
+  state.theme = value;
+  if (value === 'system') document.documentElement.removeAttribute('data-theme');
+  else document.documentElement.dataset.theme = value;
+  localStorage.setItem('dreamgate-theme', value);
+}
+
+function toggleRail() {
+  const shell = $('shell');
+  if (window.matchMedia('(max-width: 768px)').matches) {
+    const open = shell.dataset.drawer === 'open';
+    if (open) shell.removeAttribute('data-drawer');
+    else shell.dataset.drawer = 'open';
+    $('toggle-rail').setAttribute('aria-expanded', String(!open));
+    return;
+  }
+  const collapsed = shell.dataset.collapsed === 'true';
+  shell.dataset.collapsed = String(!collapsed);
+  $('toggle-rail').setAttribute('aria-expanded', String(collapsed));
 }
 
 // Events
@@ -461,12 +624,65 @@ $('auth-form').addEventListener('submit', (event) => {
 
 $('mode-register').addEventListener('click', () => setMode('register'));
 $('mode-login').addEventListener('click', () => setMode('login'));
+$('toggle-rail').addEventListener('click', toggleRail);
+$('scrim').addEventListener('click', () => $('shell').removeAttribute('data-drawer'));
+$('confirm-cancel').addEventListener('click', () => $('confirm').close());
+
+for (const [button, fields] of [['key-advanced', 'key-advanced-fields'], ['connection-advanced', 'connection-advanced-fields']]) {
+  $(button).addEventListener('click', () => {
+    const open = $(button).getAttribute('aria-expanded') === 'true';
+    $(button).setAttribute('aria-expanded', String(!open));
+    $(fields).hidden = open;
+  });
+}
+
+document.addEventListener('click', (event) => {
+  const button = event.target.closest('.menu-button');
+  if (button) {
+    const wrap = button.closest('.menu-wrap');
+    if (button.getAttribute('aria-expanded') === 'true') closeMenus();
+    else openMenu(wrap);
+    return;
+  }
+  const option = event.target.closest('[role="option"]');
+  if (option) {
+    chooseOption(option);
+    return;
+  }
+  if (!event.target.closest('.menu-wrap')) closeMenus();
+});
+
+document.addEventListener('keydown', (event) => {
+  const option = event.target.closest('[role="option"]');
+  if (!option) return;
+  const items = [...option.closest('.menu').querySelectorAll('[role="option"]')];
+  const index = items.indexOf(option);
+  const next = event.key === 'ArrowDown' ? items[index + 1] : event.key === 'ArrowUp' ? items[index - 1] : null;
+  if (next) {
+    event.preventDefault();
+    next.focus();
+  } else if (event.key === 'Enter') {
+    event.preventDefault();
+    chooseOption(option);
+  } else if (event.key === 'Escape') {
+    closeMenus();
+    option.closest('.menu-wrap').querySelector('.menu-button').focus();
+  }
+});
+
+document.addEventListener('keydown', (event) => {
+  const button = event.target.closest('.menu-button');
+  if (button && (event.key === 'ArrowDown' || event.key === 'ArrowUp')) {
+    event.preventDefault();
+    openMenu(button.closest('.menu-wrap'));
+  }
+});
 
 $('sign-out').addEventListener('click', async () => {
   try {
     await api('/api/logout', { method: 'POST' });
   } catch (err) {
-    notice(err.message);
+    report(err);
     return;
   }
   state.me = null;
@@ -483,9 +699,10 @@ $('key-form').addEventListener('submit', async (event) => {
   event.preventDefault();
   const form = event.target;
   const data = Object.fromEntries(new FormData(form));
+  const picked = $('connection-menu').dataset.value;
   const body = {
     name: data.name,
-    connection_id: data.connection ? Number(data.connection) : null,
+    connection_id: picked ? Number(picked) : null,
     model: data.model || null,
     rpm_limit: data.rpm_limit ? Number(data.rpm_limit) : null,
     token_cap: data.token_cap ? Number(data.token_cap) : null,
@@ -494,9 +711,11 @@ $('key-form').addEventListener('submit', async (event) => {
     const created = await postJson('/api/keys', body);
     state.connectKey = created.key;
     form.reset();
+    renderMenu($('connection-menu'), 'connection', connectionOptions(), '', 'Connection');
     await refresh('keys');
+    notice(`Created key "${data.name}". Use it as the Bearer token.`);
   } catch (err) {
-    notice(err.message);
+    report(err);
   }
 });
 
@@ -516,62 +735,97 @@ $('connection-form').addEventListener('submit', async (event) => {
     form.reset();
     await api(`/api/connections/${created.id}/check`, { method: 'POST' });
     await refresh('connections');
+    notice(`Added connection "${data.name}" and checked it.`);
   } catch (err) {
-    notice(err.message);
+    report(err);
   }
 });
 
-$('connect-key').addEventListener('change', (event) => {
-  state.connectKey = event.target.value;
-  renderConnect();
-});
+// Setting a limit is not destructive, so it runs straight away.
+async function setLimit(user, raw) {
+  const value = raw === '' ? null : Number(raw);
+  if (value !== null && (!Number.isInteger(value) || value < 1)) {
+    notice('Daily limit must be a whole number of at least 1, or empty to clear it.', 'error');
+    return;
+  }
+  try {
+    await api(`/api/users/${user.id}`, {
+      method: 'PATCH',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ daily_token_cap: value }),
+    });
+    await refresh('stats');
+    notice(`Set limit for ${user.name} to ${value ? nf.format(value) : 'none'}.`);
+  } catch (err) {
+    report(err);
+  }
+}
 
 document.addEventListener('click', async (event) => {
-  const button = event.target.closest('button.link');
+  const button = event.target.closest('button.link, button.secondary');
   if (!button) return;
-  try {
-    if (button.dataset.copy) {
-      await navigator.clipboard.writeText(button.dataset.copy);
-      button.textContent = 'Copied';
-      return;
-    }
-    if (button.dataset.copyFrom) {
-      await navigator.clipboard.writeText($(button.dataset.copyFrom).textContent.trim());
-      button.textContent = 'Copied';
-      return;
-    }
-    if (button.dataset.toggle) {
+  if (button.dataset.copy) {
+    await navigator.clipboard.writeText(button.dataset.copy);
+    button.textContent = 'Copied';
+    return;
+  }
+  if (button.dataset.copyFrom) {
+    await navigator.clipboard.writeText($(button.dataset.copyFrom).textContent.trim());
+    button.textContent = 'Copied';
+    return;
+  }
+  if (button.dataset.limit) {
+    const user = state.summary.users.find((u) => u.id === Number(button.dataset.limit));
+    await setLimit(user, document.querySelector(`input.cap[data-for="${user.id}"]`).value.trim());
+    return;
+  }
+  if (button.dataset.toggle) {
+    try {
       await api(`/api/keys/${button.dataset.toggle}`, {
         method: 'PATCH',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({ enabled: button.dataset.enabled !== 'true' }),
       });
       await refresh('keys');
-      return;
+    } catch (err) {
+      report(err);
     }
-    if (button.dataset.delete) {
-      const gone = state.keys.find((k) => k.id === Number(button.dataset.delete));
-      await api(`/api/keys/${button.dataset.delete}`, { method: 'DELETE' });
-      if (gone && gone.key === state.connectKey) state.connectKey = null;
+    return;
+  }
+  if (button.dataset.delete) {
+    const key = state.keys.find((k) => k.id === Number(button.dataset.delete));
+    confirmAction('Delete key', `Delete "${key.name}"? Requests already recorded for it stay.`, 'Delete', async () => {
+      await api(`/api/keys/${key.id}`, { method: 'DELETE' });
+      if (key.key === state.connectKey) state.connectKey = null;
       await refresh('keys');
-      return;
-    }
-    if (button.dataset.check) {
+    });
+    return;
+  }
+  if (button.dataset.check) {
+    try {
       const result = await api(`/api/connections/${button.dataset.check}/check`, { method: 'POST' });
       await refresh('connections');
-      if (result.health !== 'ok') notice('Health check reported down. Check the base URL and that the endpoint answers GET /v1/models.');
-      return;
+      if (result.health !== 'ok') notice('Health check reported down. Check the base URL and that the endpoint answers GET /v1/models.', 'error');
+    } catch (err) {
+      report(err);
     }
-    if (button.dataset.drop) {
-      await api(`/api/connections/${button.dataset.drop}`, { method: 'DELETE' });
+    return;
+  }
+  if (button.dataset.drop) {
+    const connection = state.connections.find((c) => c.id === Number(button.dataset.drop));
+    confirmAction('Remove connection', `Remove "${connection.name}"? Keys pointing at it will use the next healthy connection.`, 'Remove', async () => {
+      await api(`/api/connections/${connection.id}`, { method: 'DELETE' });
       await refresh('connections');
-    }
-  } catch (err) {
-    notice(err.message);
+    });
   }
 });
 
-// Start: an existing session goes straight to the dashboard.
+// Start
+
+paintIcons(document);
+applyTheme(localStorage.getItem('dreamgate-theme') || 'system');
+setSignal('down', 'not connected');
+
 api('/api/me')
   .then((account) => {
     state.me = account;

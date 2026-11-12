@@ -83,6 +83,10 @@ pub async fn create(AxumState(st): AxumState<State>, caller: Caller, Json(body):
     if name.is_empty() {
         return error(StatusCode::BAD_REQUEST, "invalid_request", "name is required");
     }
+    // A limit of 0 would refuse every request, so a limit is a positive number or absent.
+    if body.rpm_limit.is_some_and(|value| value < 1) || body.token_cap.is_some_and(|value| value < 1) {
+        return error(StatusCode::BAD_REQUEST, "invalid_request", "limits must be a positive number, or left unset");
+    }
     let key = format!("dreamgate_{}", Uuid::new_v4().simple());
     let result = sqlx::query(
         "INSERT INTO api_keys (user_id, name, key, connection_id, model, rpm_limit, token_cap, created_at) \

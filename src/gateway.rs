@@ -98,6 +98,34 @@ async fn enforce_limits(st: &State, key: &KeyInfo) -> Option<Response> {
             ));
         }
     }
+    // The account limit counts the current day only and resets at 00:00 UTC, matching the
+    // UTC text the usage rows are stored as. Checked after the key cap, so a key cannot be
+    // used to work around it.
+    let account = sqlx::query("SELECT name, daily_token_cap FROM users WHERE id = ?")
+        .bind(key.user_id)
+        .fetch_optional(&st.pool)
+        .await
+        .ok()
+        .flatten();
+    if let Some(account) = account
+        && let Some(cap) = account.get::<Option<i64>, _>("daily_token_cap") {
+        let used = sqlx::query(
+            "SELECT COALESCE(SUM(total_tokens), 0) AS used FROM usage \
+             WHERE user_id = ? AND strftime('%Y-%m-%d', created_at) = date('now')",
+        )
+            .bind(key.user_id)
+            .fetch_one(&st.pool)
+            .await
+            .map(|row| row.get::<i64, _>("used"))
+            .unwrap_or(0);
+        if used >= cap {
+            return Some(error(
+                StatusCode::TOO_MANY_REQUESTS,
+                "token_cap",
+                format!("account '{}' has used its daily token limit of {cap}", account.get::<String, _>("name")),
+            ));
+        }
+    }
     None
 }
 
@@ -108,10 +136,9 @@ fn resolve_model(key_model: Option<&str>, conn: &Connection, requested: Option<&
         .unwrap_or_else(|| requested.unwrap_or("unknown").to_string())
 }
 
-fn build_payload(body: &Value, key: &KeyInfo, conn: &Connection) -> Value {
+fn build_payload(body: &Value, model: &str) -> Value {
     let mut payload = body.clone();
-    let requested = body.get("model").and_then(Value::as_str);
-    payload["model"] = Value::String(resolve_model(key.model.as_deref(), conn, requested));
+    payload["model"] = Value::String(model.to_string());
     // Upstreams that support stream_options report real usage at the end of the
     // stream; without it the gateway has to estimate completion tokens.
     if body.get("stream").and_then(Value::as_bool).unwrap_or(false) && payload.get("stream_options").is_none() {
@@ -169,6 +196,7 @@ fn stream_body(
     upstream: reqwest::Response,
     started: Instant,
     prompt_tokens: i64,
+    model: String,
 ) -> impl futures_util::Stream<Item = Result<Bytes, BoxError>> {
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, BoxError>>(64);
     tokio::spawn(async move {
@@ -199,7 +227,7 @@ fn stream_body(
             api_key_id: key.id,
             user_id: key.user_id,
             connection_id: Some(conn.id),
-            model: Some(resolve_model(key.model.as_deref(), &conn, None)),
+            model: Some(model),
             prompt_tokens: prompt,
             completion_tokens: completion,
             total_tokens: prompt + completion,
@@ -237,14 +265,16 @@ pub async fn chat_completions(AxumState(st): AxumState<State>, headers: HeaderMa
     }
     let wants_stream = body.get("stream").and_then(Value::as_bool).unwrap_or(false);
     let prompt_tokens = tokens::prompt_estimate(body.get("messages").unwrap_or(&Value::Null));
+    let requested = body.get("model").and_then(Value::as_str);
     let mut last_error = String::from("no connection responded");
 
     for conn in &candidates {
         if conn.health == "down" && candidates.len() > 1 {
             continue;
         }
+        let model = resolve_model(key.model.as_deref(), conn, requested);
         let url = registry::endpoint(&conn.base_url, "chat/completions");
-        let payload = build_payload(&body, &key, conn);
+        let payload = build_payload(&body, &model);
         let upstream = match st
             .http
             .post(&url)
@@ -266,7 +296,7 @@ pub async fn chat_completions(AxumState(st): AxumState<State>, headers: HeaderMa
             *out.status_mut() = status;
             out.headers_mut().insert(header::CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
             out.headers_mut().insert(header::CACHE_CONTROL, HeaderValue::from_static("no-cache"));
-            *out.body_mut() = Body::from_stream(stream_body(st.clone(), key.clone(), conn.clone(), upstream, started, prompt_tokens));
+            *out.body_mut() = Body::from_stream(stream_body(st.clone(), key.clone(), conn.clone(), upstream, started, prompt_tokens, model));
             return out;
         }
 
@@ -299,7 +329,7 @@ pub async fn chat_completions(AxumState(st): AxumState<State>, headers: HeaderMa
                 api_key_id: key.id,
                 user_id: key.user_id,
                 connection_id: Some(conn.id),
-                model: Some(resolve_model(key.model.as_deref(), conn, body.get("model").and_then(Value::as_str))),
+                model: Some(model),
                 prompt_tokens: prompt,
                 completion_tokens: completion,
                 total_tokens: prompt + completion,
@@ -327,7 +357,7 @@ pub async fn chat_completions(AxumState(st): AxumState<State>, headers: HeaderMa
             api_key_id: key.id,
             user_id: key.user_id,
             connection_id: None,
-            model: key.model.clone(),
+            model: key.model.clone().or_else(|| requested.map(String::from)),
             prompt_tokens,
             completion_tokens: 0,
             total_tokens: prompt_tokens,

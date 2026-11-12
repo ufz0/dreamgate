@@ -277,6 +277,32 @@ async fn streams_sse_through_unchanged_and_records_at_the_end() {
 }
 
 #[tokio::test]
+async fn records_the_model_the_client_asked_for_when_streaming() {
+    let st = test_state().await;
+    let router = build_router(st.clone());
+    let base_url = mock_upstream().await;
+    let cookie = register(&router, "admin@example.com", "Ada").await;
+
+    // Nothing is pinned on the connection or the key, so the recorded model has to come
+    // from the request itself.
+    post_json(&router, "/api/connections", &cookie, json!({ "name": "test", "base_url": base_url })).await;
+    let (_, created) = post_json(&router, "/api/keys", &cookie, json!({ "name": "test key" })).await;
+    let key = created["key"].as_str().unwrap().to_string();
+
+    let response = gateway_call(
+        &router,
+        &key,
+        json!({ "model": "reports-usage", "stream": true, "messages": [{ "role": "user", "content": "hi" }] }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    response.into_body().collect().await.unwrap();
+
+    let usage = recorded_usage(&st.pool).await;
+    assert_eq!(usage[0]["model"], "reports-usage");
+}
+
+#[tokio::test]
 async fn fails_over_to_a_healthy_connection() {
     let st = test_state().await;
     let router = build_router(st.clone());
@@ -293,7 +319,7 @@ async fn fails_over_to_a_healthy_connection() {
     )
     .await;
 
-    let (_, created) = post_json(&router, &format!("/api/keys"), &cookie, json!({ "name": "test key" })).await;
+    let (_, created) = post_json(&router, "/api/keys", &cookie, json!({ "name": "test key" })).await;
     let key = created["key"].as_str().unwrap().to_string();
 
     let response = gateway_call(&router, &key, json!({ "messages": [{ "role": "user", "content": "hi" }] })).await;
@@ -324,6 +350,21 @@ async fn per_key_rate_limit_blocks_the_third_request() {
 }
 
 #[tokio::test]
+async fn key_limits_must_be_positive() {
+    let st = test_state().await;
+    let router = build_router(st.clone());
+    let cookie = register(&router, "admin@example.com", "Ada").await;
+
+    // A limit of 0 would refuse every request, so it is rejected rather than stored.
+    let (status, _) = post_json(&router, "/api/keys", &cookie, json!({ "name": "zero", "token_cap": 0 })).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let (status, _) = post_json(&router, "/api/keys", &cookie, json!({ "name": "negative", "rpm_limit": -1 })).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let (status, _) = post_json(&router, "/api/keys", &cookie, json!({ "name": "unset limits" })).await;
+    assert_eq!(status, StatusCode::OK);
+}
+
+#[tokio::test]
 async fn per_key_token_cap_blocks_the_next_request() {
     let st = test_state().await;
     let router = build_router(st.clone());
@@ -344,6 +385,91 @@ async fn per_key_token_cap_blocks_the_next_request() {
     assert_eq!(status, StatusCode::OK);
     let response = gateway_call(&router, &key, json!({ "messages": [{ "role": "user", "content": "hi" }] })).await;
     assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+}
+
+#[tokio::test]
+async fn account_daily_limit_blocks_the_next_request() {
+    let st = test_state().await;
+    let router = build_router(st.clone());
+    let base_url = mock_upstream().await;
+    let admin = register(&router, "admin@example.com", "Ada").await;
+    post_json(&router, "/api/connections", &admin, json!({ "name": "test", "base_url": base_url, "default_model": "reports-usage" })).await;
+
+    // The key has no cap of its own, so only the account limit can stop it.
+    let (_, created) = post_json(&router, "/api/keys", &admin, json!({ "name": "uncapped" })).await;
+    let key = created["key"].as_str().unwrap().to_string();
+    gateway_call(&router, &key, json!({ "messages": [{ "role": "user", "content": "hi" }] })).await;
+    let usage = recorded_usage(&st.pool).await;
+    assert_eq!(usage[0]["total_tokens"], 18);
+
+    let me = get_json(&router, "/api/me", &admin).await;
+    // The limit has to sit below what the first call already used, otherwise the account is still under it.
+    let (status, body) = send_json(&router, http::Method::PATCH, &format!("/api/users/{}", me["id"]), &admin, json!({ "daily_token_cap": 15 })).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["daily_token_cap"], 15);
+
+    // 18 tokens are already counted for today, so the next request is refused.
+    let response = gateway_call(&router, &key, json!({ "messages": [{ "role": "user", "content": "hi" }] })).await;
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+}
+
+#[tokio::test]
+async fn account_daily_limit_counts_only_the_current_day() {
+    let st = test_state().await;
+    let router = build_router(st.clone());
+    let base_url = mock_upstream().await;
+    let admin = register(&router, "admin@example.com", "Ada").await;
+    post_json(&router, "/api/connections", &admin, json!({ "name": "test", "base_url": base_url, "default_model": "reports-usage" })).await;
+
+    let (_, created) = post_json(&router, "/api/keys", &admin, json!({ "name": "uncapped" })).await;
+    let key = created["key"].as_str().unwrap().to_string();
+    gateway_call(&router, &key, json!({ "messages": [{ "role": "user", "content": "hi" }] })).await;
+
+    let me = get_json(&router, "/api/me", &admin).await;
+    let (status, _) = send_json(&router, http::Method::PATCH, &format!("/api/users/{}", me["id"]), &admin, json!({ "daily_token_cap": 15 })).await;
+    assert_eq!(status, StatusCode::OK);
+
+    // The same tokens dated to an earlier day are outside the window the limit counts.
+    sqlx::query("UPDATE usage SET created_at = datetime('now', '-1 day') WHERE user_id = ?")
+        .bind(me["id"].as_i64().unwrap())
+        .execute(&st.pool)
+        .await
+        .unwrap();
+    let response = gateway_call(&router, &key, json!({ "messages": [{ "role": "user", "content": "hi" }] })).await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let summary = get_json(&router, "/api/stats/summary", &admin).await;
+    assert_eq!(summary["users"][0]["used_today"], 18);
+    assert_eq!(summary["users"][0]["tokens"], 36);
+}
+
+#[tokio::test]
+async fn only_an_admin_can_set_an_account_cap() {
+    let st = test_state().await;
+    let router = build_router(st.clone());
+    let admin = register(&router, "admin@example.com", "Ada").await;
+    let member = register(&router, "member@example.com", "Ben").await;
+    let member_id = get_json(&router, "/api/me", &member).await;
+    let path = format!("/api/users/{}", member_id["id"]);
+
+    let (status, _) = send_json(&router, http::Method::PATCH, &path, &member, json!({ "daily_token_cap": 100 })).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    let (status, body) = send_json(&router, http::Method::PATCH, &path, &admin, json!({ "daily_token_cap": 100 })).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["daily_token_cap"], 100);
+
+    // An empty value clears the limit, which COALESCE would not allow.
+    let (status, body) = send_json(&router, http::Method::PATCH, &path, &admin, json!({ "daily_token_cap": null })).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body["daily_token_cap"].is_null());
+
+    let (status, _) = send_json(&router, http::Method::PATCH, &path, &admin, json!({ "daily_token_cap": 0 })).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    // Accounts without any usage are listed too, so a limit can be set before the first request.
+    let summary = get_json(&router, "/api/stats/summary", &admin).await;
+    assert_eq!(summary["users"].as_array().unwrap().len(), 2);
 }
 
 #[tokio::test]
