@@ -16,10 +16,13 @@ Then open <http://127.0.0.1:8787/>. The server binds every interface by default,
 network can reach the same port. Accounts sign in with a username and a password; there are
 no email addresses. The first account to register is the admin; everyone after that is a normal
 user. An admin is the only one who can change an account, and sees every key and every account;
-users see their own.
+users see their own. An admin can also make an account directly, with a username and a daily
+limit, while self-registration is closed — that person chooses their own password when they sign
+in for the first time.
 
 A database written before this change is migrated on start: the stored display name becomes the
-username, the email column is dropped, and existing accounts keep their limits and are enabled by
+username, the email column is dropped, a password column that was required is rebuilt so it can be
+left empty, the approval flag is added, and existing accounts keep their limits and are enabled by
 default.
 
 Environment variables:
@@ -98,8 +101,9 @@ URL hash (`#/overview`, `#/activity`, `#/keys`, `#/connections`, `#/connect`, `#
   model list; the answer streams in as it arrives and the conversation stays in this page. A
   model that sends reasoning gets it as a separate section above the answer.
 - **Accounts** — per-account totals and everything an admin can do to an account: the daily
-  token limit, a new username, a new password, disable, delete. Admin-only. This is also where
-  an admin opens or closes self-registration.
+  token limit, a new username, a new password, disable, delete, approve an account that is
+  waiting. Admin-only. This is also where an admin opens or closes self-registration, turns
+  approval on or off, and makes an account without opening registration.
 
 The dashboard reads `/api/stats/summary` and subscribes to `/api/live`, so the counters, the
 charts, the presence panel and the activity table update as traffic arrives — rows land in the
@@ -115,15 +119,26 @@ only, like the rest of the per-account data.
 
 Self-registration is closed by default as soon as the first account exists, because the first
 account to register is the admin. An admin can open it again from the Accounts view. While it is
-closed the entry screen opens on Sign in and `POST /api/register` answers 403, so opening
-registration is the only way a new account can appear — there is no admin form for creating one.
+closed the entry screen opens on Sign in and `POST /api/register` answers 403, so an admin either
+opens registration or makes the account themselves from the Accounts view.
+
+An account an admin makes has no password. The person who signs in with it for the first time
+chooses the password, and that is what is stored from then on; `POST /api/login` accepts whatever
+is entered while the account has no password hash.
+
+New accounts are held for approval, on by default: `POST /api/register` answers 200 with
+`pending: true` and no session, and signing in answers 403 until an admin approves the account in
+the Accounts view. The setting is `require_approval` in the `settings` table and can be turned off
+there; the first account is never held, because there is no one to approve it, and an account an
+admin made is not held either, because that admin approved it by making it.
 
 An account is identified by its username, and the only fields are the username, the password,
-the role, the daily limit and whether it is enabled. Disabling an account signs it out, refuses
-its keys at the gateway with 403, and stops a new sign-in; deleting it takes the account, its
-keys, its sessions and everything recorded for it, because those reference it with
-`ON DELETE CASCADE`. An admin cannot delete the account they are signed in with. Changing one
-field changes only that field, so setting a password does not clear a limit.
+the role, the daily limit, whether it is enabled, and whether it is waiting for approval.
+Disabling an account signs it out, refuses its keys at the gateway with 403, and stops a new
+sign-in; deleting it takes the account, its keys, its sessions and everything recorded for it,
+because those reference it with `ON DELETE CASCADE`. An admin cannot delete the account they are
+signed in with. Changing one field changes only that field, so setting a password does not clear a
+limit.
 
 It follows the system theme with a manual light/dark toggle, the sidebar collapses to an icon
 rail and becomes a drawer under 768px, and deleting a key, an account or a connection asks for
@@ -143,8 +158,10 @@ per-key limits and their validation, the keys list being the caller's own with t
 accounts read by an admin alone, per-account daily token limits including the day
 boundary and the admin-only rule for setting one, the admin/user scoping of the stats
 queries and the split between a caller's own figures and the platform total, the registration setting being read before sign in and closed by default after the
-first account, the account actions (disable, rename, new password, delete) and what they do to a
-sign-in, a key and the recorded usage, that deleting a key leaves the rows recorded for it and the
+first account, approval being on by default and blocking a sign-in until an admin grants it, an
+account made by an admin with no password until its first sign-in, the account actions (disable,
+rename, new password, approve, delete) and what they do to a sign-in, a key and the recorded usage,
+that deleting a key leaves the rows recorded for it and the
 counters standing, the presence counts while a request is in flight, and the migration of a
 database written with the old columns (a display name, an email, a lifetime cap), or with usage rows
 that were taken with the key, to the current shape.

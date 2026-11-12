@@ -21,6 +21,7 @@
       <button type="button" id="mode-login" aria-pressed="false">Sign in</button>
     </div>
     <p class="note" id="register-note" hidden>Self-registration is closed, so an admin has to open it before a new account can be made.</p>
+    <p class="note" id="first-password-note" hidden>For an account an admin made, the first password you enter here becomes your own.</p>
     <label>Username<input name="username" autocomplete="username" required></label>
     <label>Password<input name="password" type="password" minlength="8" required></label>
     <button type="submit" id="auth-submit">Register</button>
@@ -240,6 +241,16 @@
           <p class="help">Closed as soon as the first account exists. While it is open, anyone can register; the first account to register is the admin.</p>
           <div class="menu-wrap" id="registration-menu"></div>
         </div>
+        <div class="field" id="approval-field" hidden>
+          <span>New accounts need approval</span>
+          <p class="help">On by default. While it is on, an account that registers itself cannot sign in until an admin approves it in the table below. Turning it off lets an account sign in straight away.</p>
+          <div class="menu-wrap" id="approval-menu"></div>
+        </div>
+        <form id="account-form" hidden>
+          <label class="field">Username<input name="username" required></label>
+          <label class="field">Daily limit<p class="help">Optional. Leave it empty for no limit.</p><input name="daily_token_cap" type="number" min="1"></label>
+          <button type="submit">Create account</button>
+        </form>
         <div class="table">
           <table id="accounts">
             <thead><tr><th>Account</th><th>Daily limit</th><th>Used today</th><th>Requests</th><th>Tokens</th><th></th></tr></thead>

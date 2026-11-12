@@ -50,7 +50,7 @@ const state = {
   theme: 'system',
   // The entry screen falls back to offering Register when the setting could not be read, so a
   // first account is never blocked by a failed request.
-  settings: { open_registration: true, has_accounts: false },
+  settings: { open_registration: true, require_approval: true, has_accounts: false },
   presence: { online: 0, generating: 0, users: [] },
   chat: [],
   models: [],
@@ -165,6 +165,7 @@ function chooseOption(option) {
   }
   if (wrap.dataset.name === 'sandbox-model') state.sandboxModel = option.dataset.value;
   if (wrap.dataset.name === 'registration') setRegistration(option.dataset.value === 'open');
+  if (wrap.dataset.name === 'approval') setApproval(option.dataset.value === 'needed');
   if (wrap.dataset.name === 'key-owner') {
     state.keyOwner = option.dataset.value;
     renderKeys();
@@ -804,7 +805,7 @@ async function sendChat(text) {
 
 // Accounts. The view is admin-only, so the limit control is always editable here.
 function renderAccounts() {
-  renderRegistration();
+  renderAccountSettings();
   $('accounts-body').innerHTML = state.summary.users.length
     ? state.summary.users
         .map((user) => {
@@ -823,6 +824,7 @@ function renderAccounts() {
                   <input class="password" data-for="${user.id}" placeholder="new password" aria-label="New password for ${name}">
                   <button class="secondary" data-password="${user.id}">Set password</button>
                 </span>
+                ${user.pending ? '<span class="muted">waiting for approval</span>' : ''}
                 ${disabled ? '<span class="danger">disabled</span>' : ''}
               </span>
             </td>
@@ -836,6 +838,7 @@ function renderAccounts() {
             <td class="num">${nf.format(user.requests)}</td>
             <td class="num">${nf.format(user.tokens)}</td>
             <td class="num">
+              ${user.pending ? `<button class="link" data-approve="${user.id}">Approve</button>` : ''}
               <button class="link" data-status="${user.id}" data-enabled="${user.enabled}">${disabled ? 'Enable' : 'Disable'}</button>
               ${user.id === state.me.id ? '<span class="muted">signed in</span>' : `<button class="link danger" data-account="${user.id}">Delete</button>`}
             </td>
@@ -845,11 +848,11 @@ function renderAccounts() {
     : '<tr><td colspan="6">No account yet. The first account to register becomes the admin.</td>';
 }
 
-// Registration is closed by default as soon as the first account exists, so the control is
-// shown to an admin only.
-function renderRegistration() {
+// The settings on this page are for an admin: whether anyone may register, whether a new account
+// has to be approved, and the form that makes an account without opening registration.
+function renderAccountSettings() {
   const admin = state.me.role === 'admin';
-  $('registration-field').hidden = !admin;
+  for (const id of ['registration-field', 'approval-field', 'account-form']) $(id).hidden = !admin;
   if (!admin) return;
   renderMenu(
     $('registration-menu'),
@@ -860,6 +863,16 @@ function renderRegistration() {
     ],
     state.settings.open_registration ? 'open' : 'closed',
     'Self-registration',
+  );
+  renderMenu(
+    $('approval-menu'),
+    'approval',
+    [
+      { value: 'needed', label: 'Needed' },
+      { value: 'not needed', label: 'Not needed' },
+    ],
+    state.settings.require_approval ? 'needed' : 'not needed',
+    'New accounts need approval',
   );
 }
 
@@ -873,6 +886,21 @@ async function setRegistration(open) {
     state.settings.open_registration = open;
     renderAccounts();
     notice(open ? 'Self-registration is open. Anyone can make an account.' : 'Self-registration is closed.');
+  } catch (err) {
+    report(err);
+  }
+}
+
+async function setApproval(needed) {
+  try {
+    await api('/api/settings', {
+      method: 'PATCH',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ require_approval: needed }),
+    });
+    state.settings.require_approval = needed;
+    renderAccounts();
+    notice(needed ? 'A new account now waits for approval before it can sign in.' : 'Approval is off, so a new account can sign in straight away.');
   } catch (err) {
     report(err);
   }
@@ -894,7 +922,14 @@ function renderAuth() {
   $('first-account-note').hidden = state.settings.has_accounts;
   $('mode-register').hidden = !open;
   $('register-note').hidden = open;
+  showFirstPasswordNote();
   if (!open) setMode('login');
+}
+
+// An account made by an admin has no password until the person signs in for the first time, so
+// the entry screen says which password becomes theirs. It only applies once accounts exist.
+function showFirstPasswordNote() {
+  $('first-password-note').hidden = !(state.settings.has_accounts && mode === 'login');
 }
 
 function showShell() {
@@ -916,14 +951,22 @@ function setMode(next) {
   $('mode-register').setAttribute('aria-pressed', String(mode === 'register'));
   $('mode-login').setAttribute('aria-pressed', String(mode === 'login'));
   $('auth-submit').textContent = mode === 'register' ? 'Register' : 'Sign in';
+  showFirstPasswordNote();
   // The username is the identity for both paths, so the field stays in whichever mode is open.
   notice('');
 }
 
+// Registering can end without a session: an account that has to be approved is not signed in,
+// so the entry screen says what happens next instead of loading the app.
 async function submitAuth(form) {
   const data = Object.fromEntries(new FormData(form));
   try {
-    state.me = await postJson(`/api/${mode}`, data);
+    const account = await postJson(`/api/${mode}`, data);
+    if (account.pending) {
+      notice(`"${account.username}" is registered. An admin has to approve it before it can sign in.`);
+      return;
+    }
+    state.me = account;
     await load();
   } catch (err) {
     report(err);
@@ -1097,6 +1140,23 @@ $('connection-form').addEventListener('submit', async (event) => {
   }
 });
 
+// An admin can make an account while self-registration is closed, so this form is the only way
+// in for that person; the password is theirs when they sign in for the first time.
+$('account-form').addEventListener('submit', async (event) => {
+  event.preventDefault();
+  const form = event.target;
+  const data = Object.fromEntries(new FormData(form));
+  const body = { username: data.username, daily_token_cap: data.daily_token_cap ? Number(data.daily_token_cap) : null };
+  try {
+    const created = await postJson('/api/users', body);
+    form.reset();
+    await refresh('stats');
+    notice(`Made account "${created.username}". The password is theirs when they sign in for the first time.`);
+  } catch (err) {
+    report(err);
+  }
+});
+
 $('chat-form').addEventListener('submit', async (event) => {
   event.preventDefault();
   const form = event.target;
@@ -1194,6 +1254,11 @@ document.addEventListener('click', async (event) => {
       { enabled },
       enabled ? `Enabled "${user.username}".` : `Disabled "${user.username}". They are signed out and their keys do not work.`,
     );
+    return;
+  }
+  if (button.dataset.approve) {
+    const user = account(button.dataset.approve);
+    await changeAccount(user, { pending: false }, `Approved "${user.username}". They can sign in now.`);
     return;
   }
   if (button.dataset.account) {

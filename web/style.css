@@ -185,8 +185,9 @@ body {
 
 .topbar .spacer { flex: 1; }
 
+/* The data views use the full width of the window so a six-column table is not wrapped into
+   tall rows; prose keeps its reading width below, and forms keep theirs. */
 main {
-  max-width: 48rem;
   margin: 0 auto;
   padding: 12px 20px 64px;
   width: 100%;
@@ -409,9 +410,9 @@ tr.off td { color: var(--text-muted); }
   overflow-x: auto;
 }
 
-/* Forms: one column, labels above fields */
-
-.field { display: grid; gap: 6px; margin-bottom: 16px; font-size: 14px; }
+/* Forms: one column, labels above fields. A form does not read well stretched across a wide
+   page, so it keeps its own width while the tables below it use all of it. */
+.field { display: grid; gap: 6px; margin-bottom: 16px; font-size: 14px; max-width: 34rem; }
 .field input, .field select, .field textarea { width: 100%; }
 /* A menu inside a field has to be as wide as the fields around it. */
 .field .menu-wrap, .field .menu-button { width: 100%; }

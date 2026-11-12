@@ -121,18 +121,21 @@ pub async fn register(AxumState(st): AxumState<State>, Json(body): Json<Register
     };
     // The first account to register owns the instance.
     let role = if count == 0 { "admin" } else { "user" };
+    // The first account is never held back, because there is no one to approve it.
+    let pending = count > 0 && crate::settings::requires_approval(&st).await;
     let hash = match bcrypt::hash(&body.password, 10) {
         Ok(hash) => hash,
         Err(err) => return error(StatusCode::INTERNAL_SERVER_ERROR, "server_error", err.to_string()),
     };
 
     let row = match sqlx::query(
-        "INSERT INTO users (username, password_hash, role, created_at) VALUES (?, ?, ?, ?) RETURNING id",
+        "INSERT INTO users (username, password_hash, role, created_at, pending) VALUES (?, ?, ?, ?, ?) RETURNING id",
     )
     .bind(&username)
     .bind(&hash)
     .bind(role)
     .bind(crate::clock::now())
+    .bind(pending as i64)
     .fetch_one(&st.pool)
     .await
     {
@@ -140,6 +143,10 @@ pub async fn register(AxumState(st): AxumState<State>, Json(body): Json<Register
         Err(err) => return error(StatusCode::CONFLICT, "invalid_request", err.to_string()),
     };
     let id = row.get::<i64, _>("id");
+    if pending {
+        // No session yet: the account is signed in after an admin approves it.
+        return Json(json!({ "id": id, "username": username, "role": role, "pending": true })).into_response();
+    }
     let token = match create_session(&st, id).await {
         Ok(token) => token,
         Err(err) => return error(StatusCode::INTERNAL_SERVER_ERROR, "server_error", err.to_string()),
@@ -156,7 +163,7 @@ pub struct LoginBody {
 
 pub async fn login(AxumState(st): AxumState<State>, Json(body): Json<LoginBody>) -> Response {
     let username = body.username.trim().to_string();
-    let row = match sqlx::query("SELECT id, username, password_hash, role, enabled FROM users WHERE username = ?")
+    let row = match sqlx::query("SELECT id, username, password_hash, role, enabled, pending FROM users WHERE username = ?")
         .bind(&username)
         .fetch_optional(&st.pool)
         .await
@@ -167,13 +174,41 @@ pub async fn login(AxumState(st): AxumState<State>, Json(body): Json<LoginBody>)
     let Some(row) = row else {
         return error(StatusCode::UNAUTHORIZED, "invalid_credentials", "no account for that username");
     };
-    if !bcrypt::verify(&body.password, &row.get::<String, _>("password_hash")).unwrap_or(false) {
-        return error(StatusCode::UNAUTHORIZED, "invalid_credentials", "password does not match");
+    if row.get::<i64, _>("pending") == 1 {
+        return error(StatusCode::FORBIDDEN, "account_pending", "this account is waiting for an admin to approve it");
     }
+    let id = row.get::<i64, _>("id");
+
+    // An account made by an admin has no password until the person signs in for the first time;
+    // what they enter then becomes their own password.
+    match row.get::<Option<String>, _>("password_hash") {
+        Some(hash) => {
+            if !bcrypt::verify(&body.password, &hash).unwrap_or(false) {
+                return error(StatusCode::UNAUTHORIZED, "invalid_credentials", "password does not match");
+            }
+        }
+        None => {
+            if body.password.len() < 8 {
+                return error(StatusCode::BAD_REQUEST, "invalid_request", "password must be at least 8 characters");
+            }
+            let hash = match bcrypt::hash(&body.password, 10) {
+                Ok(hash) => hash,
+                Err(err) => return error(StatusCode::INTERNAL_SERVER_ERROR, "server_error", err.to_string()),
+            };
+            if let Err(err) = sqlx::query("UPDATE users SET password_hash = ? WHERE id = ?")
+                .bind(&hash)
+                .bind(id)
+                .execute(&st.pool)
+                .await
+            {
+                return error(StatusCode::INTERNAL_SERVER_ERROR, "server_error", err.to_string());
+            }
+        }
+    }
+
     if row.get::<i64, _>("enabled") == 0 {
         return error(StatusCode::FORBIDDEN, "account_disabled", "this account is disabled");
     }
-    let id = row.get::<i64, _>("id");
     let token = match create_session(&st, id).await {
         Ok(token) => token,
         Err(err) => return error(StatusCode::INTERNAL_SERVER_ERROR, "server_error", err.to_string()),

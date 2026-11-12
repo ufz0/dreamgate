@@ -1,12 +1,52 @@
 use axum::extract::{Path, State as AxumState};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Json, Response};
+use serde::Deserialize;
 use serde_json::{json, Value};
 use sqlx::Row;
 
 use crate::api::error;
 use crate::auth::Caller;
 use crate::state::State;
+
+// An admin can make an account without opening self-registration: the username and the limit are
+// set here, and the password is chosen by the person when they sign in for the first time. Such an
+// account is not waiting for approval, because the admin is the one who approved it by making it.
+#[derive(Deserialize)]
+pub struct CreateAccount {
+    pub username: String,
+    pub daily_token_cap: Option<i64>,
+}
+
+pub async fn create(AxumState(st): AxumState<State>, caller: Caller, Json(body): Json<CreateAccount>) -> Response {
+    if caller.role != "admin" {
+        return error(StatusCode::FORBIDDEN, "forbidden", "only an admin can make an account");
+    }
+    let username = body.username.trim().to_string();
+    if username.is_empty() || username.chars().any(char::is_whitespace) {
+        return error(StatusCode::BAD_REQUEST, "invalid_request", "username is required and cannot contain spaces");
+    }
+    if body.daily_token_cap.is_some_and(|cap| cap < 1) {
+        return error(StatusCode::BAD_REQUEST, "invalid_request", "the daily limit must be at least 1, or left unset");
+    }
+
+    let row = match sqlx::query(
+        "INSERT INTO users (username, password_hash, role, daily_token_cap, created_at) VALUES (?, NULL, 'user', ?, ?) RETURNING id",
+    )
+    .bind(&username)
+    .bind(body.daily_token_cap)
+    .bind(crate::clock::now())
+    .fetch_one(&st.pool)
+    .await
+    {
+        Ok(row) => row,
+        // A username that is already taken answers as a database error, so the response says which
+        // one it was rather than passing the driver text through.
+        Err(_) => return error(StatusCode::CONFLICT, "invalid_request", format!("the username {username} is already taken")),
+    };
+    let id = row.get::<i64, _>("id");
+    Json(json!({ "ok": true, "id": id, "username": username, "role": "user" })).into_response()
+}
 
 // One account at a time, and only the fields present in the body are applied, so a request
 // that carries a new password does not clear the limit. A limit sent as null clears it.
@@ -110,6 +150,15 @@ pub async fn update(AxumState(st): AxumState<State>, Path(id): Path<i64>, caller
                         }
                         changed.push(field.clone());
                     }
+                    Err(err) => return error(StatusCode::INTERNAL_SERVER_ERROR, "server_error", err.to_string()),
+                }
+            }
+            "pending" => {
+                let Some(pending) = value.as_bool() else {
+                    return error(StatusCode::BAD_REQUEST, "invalid_request", "pending must be true or false");
+                };
+                match sqlx::query("UPDATE users SET pending = ? WHERE id = ?").bind(pending as i64).bind(id).execute(&st.pool).await {
+                    Ok(_) => changed.push(field.clone()),
                     Err(err) => return error(StatusCode::INTERNAL_SERVER_ERROR, "server_error", err.to_string()),
                 }
             }

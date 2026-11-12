@@ -152,6 +152,65 @@ async fn open_registration(router: &Router, admin: &str) {
     assert_eq!(status, StatusCode::OK);
 }
 
+// A new account waits for approval by default and gets no session until an admin approves it, so
+// tests that are not about approval turn it off before registering. What approval itself does is
+// tested on its own.
+async fn no_approval(router: &Router, admin: &str) {
+    let (status, _) = send_json(router, http::Method::PATCH, "/api/settings", admin, json!({ "require_approval": false })).await;
+    assert_eq!(status, StatusCode::OK);
+}
+
+async fn sign_in(router: &Router, username: &str, password: &str) -> String {
+    let response = call(
+        router,
+        Request::post("/api/login")
+            .header("content-type", "application/json")
+            .body(Body::from(json!({ "username": username, "password": password }).to_string()))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    cookie_of(&response)
+}
+
+#[tokio::test]
+async fn a_new_account_waits_for_approval_before_it_can_sign_in() {
+    let st = test_state().await;
+    let router = build_router(st.clone());
+    let admin = register(&router, "ada").await;
+    assert_eq!(get_json(&router, "/api/settings", &admin).await["require_approval"], true);
+
+    open_registration(&router, &admin).await;
+    let (status, body) = post_json(&router, "/api/register", "", json!({ "username": "ben", "password": "test-password" })).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["pending"], true, "the second account is held, the first is not");
+
+    // Nothing is signed in yet, and signing in says why.
+    assert_eq!(post_json(&router, "/api/login", "", json!({ "username": "ben", "password": "test-password"})).await.0, StatusCode::FORBIDDEN);
+
+    let id = body["id"].as_i64().unwrap();
+    let (status, changed) = send_json(&router, http::Method::PATCH, &format!("/api/users/{id}"), &admin, json!({ "pending": false })).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(changed["changed"], json!(["pending"]));
+
+    let member = sign_in(&router, "ben", "test-password").await;
+    assert_eq!(get_json(&router, "/api/me", &member).await["username"], "ben");
+}
+
+#[tokio::test]
+async fn turning_approval_off_lets_an_account_register_and_sign_in_at_once() {
+    let st = test_state().await;
+    let router = build_router(st.clone());
+    let admin = register(&router, "ada").await;
+
+    open_registration(&router, &admin).await;
+    no_approval(&router, &admin).await;
+    // The helper asserts a session comes back with the registration, which is what an account
+    // that is not held gets.
+    let member = register(&router, "ben").await;
+    assert_eq!(get_json(&router, "/api/me", &member).await["username"], "ben");
+}
+
 async fn gateway_call(router: &Router, key: &str, body: Value) -> Response {
     call(
         router,
@@ -209,6 +268,7 @@ async fn first_registered_account_is_admin() {
     assert_eq!(closed.0, StatusCode::FORBIDDEN);
 
     open_registration(&router, &admin).await;
+    no_approval(&router, &admin).await;
     let member = register(&router, "ben").await;
     assert_eq!(get_json(&router, "/api/me", &member).await["role"], "user");
 }
@@ -228,15 +288,17 @@ async fn registration_setting_is_read_before_sign_in_and_only_an_admin_can_chang
     let after = get_json(&router, "/api/settings", "").await;
     assert_eq!(after["open_registration"], false, "closed by default after the first account");
     assert_eq!(after["has_accounts"], true);
+    assert_eq!(after["require_approval"], true, "approval is on by default once there is an admin to give it");
 
     let (status, _) = send_json(&router, http::Method::PATCH, "/api/settings", &admin, json!({ "open_registration": true })).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(get_json(&router, "/api/settings", &admin).await["open_registration"], true);
 
+    no_approval(&router, &admin).await;
     let member = register(&router, "ben").await;
-    let (status, _) = send_json(&router, http::Method::PATCH, "/api/settings", &member, json!({ "open_registration": false })).await;
-    assert_eq!(status, StatusCode::FORBIDDEN);
-    assert_eq!(get_json(&router, "/api/settings", &member).await["open_registration"], true, "the admin's setting stands");
+    let (status, _) = send_json(&router, http::Method::PATCH, "/api/settings", &member, json!({ "require_approval": true })).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "only an admin can change approval");
+    assert_eq!(get_json(&router, "/api/settings", &member).await["require_approval"], false, "the admin's setting stands");
 }
 
 #[tokio::test]
@@ -526,6 +588,7 @@ async fn the_keys_list_is_the_callers_own_and_only_an_admin_can_read_the_others(
     let router = build_router(st.clone());
     let admin = register(&router, "ada").await;
     open_registration(&router, &admin).await;
+    no_approval(&router, &admin).await;
     let member = register(&router, "ben").await;
 
     post_json(&router, "/api/keys", &admin, json!({ "name": "admin key" })).await;
@@ -659,6 +722,7 @@ async fn only_an_admin_can_set_an_account_cap() {
     let router = build_router(st.clone());
     let admin = register(&router, "ada").await;
     open_registration(&router, &admin).await;
+    no_approval(&router, &admin).await;
     let member = register(&router, "ben").await;
     let member_id = get_json(&router, "/api/me", &member).await;
     let path = format!("/api/users/{}", member_id["id"]);
@@ -686,6 +750,43 @@ async fn only_an_admin_can_set_an_account_cap() {
     assert_eq!(summary["users"].as_array().unwrap().len(), 2);
 }
 
+#[tokio::test]
+async fn an_admin_can_make_an_account_whose_password_is_chosen_on_the_first_sign_in() {
+    let st = test_state().await;
+    let router = build_router(st.clone());
+    let admin = register(&router, "ada").await;
+
+    // Self-registration is closed by default, so this is the only way in for the next account.
+    let (status, created) = post_json(&router, "/api/users", &admin, json!({ "username": "ben", "daily_token_cap": 200 })).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(created["role"], "user");
+
+    // The first sign-in is where the password is chosen, because there was none to check.
+    let member = sign_in(&router, "ben", "their-own-password").await;
+    assert_eq!(get_json(&router, "/api/me", &member).await["username"], "ben");
+    // From then on the password is checked, not taken as whatever is typed.
+    let (status, _) = post_json(&router, "/api/login", "", json!({ "username": "ben", "password": "something else" })).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+    let summary = get_json(&router, "/api/stats/summary", &admin).await;
+    let ben = summary["users"].as_array().unwrap().iter().find(|user| user["username"] == "ben").unwrap();
+    assert_eq!(ben["daily_token_cap"], 200, "the limit set on the form is the account's limit");
+    assert_eq!(ben["pending"], false, "an account the admin made is not waiting for approval");
+
+    // A member cannot make an account, a name that is taken is named rather than passed through
+    // as a database error, and a limit below 1 is refused.
+    let (status, body) = post_json(&router, "/api/users", &member, json!({ "username": "dee" })).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(body["error"]["message"], "only an admin can make an account");
+    let (status, body) = post_json(&router, "/api/users", &admin, json!({ "username": "ben" })).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(body["error"]["message"], "the username ben is already taken");
+    let (status, _) = post_json(&router, "/api/users", &admin, json!({ "username": " " })).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let (status, _) = post_json(&router, "/api/users", &admin, json!({ "username": "cy", "daily_token_cap": 0 })).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
 async fn usage_count(pool: &SqlitePool, user: i64) -> i64 {
     sqlx::query("SELECT COUNT(*) AS n FROM usage WHERE user_id = ?")
         .bind(user)
@@ -702,6 +803,7 @@ async fn a_disabled_account_cannot_sign_in_or_use_its_key() {
     let base_url = mock_upstream().await;
     let admin = register(&router, "ada").await;
     open_registration(&router, &admin).await;
+    no_approval(&router, &admin).await;
     let member = register(&router, "ben").await;
     let member_id = get_json(&router, "/api/me", &member).await["id"].as_i64().unwrap();
 
@@ -732,6 +834,7 @@ async fn an_admin_can_rename_an_account_and_set_a_new_password() {
     let router = build_router(st.clone());
     let admin = register(&router, "ada").await;
     open_registration(&router, &admin).await;
+    no_approval(&router, &admin).await;
     let member = register(&router, "ben").await;
     let member_id = get_json(&router, "/api/me", &member).await["id"].as_i64().unwrap();
     let path = format!("/api/users/{member_id}");
@@ -769,6 +872,7 @@ async fn deleting_an_account_takes_its_keys_and_its_usage_with_it() {
     let admin = register(&router, "ada").await;
     let admin_id = get_json(&router, "/api/me", &admin).await["id"].as_i64().unwrap();
     open_registration(&router, &admin).await;
+    no_approval(&router, &admin).await;
     let member = register(&router, "ben").await;
     let member_id = get_json(&router, "/api/me", &member).await["id"].as_i64().unwrap();
     let path = format!("/api/users/{member_id}");
@@ -842,7 +946,7 @@ async fn an_existing_database_with_the_old_columns_is_moved_to_the_current_shape
 
     assert_eq!(
         user_columns(&pool).await.join(","),
-        "created_at,daily_token_cap,enabled,id,password_hash,role,username"
+        "created_at,daily_token_cap,enabled,id,password_hash,pending,role,username"
     );
 
     // The account keeps its name and its limit; only the column names changed, and the email is
@@ -856,7 +960,7 @@ async fn an_existing_database_with_the_old_columns_is_moved_to_the_current_shape
     db::migrate(&pool).await.unwrap();
     assert_eq!(
         user_columns(&pool).await.join(","),
-        "created_at,daily_token_cap,enabled,id,password_hash,role,username"
+        "created_at,daily_token_cap,enabled,id,password_hash,pending,role,username"
     );
 
     // Rebuilding the table must not take the rows that belong to the account with it.
@@ -921,11 +1025,12 @@ async fn an_account_table_with_a_unique_email_and_a_current_limit_is_rebuilt() {
 
     assert_eq!(
         user_columns(&pool).await.join(","),
-        "created_at,daily_token_cap,enabled,id,password_hash,role,username"
+        "created_at,daily_token_cap,enabled,id,password_hash,pending,role,username"
     );
-    let row = sqlx::query("SELECT username, daily_token_cap, enabled FROM users").fetch_one(&pool).await.unwrap();
+    let row = sqlx::query("SELECT username, daily_token_cap, enabled, pending FROM users").fetch_one(&pool).await.unwrap();
     assert_eq!(row.get::<String, _>("username"), "ada");
     assert_eq!(row.get::<i64, _>("daily_token_cap"), 500);
+    assert_eq!(row.get::<i64, _>("pending"), 0, "an account that was already there is not held for approval");
     assert_eq!(count(&pool, "sessions").await, 1, "the sign-in for this account is still there");
 }
 
@@ -1013,6 +1118,7 @@ async fn the_summary_separates_the_callers_own_figures_from_the_platform_total()
     gateway_call(&router, admin_key["key"].as_str().unwrap(), json!({ "messages": [{ "role": "user", "content": "hi" }] })).await;
 
     open_registration(&router, &admin).await;
+    no_approval(&router, &admin).await;
     let member = register(&router, "ben").await;
     let (_, member_key) = post_json(&router, "/api/keys", &member, json!({ "name": "member key" })).await;
     gateway_call(&router, member_key["key"].as_str().unwrap(), json!({ "messages": [{ "role": "user", "content": "hi" }] })).await;
@@ -1061,6 +1167,7 @@ async fn presence_counts_an_account_while_its_request_is_running() {
 
     // Names are scoped like the rest of the stats: a member sees the counts, not the accounts.
     open_registration(&router, &admin).await;
+    no_approval(&router, &admin).await;
     let member = register(&router, "ben").await;
     let seen = get_json(&router, "/api/presence", &member).await;
     assert_eq!(seen["users"].as_array().unwrap().len(), 0);

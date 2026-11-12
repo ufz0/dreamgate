@@ -38,6 +38,7 @@ pub fn build_router(st: State) -> Router {
         .route("/keys", routing::get(keys::list).post(keys::create))
         .route("/keys/others", routing::get(keys::other_accounts))
         .route("/keys/{id}", routing::patch(keys::update).delete(keys::delete))
+        .route("/users", routing::post(users::create))
         .route("/users/{id}", routing::patch(users::update).delete(users::remove))
         .route("/connections", routing::get(registry::list).post(registry::create))
         .route("/connections/{id}", routing::delete(registry::remove))
