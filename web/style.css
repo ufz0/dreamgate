@@ -140,8 +140,10 @@ body {
 .shell[data-collapsed="true"] .nav span:not(.icon),
 .shell[data-collapsed="true"] .sidebar-foot { display: none; }
 
-/* The list is the part of the rail that scrolls; brand and account block stay put. */
-.nav { display: grid; gap: 2px; flex: 1; min-height: 0; overflow-y: auto; }
+/* The list is the part of the rail that scrolls, and only when it actually overflows.
+   Without align-content: start the single implicit grid row stretches to the full rail
+   height, which is what made every item as tall as the leftover space. */
+.nav { display: grid; gap: 2px; align-content: start; flex: 1; min-height: 0; overflow-y: auto; }
 
 .nav a {
   display: flex;

@@ -57,6 +57,10 @@ and llama.cpp builds), the gateway estimates them and marks the row as estimated
 streaming, the gateway adds `stream_options: {"include_usage": true}` so upstreams that can
 report usage will.
 
+Nothing else in the request body is changed, so a reasoning level a client sends — `reasoning_effort`
+or whatever the upstream calls it — reaches the runtime exactly as the client wrote it. DreamGate does
+not pick a level itself; it only routes and counts.
+
 An estimate counts everything the model produced, not only the answer. Reasoning models put their
 working in `reasoning_content` (or `reasoning`) beside the reply, and that text is counted as
 generated. The Sandbox shows it as its own section above the answer when an upstream sends it.
@@ -73,9 +77,10 @@ URL hash (`#/overview`, `#/activity`, `#/keys`, `#/connections`, `#/connect`, `#
 `#/accounts`):
 
 - **Overview** — the gate readout (client → key → upstream, following the key and the
-  connection the last request actually used, which is not necessarily the first key),
-  totals including today's, a "Right now" panel for who is online and generating, token rate
-  per hour, requests per day.
+  connection the last request actually used, which is not necessarily the first key), the count of
+  every token that has ever crossed the gate from any account, then this account's own totals
+  including today's, a "Right now" panel for who is online and generating, and the token rate per
+  hour and requests per day for this account. Totals across accounts are in the Accounts view.
 - **Activity** — every recorded request, newest first, plus usage by model.
 - **Keys** — create, copy, disable and delete keys, with per-key usage, and a note when a
   key's binding points at a connection that is turned off.
@@ -89,10 +94,11 @@ URL hash (`#/overview`, `#/activity`, `#/keys`, `#/connections`, `#/connect`, `#
   token limit, a new username, a new password, disable, delete. Admin-only. This is also where
   an admin opens or closes self-registration.
 
-The dashboard reads `/api/stats/summary` and subscribes to `/api/live`, so the readout, the
+The dashboard reads `/api/stats/summary` and subscribes to `/api/live`, so the counters, the
 charts, the presence panel and the activity table update as traffic arrives — rows land in the
-current view without a reload, and nothing polls. Per-key figures are always shown; the
-per-account view is admin-only.
+current view without a reload, and nothing polls. The platform total is the only figure that
+counts other accounts, and it is shown to anyone signed in; everything else on the Overview is
+this account's own. Per-key figures are always shown; the accounts table is admin-only.
 
 Presence is measured in the process, not stored: an account is online while a request of theirs
 came through the gateway in the last five minutes, and generating while one is in flight. The
@@ -124,11 +130,11 @@ cargo test
 
 The suite runs the gateway against a mock OpenAI-compatible upstream and covers usage
 recording, estimation when the upstream reports nothing including reasoning text, SSE
-pass-through, upstream failover,
+pass-through, that a client's reasoning level reaches the upstream unchanged, upstream failover,
 the model recorded for a streamed request when nothing is pinned to a key or a connection,
 per-key limits and their validation, per-account daily token limits including the day
 boundary and the admin-only rule for setting one, the admin/user scoping of the stats
-queries, the registration setting being read before sign in and closed by default after the
+queries and the split between a caller's own figures and the platform total, the registration setting being read before sign in and closed by default after the
 first account, the account actions (disable, rename, new password, delete) and what they do to a
 sign-in, a key and the recorded usage, the presence counts while a request is in flight, and the
 migration of a database written with the old columns (a display name, an email, a lifetime cap)

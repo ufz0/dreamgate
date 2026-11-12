@@ -43,8 +43,11 @@ pub fn hub() -> Hub {
 pub async fn stream_events(AxumState(st): AxumState<State>, caller: Caller) -> Response {
     let scoped = caller.role != "admin";
     let user_id = caller.id;
-    let totals = stats::totals(&st, scoped, user_id).await.unwrap_or(json!({}));
-    let snapshot = json!({ "type": "snapshot", "scoped": scoped, "totals": totals }).to_string();
+    // The page shows both: the account's own figures and the total across every account, so
+    // the snapshot has to carry both rather than one role-dependent set.
+    let self_totals = stats::totals(&st, true, user_id).await.unwrap_or(json!({}));
+    let global = stats::totals(&st, false, user_id).await.unwrap_or(json!({}));
+    let snapshot = json!({ "type": "snapshot", "scoped": scoped, "self": self_totals, "global": global }).to_string();
     let receiver = st.hub.subscribe();
 
     let body = stream::once(async move { Ok::<_, BoxError>(Bytes::from(format!("data: {snapshot}\n\n"))) }).chain(

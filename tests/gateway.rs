@@ -69,6 +69,12 @@ async fn mock_models() -> Json<Value> {
     Json(json!({ "object": "list", "data": [{ "id": "test-model" }] }))
 }
 
+// An upstream that answers with the body it was sent, so a test can read exactly what the
+// gateway forwarded.
+async fn mock_echo(Json(body): Json<Value>) -> Json<Value> {
+    Json(body)
+}
+
 async fn mock_upstream() -> String {
     let app = Router::new()
         .route("/v1/models", get(mock_models))
@@ -391,6 +397,39 @@ async fn counts_reasoning_in_the_estimate_when_the_upstream_reports_none() {
     let usage = recorded_usage(&st.pool).await;
     assert_eq!(usage[0]["estimated"], true);
     assert_eq!(usage[0]["completion_tokens"], 7, "the answer and the reasoning together");
+}
+
+#[tokio::test]
+async fn reasoning_effort_is_forwarded_to_the_upstream_unchanged() {
+    let echo = Router::new().route("/v1/chat/completions", post(mock_echo));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base_url = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, echo).await.unwrap() });
+
+    let st = test_state().await;
+    let router = build_router(st.clone());
+    let cookie = register(&router, "ada").await;
+    post_json(&router, "/api/connections", &cookie, json!({ "name": "test", "base_url": base_url })).await;
+    let (_, created) = post_json(&router, "/api/keys", &cookie, json!({ "name": "test key" })).await;
+    let key = created["key"].as_str().unwrap().to_string();
+
+    // DreamGate does not interpret reasoning levels, it forwards the request body as it is, so a
+    // client's reasoning_effort reaches the runtime.
+    let response = gateway_call(
+        &router,
+        &key,
+        json!({
+            "model": "reasoning-model",
+            "messages": [{ "role": "user", "content": "hi" }],
+            "reasoning_effort": "high",
+        }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let sent = json_body(response).await;
+    assert_eq!(sent["reasoning_effort"], "high");
+    assert_eq!(sent["model"], "reasoning-model");
 }
 
 #[tokio::test]
@@ -847,7 +886,7 @@ async fn user_columns(pool: &SqlitePool) -> Vec<String> {
 }
 
 #[tokio::test]
-async fn summary_totals_are_scoped_to_the_caller() {
+async fn the_summary_separates_the_callers_own_figures_from_the_platform_total() {
     let st = test_state().await;
     let router = build_router(st.clone());
     let base_url = mock_upstream().await;
@@ -862,18 +901,21 @@ async fn summary_totals_are_scoped_to_the_caller() {
     let (_, member_key) = post_json(&router, "/api/keys", &member, json!({ "name": "member key" })).await;
     gateway_call(&router, member_key["key"].as_str().unwrap(), json!({ "messages": [{ "role": "user", "content": "hi" }] })).await;
 
+    // The summary reports the caller's own figures and the platform total separately, so the
+    // page does not have to infer which one it is showing.
     let admin_summary = get_json(&router, "/api/stats/summary", &admin).await;
-    assert_eq!(admin_summary["scope"], "all");
-    assert_eq!(admin_summary["totals"]["requests"], 2);
-    assert_eq!(admin_summary["totals"]["total_tokens"], 36);
-    assert_eq!(admin_summary["hourly"].as_array().unwrap().len(), 1, "both requests fall in the current hour");
+    assert_eq!(admin_summary["self"]["requests"], 1, "an admin's own figures are their own");
+    assert_eq!(admin_summary["self"]["total_tokens"], 18);
+    assert_eq!(admin_summary["global"]["requests"], 2);
+    assert_eq!(admin_summary["global"]["total_tokens"], 36);
+    assert_eq!(admin_summary["hourly"].as_array().unwrap().len(), 1, "the charts are per account");
     assert_eq!(admin_summary["models"].as_array().unwrap().len(), 1);
     assert_eq!(admin_summary["users"].as_array().unwrap().len(), 2);
 
     let member_summary = get_json(&router, "/api/stats/summary", &member).await;
-    assert_eq!(member_summary["scope"].as_str(), Some("self"), "{member_summary}");
-    assert_eq!(member_summary["totals"]["requests"], 1);
-    assert_eq!(member_summary["totals"]["total_tokens"], 18);
+    assert_eq!(member_summary["self"]["requests"], 1, "{member_summary}");
+    assert_eq!(member_summary["self"]["total_tokens"], 18);
+    assert_eq!(member_summary["global"]["requests"], 2, "the platform total is not scoped");
     assert_eq!(member_summary["users"].as_array().unwrap().len(), 0, "a member does not see other accounts");
 
     let recent = get_json(&router, "/api/stats/recent", &member).await;

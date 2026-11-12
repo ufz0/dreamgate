@@ -238,13 +238,29 @@ async function refresh(path) {
   render(false);
 }
 
+// A counter moves with the same event the feed does. The top counter covers every account, so
+// any event counts; an account's own figures only move for the event that belongs to it.
+const isToday = (value) => String(value).slice(0, 10) === new Date().toISOString().slice(0, 10);
+
+function countTotals(totals, event) {
+  if (!totals) return;
+  totals.total_tokens = num(totals.total_tokens) + event.total_tokens;
+  totals.requests = num(totals.requests) + 1;
+  // The day figures are what a daily account limit is measured against.
+  if (isToday(event.created_at)) {
+    totals.today_tokens = num(totals.today_tokens) + event.total_tokens;
+    totals.today_requests = num(totals.today_requests) + 1;
+  }
+}
+
 function subscribe() {
   if (state.live) state.live.close();
   state.live = new EventSource('/api/live');
   state.live.onmessage = (message) => {
     const payload = JSON.parse(message.data);
     if (payload.type === 'snapshot') {
-      state.summary.totals = payload.totals;
+      state.summary.self = payload.self;
+      state.summary.global = payload.global;
       render(false);
       return;
     }
@@ -256,18 +272,16 @@ function subscribe() {
     state.events.unshift(payload.event);
     state.events = state.events.slice(0, 50);
     const event = payload.event;
-    const totals = state.summary.totals;
-    totals.total_tokens = num(totals.total_tokens) + event.total_tokens;
-    totals.requests = num(totals.requests) + 1;
-    // The day figures are what a daily account limit is measured against, so they have to
-    // move with the same event the feed does.
-    if (String(event.created_at).slice(0, 10) === new Date().toISOString().slice(0, 10)) {
-      totals.today_tokens = num(totals.today_tokens) + event.total_tokens;
-      totals.today_requests = num(totals.today_requests) + 1;
+    // Every event counts toward the total the gate has produced, but only the caller's own events
+    // move the account figures or the charts.
+    countTotals(state.summary.global, event);
+    if (event.user_id === state.me.id) countTotals(state.summary.self, event);
+    if (isToday(event.created_at)) {
       const account = state.summary.users.find((user) => user.id === event.user_id);
       if (account) account.used_today = num(account.used_today) + event.total_tokens;
     }
-    addEvent(event);
+    // The charts are per account, so an event from another account does not move them.
+    if (event.user_id === state.me.id) addEvent(event);
     const wire = $('gate-wire');
     wire.classList.add('arrive');
     setTimeout(() => wire.classList.remove('arrive'), 180);
@@ -409,11 +423,13 @@ function renderGate() {
   ].join(' ');
 }
 
+// The two totals are different questions, so they are read from different parts of the summary:
+// the top one is the whole gate, the one below the gate diagram is this account.
 function renderReadout() {
-  const t = state.summary.totals;
+  $('global-tokens').textContent = nf.format(state.summary.global?.total_tokens || 0);
+
+  const t = state.summary.self;
   $('total-tokens').textContent = nf.format(t.total_tokens || 0);
-  $('readout-note').textContent =
-    state.me.role === 'admin' ? 'tokens counted so far, every account' : 'tokens counted so far, this account only';
 
   const rows = [
     ['Requests', nf.format(t.requests || 0)],

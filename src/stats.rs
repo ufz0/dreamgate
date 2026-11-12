@@ -131,29 +131,32 @@ async fn accounts(st: &State) -> Result<Vec<serde_json::Value>, sqlx::Error> {
         .collect())
 }
 
+// The overview is the account's own figures plus one figure that is not: the total across
+// every account and key. Both are reported separately so the page does not have to guess which
+// one it is showing, and the charts are always the caller's own even for an admin.
 async fn build_summary(st: &State, caller: &Caller) -> Result<serde_json::Value, sqlx::Error> {
-    let scoped = caller.role != "admin";
     let admin = caller.role == "admin";
-    let scope = scope_clause(scoped, "usage.user_id");
 
-    let all = totals(st, scoped, caller.id).await?;
-    let hourly = buckets(st, scoped, caller.id, "strftime('%Y-%m-%dT%H:00:00Z', created_at)", "-24 hours").await?;
-    let daily = buckets(st, scoped, caller.id, "strftime('%Y-%m-%d', created_at)", "-14 days").await?;
+    let self_totals = totals(st, true, caller.id).await?;
+    let global = totals(st, false, caller.id).await?;
+    let hourly = buckets(st, true, caller.id, "strftime('%Y-%m-%dT%H:00:00Z', created_at)", "-24 hours").await?;
+    let daily = buckets(st, true, caller.id, "strftime('%Y-%m-%d', created_at)", "-14 days").await?;
     let models = grouped(
         st,
-        scoped,
+        !admin,
         caller.id,
         &format!(
             "SELECT COALESCE(model, 'unknown') AS model, COUNT(*) AS requests, COALESCE(SUM(total_tokens), 0) AS tokens \
              FROM usage {scope} GROUP BY model ORDER BY tokens DESC LIMIT 8",
+            scope = scope_clause(!admin, "usage.user_id"),
         ),
     )
     .await?;
     let users = if admin { accounts(st).await? } else { Vec::new() };
 
     Ok(json!({
-        "scope": if admin { "all" } else { "self" },
-        "totals": all,
+        "self": self_totals,
+        "global": global,
         "hourly": hourly,
         "daily": daily,
         "models": models,
