@@ -79,7 +79,7 @@ URL hash (`#/overview`, `#/activity`, `#/keys`, `#/connections`, `#/connect`, `#
 - **Activity** — every recorded request, newest first, plus usage by model.
 - **Keys** — create, copy, disable and delete keys, with per-key usage, and a note when a
   key's binding points at a connection that is turned off.
-- **Connections** — add and health-check upstreams.
+- **Connections** — add and health-check upstreams. Admin-only, like the per-account figures.
 - **Connect a client** — the base URL, a key picker, a copyable curl request.
 - **Sandbox** — chat with any model a connection serves, through the same gateway the clients
   use, so the request is recorded like any other. Pick a key and a model from the connection's

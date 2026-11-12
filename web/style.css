@@ -112,12 +112,12 @@ body {
 
 .entry-form label { display: grid; gap: 6px; font-size: 14px; color: var(--text-muted); margin-bottom: 14px; }
 
-/* Shell */
-
+/* Shell — two independently scrolling panes. The rail keeps the brand and the account block
+   in place and scrolls only its own list, so a long page never pushes sign-out off screen. */
 .shell {
   display: grid;
   grid-template-columns: 272px minmax(0, 1fr);
-  min-height: 100vh;
+  height: 100vh;
 }
 
 .shell[data-collapsed="true"] { grid-template-columns: 52px minmax(0, 1fr); }
@@ -130,7 +130,7 @@ body {
   gap: 18px;
 }
 
-.brand { display: flex; align-items: center; gap: 10px; padding: 6px; font-size: 15px; font-weight: 600; }
+.brand { display: flex; align-items: center; gap: 10px; padding: 6px; font-size: 15px; font-weight: 600; flex: none; }
 
 .brand svg { width: 20px; height: 20px; stroke: var(--text); stroke-width: 1.75; fill: none; flex: none; }
 
@@ -140,7 +140,8 @@ body {
 .shell[data-collapsed="true"] .nav span:not(.icon),
 .shell[data-collapsed="true"] .sidebar-foot { display: none; }
 
-.nav { display: grid; gap: 2px; }
+/* The list is the part of the rail that scrolls; brand and account block stay put. */
+.nav { display: grid; gap: 2px; flex: 1; min-height: 0; overflow-y: auto; }
 
 .nav a {
   display: flex;
@@ -163,23 +164,33 @@ body {
 
 .icon svg { width: 18px; height: 18px; stroke: currentColor; stroke-width: 1.75; fill: none; stroke-linecap: round; stroke-linejoin: round; }
 
-.sidebar-foot { margin-top: auto; padding: 6px; display: grid; gap: 8px; }
+/* Pinned to the bottom of the rail: margin-top auto takes whatever the list does not need. */
+.sidebar-foot { margin-top: auto; padding: 6px; display: grid; gap: 8px; flex: none; }
 
 .account { color: var(--text-muted); font-size: 13px; margin: 0; }
 .account b { font-weight: 600; color: var(--text); }
 
-.content { display: grid; grid-template-rows: auto 1fr; }
+/* min-height: 0 is what lets the second row scroll instead of growing the page. */
+.content { display: grid; grid-template-rows: auto 1fr; min-height: 0; }
 
 .topbar {
   display: flex;
   align-items: center;
   gap: 10px;
   padding: 10px 20px;
+  flex: none;
 }
 
 .topbar .spacer { flex: 1; }
 
-main { max-width: 48rem; margin: 0 auto; padding: 12px 20px 64px; width: 100%; }
+main {
+  max-width: 48rem;
+  margin: 0 auto;
+  padding: 12px 20px 64px;
+  width: 100%;
+  min-height: 0;
+  overflow-y: auto;
+}
 
 .view h1 { margin: 0 0 16px; font: 400 20px/1.5 var(--font-serif); }
 .view h2 { margin: 28px 0 10px; font-size: 14px; font-weight: 600; }

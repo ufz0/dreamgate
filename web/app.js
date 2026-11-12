@@ -54,6 +54,13 @@ const state = {
 
 const VIEWS = ['overview', 'activity', 'keys', 'connections', 'connect', 'sandbox', 'accounts'];
 
+// Views an account that is not an admin cannot open, so they are not in the navigation either.
+const ADMIN_ONLY = ['accounts', 'connections'];
+
+function viewAllowed(name) {
+  return state.me.role === 'admin' || !ADMIN_ONLY.includes(name);
+}
+
 async function api(path, init) {
   const response = await fetch(path, { credentials: 'same-origin', ...init });
   const body = await response.json().catch(() => ({}));
@@ -77,6 +84,29 @@ function report(err) {
   const message = String(err?.message || '');
   notice(message && message.length < 140 ? message : 'Something went wrong. Check the values and try again.', 'error');
   console.error(err);
+}
+
+// The clipboard is only exposed on a secure origin, so this page served over http on a LAN
+// address has no navigator.clipboard. Selecting a temporary textarea still copies there.
+async function copy(text) {
+  if (navigator.clipboard) {
+    try {
+      await navigator.clipboard.writeText(text);
+      return true;
+    } catch {
+      // Permission denied for this origin — fall through to the selection path.
+    }
+  }
+  const area = document.createElement('textarea');
+  area.value = text;
+  area.setAttribute('readonly', '');
+  area.style.position = 'fixed';
+  area.style.left = '-100%';
+  document.body.appendChild(area);
+  area.select();
+  const copied = document.execCommand('copy');
+  area.remove();
+  return copied;
 }
 
 // Menus replace the native select: a button plus a list, closed on outside click and
@@ -145,15 +175,18 @@ const RENDER = {
 function currentView() {
   const name = (location.hash || '').replace(/^#\/?/, '');
   if (!VIEWS.includes(name)) return 'overview';
-  if (name === 'accounts' && state.me.role !== 'admin') return 'overview';
+  if (!viewAllowed(name)) return 'overview';
   return name;
 }
 
 function route() {
   state.view = currentView();
   for (const link of document.querySelectorAll('.nav a')) {
-    link.hidden = link.dataset.view === 'accounts' && state.me.role !== 'admin';
-    if (link.hidden) continue;
+    if (!viewAllowed(link.dataset.view)) {
+      link.hidden = true;
+      continue;
+    }
+    link.hidden = false;
     if (link.dataset.view === state.view) link.setAttribute('aria-current', 'page');
     else link.removeAttribute('aria-current');
   }
@@ -170,7 +203,6 @@ function render(arrived) {
 }
 
 function renderNav() {
-  $('nav-accounts').hidden = state.me.role !== 'admin';
   $('count-keys').textContent = state.keys.length ? String(state.keys.length) : '';
   const badge = $('count-connections');
   const down = state.connections.filter((c) => c.health === 'down').length;
@@ -1057,13 +1089,12 @@ async function setLimit(user, raw) {
 document.addEventListener('click', async (event) => {
   const button = event.target.closest('button.link, button.secondary');
   if (!button) return;
-  if (button.dataset.copy) {
-    await navigator.clipboard.writeText(button.dataset.copy);
-    button.textContent = 'Copied';
-    return;
-  }
-  if (button.dataset.copyFrom) {
-    await navigator.clipboard.writeText($(button.dataset.copyFrom).textContent.trim());
+  if (button.dataset.copy || button.dataset.copyFrom) {
+    const text = button.dataset.copy || $(button.dataset.copyFrom).textContent.trim();
+    if (!(await copy(text))) {
+      notice('Nothing was copied. Select the value and copy it yourself.', 'error');
+      return;
+    }
     button.textContent = 'Copied';
     return;
   }
