@@ -546,6 +546,35 @@ async fn the_keys_list_is_the_callers_own_and_only_an_admin_can_read_the_others(
 }
 
 #[tokio::test]
+async fn deleting_a_key_leaves_the_usage_recorded_for_it() {
+    let st = test_state().await;
+    let router = build_router(st.clone());
+    let base_url = mock_upstream().await;
+    let admin = register(&router, "ada").await;
+    post_json(&router, "/api/connections", &admin, json!({ "name": "test", "base_url": base_url, "default_model": "reports-usage" })).await;
+
+    let (_, created) = post_json(&router, "/api/keys", &admin, json!({ "name": "test key" })).await;
+    gateway_call(&router, created["key"].as_str().unwrap(), json!({ "messages": [{ "role": "user", "content": "hi" }] })).await;
+    let before = get_json(&router, "/api/stats/summary", &admin).await;
+    assert_eq!(before["self"]["total_tokens"], 18);
+
+    let key_id = created["id"].as_i64().unwrap();
+    let (status, _) = send_json(&router, http::Method::DELETE, &format!("/api/keys/{key_id}"), &admin, json!({})).await;
+    assert_eq!(status, StatusCode::OK);
+
+    // The counters are what crossed the gate, so removing the key cannot make them smaller.
+    let after = get_json(&router, "/api/stats/summary", &admin).await;
+    assert_eq!(after["self"]["total_tokens"], 18, "the account total stands");
+    assert_eq!(after["global"]["total_tokens"], 18, "the platform total stands");
+
+    let row = sqlx::query("SELECT api_key_id FROM usage").fetch_one(&st.pool).await.unwrap();
+    assert_eq!(row.get::<Option<i64>, _>("api_key_id"), None, "the row is left without its key");
+
+    let recent = get_json(&router, "/api/stats/recent", &admin).await;
+    assert_eq!(recent["events"][0]["key"], Value::Null, "the activity row has no key name left");
+}
+
+#[tokio::test]
 async fn per_key_token_cap_blocks_the_next_request() {
     let st = test_state().await;
     let router = build_router(st.clone());
@@ -908,6 +937,68 @@ async fn user_columns(pool: &SqlitePool) -> Vec<String> {
         .into_iter()
         .map(|row| row.get::<String, _>("name"))
         .collect()
+}
+
+#[tokio::test]
+async fn a_database_that_takes_usage_with_a_deleted_key_is_moved_to_the_current_shape() {
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
+        .unwrap();
+    for statement in db::SCHEMA {
+        sqlx::query(*statement).execute(&pool).await.unwrap();
+    }
+
+    // A usage table as it was written before a recorded request outlived its key: the column
+    // could not be null and the row went with the key.
+    sqlx::query("DROP TABLE usage").execute(&pool).await.unwrap();
+    sqlx::query(
+        "CREATE TABLE usage (
+            id INTEGER PRIMARY KEY,
+            api_key_id INTEGER NOT NULL REFERENCES api_keys(id) ON DELETE CASCADE,
+            user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            connection_id INTEGER REFERENCES connections(id) ON DELETE SET NULL,
+            model TEXT,
+            prompt_tokens INTEGER NOT NULL,
+            completion_tokens INTEGER NOT NULL,
+            total_tokens INTEGER NOT NULL,
+            latency_ms INTEGER NOT NULL,
+            status INTEGER NOT NULL,
+            streamed INTEGER NOT NULL DEFAULT 0,
+            estimated INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL
+        )",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query("INSERT INTO users (id, username, password_hash, role, created_at) VALUES (1, 'ada', 'hash', 'admin', '2026-01-01T00:00:00Z')")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO api_keys (id, user_id, name, key, created_at) VALUES (1, 1, 'key', 'dreamgate_test', '2026-01-01T00:00:00Z')")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO usage (api_key_id, user_id, model, prompt_tokens, completion_tokens, total_tokens, latency_ms, status, created_at) VALUES (1, 1, 'test-model', 11, 7, 18, 5, 200, '2026-01-01T00:00:00Z')")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    db::migrate(&pool).await.unwrap();
+
+    // The rows that were already recorded stand, and the key reference now sets the column null.
+    sqlx::query("DELETE FROM api_keys WHERE id = 1").execute(&pool).await.unwrap();
+    assert_eq!(usage_count(&pool, 1).await, 1, "the recorded usage outlives the key");
+
+    // Running it again on a table that is already current changes nothing.
+    db::migrate(&pool).await.unwrap();
+    assert_eq!(usage_count(&pool, 1).await, 1);
+
+    // An account still takes the rows that belong to it.
+    sqlx::query("DELETE FROM users WHERE id = 1").execute(&pool).await.unwrap();
+    assert_eq!(usage_count(&pool, 1).await, 0);
 }
 
 #[tokio::test]

@@ -173,10 +173,12 @@ pub async fn summary(AxumState(st): AxumState<State>, caller: Caller) -> Respons
 
 pub async fn recent(AxumState(st): AxumState<State>, caller: Caller) -> Response {
     let scoped = caller.role != "admin";
+    // A recorded request outlives the key it came in on, so the key is looked up rather than
+    // assumed to still be there; the page says which rows have no key left.
     let sql = format!(
         "SELECT r.id, k.name AS key_name, u.username AS user_name, r.model, r.prompt_tokens, \
                 r.completion_tokens, r.total_tokens, r.latency_ms, r.status, r.streamed, r.created_at \
-         FROM usage r JOIN api_keys k ON k.id = r.api_key_id JOIN users u ON u.id = r.user_id \
+         FROM usage r LEFT JOIN api_keys k ON k.id = r.api_key_id JOIN users u ON u.id = r.user_id \
          {scope} ORDER BY r.id DESC LIMIT 50",
         scope = if scoped { "WHERE r.user_id = ?" } else { "" }
     );
@@ -194,7 +196,7 @@ pub async fn recent(AxumState(st): AxumState<State>, caller: Caller) -> Response
         .map(|row| {
             json!({
                 "id": row.get::<i64, _>("id"),
-                "key": row.get::<String, _>("key_name"),
+                "key": row.get::<Option<String>, _>("key_name"),
                 "user": row.get::<String, _>("user_name"),
                 "model": row.get::<Option<String>, _>("model"),
                 "prompt_tokens": row.get::<i64, _>("prompt_tokens"),

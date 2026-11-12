@@ -45,7 +45,7 @@ pub const SCHEMA: &[&str] = &[
     )",
     "CREATE TABLE IF NOT EXISTS usage (
         id INTEGER PRIMARY KEY,
-        api_key_id INTEGER NOT NULL REFERENCES api_keys(id) ON DELETE CASCADE,
+        api_key_id INTEGER REFERENCES api_keys(id) ON DELETE SET NULL,
         user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
         connection_id INTEGER REFERENCES connections(id) ON DELETE SET NULL,
         model TEXT,
@@ -97,35 +97,87 @@ pub async fn connect(url: &str) -> Result<SqlitePool, sqlx::Error> {
 // created before either change is moved to the current columns; the values already stored still
 // apply to the accounts that were created under the old names.
 pub async fn migrate(pool: &SqlitePool) -> Result<(), sqlx::Error> {
-    // An email with a UNIQUE constraint cannot be dropped, so a table that still has one is
-    // rebuilt in the current shape.
     if has_column(pool, "email").await? {
-        return rebuild_accounts(pool).await;
+        rebuild_accounts(pool).await?;
+    } else {
+        if !has_column(pool, "daily_token_cap").await? {
+            let statement = if has_column(pool, "token_cap").await? {
+                "ALTER TABLE users RENAME COLUMN token_cap TO daily_token_cap"
+            } else {
+                "ALTER TABLE users ADD COLUMN daily_token_cap INTEGER"
+            };
+            sqlx::query(statement).execute(pool).await?;
+        }
+        // A database created with a display name keeps it as the username, which keeps the existing
+        // accounts and their sessions working; the email address is dropped with it.
+        if !has_column(pool, "username").await? {
+            let statement = if has_column(pool, "name").await? {
+                "ALTER TABLE users RENAME COLUMN name TO username"
+            } else {
+                "ALTER TABLE users ADD COLUMN username TEXT NOT NULL DEFAULT ''"
+            };
+            sqlx::query(statement).execute(pool).await?;
+        }
+        if has_column(pool, "email").await? {
+            sqlx::query("ALTER TABLE users DROP COLUMN email").execute(pool).await?;
+        }
+        if !has_column(pool, "enabled").await? {
+            sqlx::query("ALTER TABLE users ADD COLUMN enabled INTEGER NOT NULL DEFAULT 1").execute(pool).await?;
+        }
     }
-    if !has_column(pool, "daily_token_cap").await? {
-        let statement = if has_column(pool, "token_cap").await? {
-            "ALTER TABLE users RENAME COLUMN token_cap TO daily_token_cap"
-        } else {
-            "ALTER TABLE users ADD COLUMN daily_token_cap INTEGER"
-        };
-        sqlx::query(statement).execute(pool).await?;
+    relax_key_reference(pool).await
+}
+
+// Recorded usage outlives the key it came in on: the counters measure what crossed the gate, so
+// removing a key must not take rows that were already true. A table that still cascades the key,
+// or cannot hold a null key, is rebuilt — SQLite cannot change the action of a table that exists.
+async fn relax_key_reference(pool: &SqlitePool) -> Result<(), sqlx::Error> {
+    let action = sqlx::query("SELECT \"on_delete\" AS action FROM pragma_foreign_key_list('usage') WHERE \"table\" = 'api_keys'")
+        .fetch_one(pool)
+        .await?
+        .get::<String, _>("action");
+    let required = sqlx::query("SELECT COUNT(*) AS n FROM pragma_table_info('usage') WHERE name = 'api_key_id' AND \"notnull\" = 1")
+        .fetch_one(pool)
+        .await?
+        .get::<i64, _>("n")
+        > 0;
+    if action == "SET NULL" && !required {
+        return Ok(());
     }
-    // A database created with a display name keeps it as the username, which keeps the existing
-    // accounts and their sessions working; the email address is dropped with it.
-    if !has_column(pool, "username").await? {
-        let statement = if has_column(pool, "name").await? {
-            "ALTER TABLE users RENAME COLUMN name TO username"
-        } else {
-            "ALTER TABLE users ADD COLUMN username TEXT NOT NULL DEFAULT ''"
-        };
-        sqlx::query(statement).execute(pool).await?;
-    }
-    if has_column(pool, "email").await? {
-        sqlx::query("ALTER TABLE users DROP COLUMN email").execute(pool).await?;
-    }
-    if !has_column(pool, "enabled").await? {
-        sqlx::query("ALTER TABLE users ADD COLUMN enabled INTEGER NOT NULL DEFAULT 1").execute(pool).await?;
-    }
+
+    let mut conn = pool.acquire().await?;
+    sqlx::query("PRAGMA foreign_keys = OFF").execute(conn.as_mut()).await?;
+    sqlx::query(
+        "CREATE TABLE usage_new (
+            id INTEGER PRIMARY KEY,
+            api_key_id INTEGER REFERENCES api_keys(id) ON DELETE SET NULL,
+            user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            connection_id INTEGER REFERENCES connections(id) ON DELETE SET NULL,
+            model TEXT,
+            prompt_tokens INTEGER NOT NULL,
+            completion_tokens INTEGER NOT NULL,
+            total_tokens INTEGER NOT NULL,
+            latency_ms INTEGER NOT NULL,
+            status INTEGER NOT NULL,
+            streamed INTEGER NOT NULL DEFAULT 0,
+            estimated INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL
+        )",
+    )
+    .execute(conn.as_mut()).await?;
+    // Both shapes have the same columns, so the rows move as they are.
+    sqlx::query(
+        "INSERT INTO usage_new (id, api_key_id, user_id, connection_id, model, prompt_tokens, \
+                completion_tokens, total_tokens, latency_ms, status, streamed, estimated, created_at) \
+         SELECT id, api_key_id, user_id, connection_id, model, prompt_tokens, completion_tokens, \
+                total_tokens, latency_ms, status, streamed, estimated, created_at FROM usage",
+    )
+    .execute(conn.as_mut()).await?;
+    sqlx::query("DROP TABLE usage").execute(conn.as_mut()).await?;
+    sqlx::query("ALTER TABLE usage_new RENAME TO usage").execute(conn.as_mut()).await?;
+    // Dropping the table drops the index on the key with it, so that one is made again.
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_usage_key ON usage (api_key_id)").execute(conn.as_mut()).await?;
+    sqlx::query("PRAGMA foreign_keys = ON").execute(conn.as_mut()).await?;
     Ok(())
 }
 

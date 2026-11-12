@@ -314,6 +314,10 @@ th { color: var(--text-muted); font-size: 13px; font-weight: 600; }
 td.num { text-align: right; font: 400 14px/1.4 var(--font-mono); font-variant-numeric: tabular-nums; }
 td .clamp { max-width: 240px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
+/* A key that is turned off stays listed, because the requests recorded for it still stand, so its
+   row reads quieter than the keys that work. The action buttons keep their own colour. */
+tr.off td { color: var(--text-muted); }
+
 /* Chips and status */
 
 .chip {

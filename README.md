@@ -70,6 +70,10 @@ connections are health-checked every 30 seconds. A key with no connection routes
 enabled connection by priority, and a connection that is down or fails at the transport
 level falls over to the next one.
 
+A recorded request outlives the key it came in on. Deleting a key leaves its rows standing, so the
+counters do not move when a key is removed; an activity row whose key is gone is marked key
+removed.
+
 ## Dashboard
 
 Open it at the address above. It is a no-build single-page app with seven views routed by the
@@ -83,9 +87,10 @@ URL hash (`#/overview`, `#/activity`, `#/keys`, `#/connections`, `#/connect`, `#
   hour and requests per day for this account. Totals across accounts are in the Accounts view.
 - **Activity** — every recorded request, newest first, plus usage by model.
 - **Keys** — create, copy, disable and delete keys, with per-key usage, and a note when a
-  key's binding points at a connection that is turned off. The table is this account's own keys for
-  anyone; under it an admin can pick another account, or all of them, and see those keys with the
-  account each one belongs to.
+  key's binding points at a connection that is turned off. A key that is turned off stays listed and
+  reads dimmer than the keys that work. The table is this account's own keys for anyone; under it an
+  admin can pick another account, or all of them, and see those keys with the account each one
+  belongs to.
 - **Connections** — add and health-check upstreams. Admin-only, like the per-account figures.
 - **Connect a client** — the base URL, a key picker, a copyable curl request.
 - **Sandbox** — chat with any model a connection serves, through the same gateway the clients
@@ -139,6 +144,7 @@ accounts read by an admin alone, per-account daily token limits including the da
 boundary and the admin-only rule for setting one, the admin/user scoping of the stats
 queries and the split between a caller's own figures and the platform total, the registration setting being read before sign in and closed by default after the
 first account, the account actions (disable, rename, new password, delete) and what they do to a
-sign-in, a key and the recorded usage, the presence counts while a request is in flight, and the
-migration of a database written with the old columns (a display name, an email, a lifetime cap)
-to the current shape.
+sign-in, a key and the recorded usage, that deleting a key leaves the rows recorded for it and the
+counters standing, the presence counts while a request is in flight, and the migration of a
+database written with the old columns (a display name, an email, a lifetime cap), or with usage rows
+that were taken with the key, to the current shape.

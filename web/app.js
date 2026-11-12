@@ -6,6 +6,10 @@ const esc = (value) =>
 // A snapshot can arrive with empty totals, so live counting starts from 0 rather than undefined.
 const num = (value) => (Number.isFinite(value) ? value : 0);
 
+// A recorded request outlives the key it came in on, so a row whose key is gone says so instead
+// of showing an empty cell.
+const keyLabel = (event) => event.key || 'key removed';
+
 const ICONS = {
   overview: '<path d="M4 17a8 8 0 0 1 16 0"/><path d="M12 14l4-3"/>',
   activity: '<path d="M4 6h16M4 12h12M4 18h8"/>',
@@ -491,7 +495,7 @@ function renderFeed(arrived) {
           (event, i) =>
             `<li class="${arrived && i === 0 ? ' arrived' : ''}">
               <span>${esc(event.created_at.slice(11, 19))}</span>
-              <span>${esc(event.key)}</span>
+              <span>${esc(keyLabel(event))}</span>
               <span>${esc(event.model || 'no model')}</span>
               <span class="${event.status >= 400 ? 'danger' : ''}">${esc(event.status)}</span>
               <span class="tokens">${nf.format(event.total_tokens)}</span>
@@ -514,7 +518,7 @@ function renderActivity() {
           (event) =>
             `<tr>
               <td>${esc(event.created_at.slice(11, 19))}</td>
-              <td><span class="clamp">${esc(event.key)}</span></td>
+              <td><span class="clamp">${esc(keyLabel(event))}</span></td>
               ${admin ? `<td><span class="clamp">${esc(event.user)}</span></td>` : ''}
               <td><span class="clamp">${esc(event.model || 'no model')}</span></td>
               <td class="num">${nf.format(event.total_tokens)}</td>
@@ -545,7 +549,9 @@ function keyRow(key, showOwner) {
   // A binding to a disabled connection does not hold: the key uses another one.
   const bound = key.connection_id ? state.connections.find((c) => c.id === key.connection_id) : null;
   const binding = bound && !bound.enabled ? `${esc(bound.name)} <span class="muted">binding inactive</span>` : esc(key.connection || 'any');
-  return `<tr>
+  // A key that is off is still a key with a history, so the row stays and only reads quieter; the
+  // Enable button in it says plainly which state it is in.
+  return `<tr class="${key.enabled ? '' : 'off'}">
     ${showOwner ? `<td>${esc(key.owner)}</td>` : ''}
     <td><span class="clamp" title="${esc(key.key)}">${esc(key.name)}</span></td>
     <td>${binding}</td>
