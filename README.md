@@ -95,7 +95,10 @@ URL hash (`#/overview`, `#/activity`, `#/keys`, `#/connections`, `#/connect`, `#
   reads dimmer than the keys that work. The table is this account's own keys for anyone; under it an
   admin can pick another account, or all of them, and see those keys with the account each one
   belongs to.
-- **Connections** — add and health-check upstreams. Admin-only, like the per-account figures.
+- **Connections** — add and health-check upstreams. Admin-only, like the per-account figures, and
+  that rule is on the routes as well as on the page. The key a connection carries is returned to an
+  admin alone; every signed-in account still sees the connection itself, because the gate readout and
+  the model list need it.
 - **Connect a client** — the base URL, a key picker, a copyable curl request.
 - **Sandbox** — chat with any model a connection serves, through the same gateway the clients
   use, so the request is recorded like any other. Pick a key and a model from the connection's
@@ -146,6 +149,33 @@ to an icon rail and becomes a drawer under 768px, and deleting a key, an account
 asks for confirmation first. There is no connection-status chip in the header: the live stream
 reconnects on its own, and a request that arrives moves the counters.
 
+## Security
+
+What an unauthenticated request can reach is the entry screen: `POST /api/register`, `POST /api/login`,
+`GET /api/settings`, and the static files. Everything else needs a session or a DreamGate key.
+
+- The session is an `HttpOnly; SameSite=Lax` cookie, and it is marked `Secure` when the request
+  arrived over TLS, including through a proxy that sets `x-forwarded-proto`. DreamGate does not
+  terminate TLS itself, so that is where a production instance should: over plain HTTP a password and
+  a session token travel in the clear, which is what the `0.0.0.0` default means on a shared network.
+- A session row is refused after the window the cookie lasts (30 days), so a token taken from a shared
+  browser and replayed does not work forever.
+- Sign-in attempts are bounded to 10 per account per minute, and an unknown username answers exactly as
+  a wrong password does, so an attempt cannot be used to list the accounts. A state-changing request
+  from another site carries no session cookie, so a cross-site form cannot act as the signed-in account.
+- Adding, removing or checking a connection is an admin action in the API as well as in the page, and
+  the key a connection carries is returned to an admin alone. A disabled account is refused at both
+  gateway endpoints, not only at the completion path.
+- Every statement takes its values as parameters; the only text put into a statement is a scope clause
+  that comes from the code. Every value the page prints from the API is escaped on the way into the DOM.
+
+Two things this pass left as they are, and a public release should decide on them first. An account an
+admin makes has no password until its first sign-in, so whoever signs in with that username first is the
+one who sets it — the intended feature, but a guessed username can be claimed by anyone who reaches the
+instance. And the role is decided by counting rows before the insert, so two first sign-ins at the same
+moment on an empty instance can both be told they own it. Error responses pass the driver text through,
+so a constraint name can reach a client, and bcrypt only reads the first 72 bytes of a password.
+
 ## Tests
 
 ```sh
@@ -164,6 +194,9 @@ first account, approval being on by default and blocking a sign-in until an admi
 account made by an admin with no password until its first sign-in, the account actions (disable,
 rename, new password, approve, delete) and what they do to a sign-in, a key and the recorded usage,
 that deleting a key leaves the rows recorded for it and the
-counters standing, the presence counts while a request is in flight, and the migration of a
-database written with the old columns (a display name, an email, a lifetime cap), or with usage rows
-that were taken with the key, to the current shape.
+counters standing, the presence counts while a request is in flight, the connections routes being
+admin-only with the key a connection carries returned to an admin alone, the model list refusing a
+disabled account the same way the completion path does, sign-in attempts being bounded per account, a
+session refused past the window the cookie lasts, the cookie marked Secure only when the request came
+over TLS, and the migration of a database written with the old columns (a display name, an email, a
+lifetime cap), or with usage rows that were taken with the key, to the current shape.
