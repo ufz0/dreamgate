@@ -29,33 +29,19 @@ pub struct UpdateKey {
     pub token_cap: Option<i64>,
 }
 
-pub async fn list(AxumState(st): AxumState<State>, caller: Caller) -> Response {
-    // An admin sees every key; everyone else sees their own.
-    let sql = if caller.role == "admin" {
-        "SELECT k.id, k.name, k.key, k.model, k.connection_id, k.enabled, k.rpm_limit, k.token_cap, \
-                k.created_at, c.name AS connection, u.username AS owner, \
-                COUNT(r.id) AS requests, COALESCE(SUM(r.total_tokens), 0) AS tokens \
-         FROM api_keys k LEFT JOIN usage r ON r.api_key_id = k.id \
-         LEFT JOIN connections c ON c.id = k.connection_id \
-         JOIN users u ON u.id = k.user_id \
-         GROUP BY k.id ORDER BY tokens DESC"
-    } else {
-        "SELECT k.id, k.name, k.key, k.model, k.connection_id, k.enabled, k.rpm_limit, k.token_cap, \
-                k.created_at, c.name AS connection, u.username AS owner, \
-                COUNT(r.id) AS requests, COALESCE(SUM(r.total_tokens), 0) AS tokens \
-         FROM api_keys k LEFT JOIN usage r ON r.api_key_id = k.id \
-         LEFT JOIN connections c ON c.id = k.connection_id \
-         JOIN users u ON u.id = k.user_id \
-         WHERE k.user_id = ? \
-         GROUP BY k.id ORDER BY tokens DESC"
-    };
-    let query = sqlx::query(sql);
-    let query = if caller.role == "admin" { query } else { query.bind(caller.id) };
-    let rows = match query.fetch_all(&st.pool).await {
-        Ok(rows) => rows,
-        Err(err) => return error(StatusCode::INTERNAL_SERVER_ERROR, "server_error", err.to_string()),
-    };
-    let keys: Vec<serde_json::Value> = rows
+// One row shape for both lists. The Keys page shows the caller's own keys; an admin can ask for
+// the other accounts separately, so a table never mixes two owners.
+const KEY_SQL: &str = "SELECT k.id, k.name, k.key, k.model, k.connection_id, k.enabled, k.rpm_limit, k.token_cap, \
+        k.created_at, c.name AS connection, u.username AS owner, \
+        COUNT(r.id) AS requests, COALESCE(SUM(r.total_tokens), 0) AS tokens \
+ FROM api_keys k LEFT JOIN usage r ON r.api_key_id = k.id \
+ LEFT JOIN connections c ON c.id = k.connection_id \
+ JOIN users u ON u.id = k.user_id {scope} GROUP BY k.id ORDER BY tokens DESC";
+
+async fn key_rows(st: &State, scope: &str, user_id: i64) -> Result<Vec<serde_json::Value>, sqlx::Error> {
+    let sql = KEY_SQL.replace("{scope}", scope);
+    let rows = sqlx::query(sqlx::AssertSqlSafe(sql.as_str())).bind(user_id).fetch_all(&st.pool).await?;
+    Ok(rows
         .iter()
         .map(|row| {
             json!({
@@ -74,8 +60,25 @@ pub async fn list(AxumState(st): AxumState<State>, caller: Caller) -> Response {
                 "created_at": row.get::<String, _>("created_at"),
             })
         })
-        .collect();
-    Json(json!({ "keys": keys })).into_response()
+        .collect())
+}
+
+pub async fn list(AxumState(st): AxumState<State>, caller: Caller) -> Response {
+    match key_rows(&st, "WHERE k.user_id = ?", caller.id).await {
+        Ok(keys) => Json(json!({ "keys": keys })).into_response(),
+        Err(err) => error(StatusCode::INTERNAL_SERVER_ERROR, "server_error", err.to_string()),
+    }
+}
+
+// Keys that belong to someone else, for an admin.
+pub async fn other_accounts(AxumState(st): AxumState<State>, caller: Caller) -> Response {
+    if caller.role != "admin" {
+        return error(StatusCode::FORBIDDEN, "forbidden", "only an admin can see keys from other accounts");
+    }
+    match key_rows(&st, "WHERE k.user_id != ?", caller.id).await {
+        Ok(keys) => Json(json!({ "keys": keys })).into_response(),
+        Err(err) => error(StatusCode::INTERNAL_SERVER_ERROR, "server_error", err.to_string()),
+    }
 }
 
 pub async fn create(AxumState(st): AxumState<State>, caller: Caller, Json(body): Json<CreateKey>) -> Response {

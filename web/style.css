@@ -411,6 +411,9 @@ td .clamp { max-width: 240px; overflow: hidden; text-overflow: ellipsis; white-s
 .field input, .field select, .field textarea { width: 100%; }
 /* A menu inside a field has to be as wide as the fields around it. */
 .field .menu-wrap, .field .menu-button { width: 100%; }
+/* The account picker on the Keys page is a control by itself, not part of a form, so it stays
+   the width of its own label. */
+#other-keys-field .menu-wrap, #other-keys-field .menu-button { width: auto; justify-self: start; }
 
 input, select, textarea {
   background: var(--surface);

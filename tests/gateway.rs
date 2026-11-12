@@ -521,6 +521,31 @@ async fn key_limits_must_be_positive() {
 }
 
 #[tokio::test]
+async fn the_keys_list_is_the_callers_own_and_only_an_admin_can_read_the_others() {
+    let st = test_state().await;
+    let router = build_router(st.clone());
+    let admin = register(&router, "ada").await;
+    open_registration(&router, &admin).await;
+    let member = register(&router, "ben").await;
+
+    post_json(&router, "/api/keys", &admin, json!({ "name": "admin key" })).await;
+    post_json(&router, "/api/keys", &member, json!({ "name": "member key" })).await;
+
+    // The Keys page shows one table, so the main list is always the caller's own and another
+    // account's keys come from a read an admin can make on their own.
+    let own = get_json(&router, "/api/keys", &admin).await;
+    assert_eq!(own["keys"].as_array().unwrap().len(), 1, "an admin's own list is their own");
+    assert_eq!(own["keys"][0]["name"], "admin key");
+
+    let others = get_json(&router, "/api/keys/others", &admin).await;
+    assert_eq!(others["keys"].as_array().unwrap().len(), 1);
+    assert_eq!(others["keys"][0]["owner"], "ben", "the other list names who a key belongs to");
+
+    let denied = get_json(&router, "/api/keys/others", &member).await;
+    assert_eq!(denied["error"]["message"], "only an admin can see keys from other accounts");
+}
+
+#[tokio::test]
 async fn per_key_token_cap_blocks_the_next_request() {
     let st = test_state().await;
     let router = build_router(st.clone());

@@ -36,6 +36,7 @@ pub fn build_router(st: State) -> Router {
         .route("/stats/recent", routing::get(stats::recent))
         .route("/live", routing::get(live::stream_events))
         .route("/keys", routing::get(keys::list).post(keys::create))
+        .route("/keys/others", routing::get(keys::other_accounts))
         .route("/keys/{id}", routing::patch(keys::update).delete(keys::delete))
         .route("/users/{id}", routing::patch(users::update).delete(users::remove))
         .route("/connections", routing::get(registry::list).post(registry::create))

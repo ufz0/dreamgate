@@ -83,7 +83,9 @@ URL hash (`#/overview`, `#/activity`, `#/keys`, `#/connections`, `#/connect`, `#
   hour and requests per day for this account. Totals across accounts are in the Accounts view.
 - **Activity** — every recorded request, newest first, plus usage by model.
 - **Keys** — create, copy, disable and delete keys, with per-key usage, and a note when a
-  key's binding points at a connection that is turned off.
+  key's binding points at a connection that is turned off. The table is this account's own keys for
+  anyone; under it an admin can pick another account, or all of them, and see those keys with the
+  account each one belongs to.
 - **Connections** — add and health-check upstreams. Admin-only, like the per-account figures.
 - **Connect a client** — the base URL, a key picker, a copyable curl request.
 - **Sandbox** — chat with any model a connection serves, through the same gateway the clients
@@ -132,7 +134,8 @@ The suite runs the gateway against a mock OpenAI-compatible upstream and covers 
 recording, estimation when the upstream reports nothing including reasoning text, SSE
 pass-through, that a client's reasoning level reaches the upstream unchanged, upstream failover,
 the model recorded for a streamed request when nothing is pinned to a key or a connection,
-per-key limits and their validation, per-account daily token limits including the day
+per-key limits and their validation, the keys list being the caller's own with the other
+accounts read by an admin alone, per-account daily token limits including the day
 boundary and the admin-only rule for setting one, the admin/user scoping of the stats
 queries and the split between a caller's own figures and the platform total, the registration setting being read before sign in and closed by default after the
 first account, the account actions (disable, rename, new password, delete) and what they do to a

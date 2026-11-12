@@ -31,8 +31,11 @@ function paintIcons(root) {
 
 const state = {
   me: null,
-  summary: { totals: {}, hourly: [], daily: [], models: [], users: [] },
+  summary: { self: {}, global: {}, hourly: [], daily: [], models: [], users: [] },
   keys: [],
+  // Keys that belong to another account, read only by an admin, and which of them the page shows.
+  otherKeys: [],
+  keyOwner: '',
   connections: [],
   events: [],
   hours: [],
@@ -158,6 +161,10 @@ function chooseOption(option) {
   }
   if (wrap.dataset.name === 'sandbox-model') state.sandboxModel = option.dataset.value;
   if (wrap.dataset.name === 'registration') setRegistration(option.dataset.value === 'open');
+  if (wrap.dataset.name === 'key-owner') {
+    state.keyOwner = option.dataset.value;
+    renderKeys();
+  }
 }
 
 // Views
@@ -220,6 +227,7 @@ async function load() {
   state.keys = (await api('/api/keys')).keys;
   state.connections = (await api('/api/connections')).connections;
   state.events = (await api('/api/stats/recent')).events;
+  await loadOtherKeys();
   await refreshPresence();
   buildAxes();
   showShell();
@@ -227,12 +235,20 @@ async function load() {
   subscribe();
 }
 
+// Only an admin can read another account's keys, so a member never asks for them.
+async function loadOtherKeys() {
+  state.otherKeys = state.me?.role === 'admin' ? (await api('/api/keys/others')).keys : [];
+}
+
 async function refreshPresence() {
   state.presence = await api('/api/presence');
 }
 
 async function refresh(path) {
-  if (path === 'keys') state.keys = (await api('/api/keys')).keys;
+  if (path === 'keys') {
+    state.keys = (await api('/api/keys')).keys;
+    await loadOtherKeys();
+  }
   if (path === 'connections') state.connections = (await api('/api/connections')).connections;
   if (path === 'stats') state.summary = await api('/api/stats/summary');
   render(false);
@@ -525,33 +541,58 @@ function connectionOptions() {
   return [{ value: '', label: 'Any enabled connection' }, ...state.connections.map((c) => ({ value: String(c.id), label: c.name }))];
 }
 
+function keyRow(key, showOwner) {
+  // A binding to a disabled connection does not hold: the key uses another one.
+  const bound = key.connection_id ? state.connections.find((c) => c.id === key.connection_id) : null;
+  const binding = bound && !bound.enabled ? `${esc(bound.name)} <span class="muted">binding inactive</span>` : esc(key.connection || 'any');
+  return `<tr>
+    ${showOwner ? `<td>${esc(key.owner)}</td>` : ''}
+    <td><span class="clamp" title="${esc(key.key)}">${esc(key.name)}</span></td>
+    <td>${binding}</td>
+    <td>${esc(key.model || 'the client model')}</td>
+    <td>${key.rpm_limit ? `${key.rpm_limit}/min` : 'no limit'}<br>${key.token_cap ? nf.format(key.token_cap) : 'no cap'}</td>
+    <td class="num">${nf.format(key.requests)}</td>
+    <td class="num">${nf.format(key.tokens)}</td>
+    <td class="num">
+      <button class="link" data-copy="${esc(key.key)}">Copy key</button>
+      <button class="link" data-toggle="${key.id}" data-enabled="${key.enabled}">${key.enabled ? 'Disable' : 'Enable'}</button>
+      <button class="link danger" data-delete="${key.id}">Delete</button>
+    </td>
+  </tr>`;
+}
+
+// Only accounts that have a key can be picked, so the list is the keys themselves.
+function keyOwnerOptions() {
+  const owners = [...new Set(state.otherKeys.map((key) => key.owner))].sort((a, b) => a.localeCompare(b));
+  return [{ value: '', label: 'None' }, { value: 'all', label: 'All other accounts' }, ...owners.map((name) => ({ value: name, label: name }))];
+}
+
 function renderKeys() {
+  const admin = state.me.role === 'admin';
+  // The table above is this account's own keys for everyone; another account's keys are a
+  // separate read an admin can ask for.
+  $('other-keys-field').hidden = !admin;
   $('keys-body').innerHTML = state.keys.length
-    ? state.keys
-        .map(
-          (key) => {
-            // A binding to a disabled connection does not hold: the key uses another one.
-            const bound = key.connection_id ? state.connections.find((c) => c.id === key.connection_id) : null;
-            const binding = bound && !bound.enabled ? `${esc(bound.name)} <span class="muted">binding inactive</span>` : esc(key.connection || 'any');
-            return `<tr>
-            <td><span class="clamp" title="${esc(key.key)}">${esc(key.name)}</span></td>
-            <td>${binding}</td>
-            <td>${esc(key.model || 'the client model')}</td>
-            <td>${key.rpm_limit ? `${key.rpm_limit}/min` : 'no limit'}<br>${key.token_cap ? nf.format(key.token_cap) : 'no cap'}</td>
-            <td class="num">${nf.format(key.requests)}</td>
-            <td class="num">${nf.format(key.tokens)}</td>
-            <td class="num">
-              <button class="link" data-copy="${esc(key.key)}">Copy key</button>
-              <button class="link" data-toggle="${key.id}" data-enabled="${key.enabled}">${key.enabled ? 'Disable' : 'Enable'}</button>
-              <button class="link danger" data-delete="${key.id}">Delete</button>
-            </td>
-          </tr>`;
-          },
-        )
-        .join('')
+    ? state.keys.map((key) => keyRow(key, false)).join('')
     : `<tr><td colspan="7">No key yet. Create one above, then use it as the Bearer token, or as x-api-key, against /v1/chat/completions.</td></tr>`;
 
   renderMenu($('connection-menu'), 'connection', connectionOptions(), $('connection-menu').dataset.value || '', 'Connection');
+  if (!admin) return;
+
+  const options = keyOwnerOptions();
+  // A picked account can stop having keys, because its key or the account is deleted, so a
+  // choice that is no longer offered is dropped instead of leaving an empty table.
+  if (!options.some((o) => o.value === state.keyOwner)) state.keyOwner = '';
+
+  const hasOthers = state.otherKeys.length > 0;
+  $('key-owner-menu').hidden = !hasOthers;
+  $('other-keys-note').hidden = hasOthers;
+  $('other-keys-note').textContent = hasOthers ? '' : 'No key belongs to another account yet.';
+  if (hasOthers) renderMenu($('key-owner-menu'), 'key-owner', options, state.keyOwner, 'Keys from other accounts');
+
+  const rows = state.otherKeys.filter((key) => state.keyOwner && (state.keyOwner === 'all' || key.owner === state.keyOwner));
+  $('other-keys-table').hidden = !rows.length;
+  $('other-keys-body').innerHTML = rows.map((key) => keyRow(key, true)).join('');
 }
 
 // Connections
@@ -1172,8 +1213,12 @@ document.addEventListener('click', async (event) => {
     return;
   }
   if (button.dataset.delete) {
-    const key = state.keys.find((k) => k.id === Number(button.dataset.delete));
-    confirmAction('Delete key', `Delete "${key.name}"? Requests already recorded for it stay.`, 'Delete', async () => {
+    const id = Number(button.dataset.delete);
+    const own = state.keys.find((k) => k.id === id);
+    const key = own || state.otherKeys.find((k) => k.id === id);
+    // An admin can delete another account's key, so the confirm names whose key it is.
+    const who = own ? '' : ` (${key.owner})`;
+    confirmAction('Delete key', `Delete "${key.name}"${who}? Requests already recorded for it stay.`, 'Delete', async () => {
       await api(`/api/keys/${key.id}`, { method: 'DELETE' });
       if (key.key === state.connectKey) state.connectKey = null;
       await refresh('keys');
