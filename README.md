@@ -212,7 +212,8 @@ URL hash (`#/overview`, `#/activity`, `#/keys`, `#/connections`, `#/connect`, `#
   request, and the speed is measured over the rows whose counts an upstream reported rather than over
   estimated ones; when nothing reported timings those rows are not shown. Totals across accounts are
   in the Accounts view.
-- **Activity** — every recorded request, newest first, plus usage by model.
+- **Activity** — the last 50 recorded requests, newest first, plus usage by model for the eight
+  models with the most tokens.
 - **Keys** — create, copy, disable and delete keys, with per-key usage, and a note when a
   key's binding points at a connection that is turned off. A key that is turned off stays listed and
   reads dimmer than the keys that work. The table is this account's own keys for anyone; under it an

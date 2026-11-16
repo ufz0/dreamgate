@@ -75,7 +75,7 @@
           </div>
           <div>
             <p class="readout" id="global-input-tokens">0</p>
-            <p class="readout-note" id="global-input-note">what was sent in, every account and key</p>
+            <p class="readout-note" id="global-input-note">what every account and key sent in</p>
           </div>
         </div>
 
@@ -106,19 +106,20 @@
         <dl class="panel" id="presence"></dl>
         <p class="note">Online means a request came through the gateway from that account in the last five minutes. Generating means one is in flight now. This clears when the gateway is restarted.</p>
 
-        <h2>Token rate (input + output), last 24 hours</h2>
+        <h2>Token rate (input + output) for this account, last 24 hours</h2>
         <div class="chart" id="chart-hourly"></div>
 
-        <h2>Requests per day, last 14 days</h2>
+        <h2>Requests per day for this account, last 14 days</h2>
         <div class="chart" id="chart-daily"></div>
 
         <h2>Live traffic</h2>
+        <div class="feed-head" id="feed-head"><span>Time</span><span>Key</span><span>Model</span><span>Status</span><span class="tokens">Tokens</span></div>
         <ul class="feed" id="feed" aria-live="polite"></ul>
       </section>
 
       <section class="view" data-view="activity" hidden>
         <h1>Activity</h1>
-        <p class="lede">Every request that crossed the gate, newest first, with what it cost. New rows arrive as they happen. Times are UTC.</p>
+        <p class="lede">The last 50 requests that crossed the gate, newest first, with what each cost. New rows arrive as they happen. Times are UTC.</p>
         <div class="table">
           <table id="activity">
             <thead id="activity-head"></thead>
@@ -148,30 +149,38 @@
               <p class="help">Leave it on any connection unless this key is for one runtime.</p>
               <div class="menu-wrap" id="connection-menu"></div>
             </div>
-            <label class="field">Model<p class="help">Leave it empty to use the model the client asks for.</p><input name="model"></label>
+            <div class="field">
+              <label for="key-model">Model</label>
+              <p class="help" id="key-model-help">Leave it empty to use the model the client asks for.</p>
+              <input id="key-model" name="model" aria-describedby="key-model-help">
+            </div>
             <label class="field">Requests per minute<input name="rpm_limit" type="number" min="1"></label>
-            <label class="field">Token cap<p class="help">Counted against everything this key has already used, so it does not reset. The account limit in the Accounts view counts one day.</p><input name="token_cap" type="number" min="1"></label>
+            <div class="field">
+              <label for="key-token-cap">Token cap</label>
+              <p class="help" id="key-token-cap-help">Counted against everything this key has already used, so it does not reset. An account's daily limit, which an admin sets, counts one day and applies on top of it.</p>
+              <input id="key-token-cap" name="token_cap" type="number" min="1" aria-describedby="key-token-cap-help">
+            </div>
           </div>
           <button type="submit">Create key</button>
         </form>
         <div class="table">
           <table id="keys">
             <thead>
-              <tr><th>Key</th><th>Connection</th><th>Model</th><th>Limits</th><th>Requests</th><th>Tokens</th><th></th></tr>
+              <tr><th>Key</th><th>Connection</th><th>Model</th><th>Limits</th><th>Requests</th><th>Tokens</th><th><span class="visually-hidden">Actions</span></th></tr>
             </thead>
             <tbody id="keys-body"></tbody>
           </table>
         </div>
         <div class="field" id="other-keys-field" hidden>
           <span>Keys from other accounts</span>
-          <p class="help">The table above is only this account's keys. Choose an account here to see its keys below, with the account each one belongs to.</p>
+          <p class="help">The table above is only this account's keys. Choose an account here to see its keys below.</p>
           <div class="menu-wrap" id="key-owner-menu"></div>
           <p class="note" id="other-keys-note" hidden></p>
         </div>
         <div class="table" id="other-keys-table" hidden>
           <table id="other-keys">
             <thead>
-              <tr><th>Account</th><th>Key</th><th>Connection</th><th>Model</th><th>Limits</th><th>Requests</th><th>Tokens</th><th></th></tr>
+              <tr><th>Account</th><th>Key</th><th>Connection</th><th>Model</th><th>Limits</th><th>Requests</th><th>Tokens</th><th><span class="visually-hidden">Actions</span></th></tr>
             </thead>
             <tbody id="other-keys-body"></tbody>
           </table>
@@ -188,16 +197,24 @@
             <span class="icon" data-icon="chevron"></span><span>Upstream key, default model and priority</span>
           </button>
           <div id="connection-advanced-fields" hidden>
-            <label class="field">Upstream key<p class="help">Kept server-side. Clients never see it.</p><input name="api_key"></label>
+            <div class="field">
+              <label for="connection-api-key">Upstream key</label>
+              <p class="help" id="connection-api-key-help">Kept server-side. Clients never see it.</p>
+              <input id="connection-api-key" name="api_key" aria-describedby="connection-api-key-help">
+            </div>
             <label class="field">Default model<input name="default_model"></label>
-            <label class="field">Priority<p class="help">Lowest number is used first.</p><input name="priority" type="number"></label>
+            <div class="field">
+              <label for="connection-priority">Priority</label>
+              <p class="help" id="connection-priority-help">Lowest number is used first.</p>
+              <input id="connection-priority" name="priority" type="number" aria-describedby="connection-priority-help">
+            </div>
           </div>
           <button type="submit">Add connection</button>
         </form>
         <div class="table">
           <table id="connections">
             <thead>
-              <tr><th>Connection</th><th>Base URL</th><th>Default model</th><th>Priority</th><th>Health</th><th></th></tr>
+              <tr><th>Connection</th><th>Base URL</th><th>Default model</th><th>Priority</th><th>Health</th><th><span class="visually-hidden">Actions</span></th></tr>
             </thead>
             <tbody id="connections-body"></tbody>
           </table>
@@ -214,7 +231,7 @@
           </li>
           <li>
             <h3>API key</h3>
-            <p class="value-line"><div class="menu-wrap" id="connect-key-menu"></div><button type="button" class="link" id="connect-copy">Copy key</button></p>
+            <div class="value-line"><div class="menu-wrap" id="connect-key-menu"></div><button type="button" class="link" id="connect-copy">Copy key</button></div>
           </li>
           <li>
             <h3>Model</h3>
@@ -254,25 +271,29 @@
 
       <section class="view" data-view="accounts" hidden>
         <h1>Accounts</h1>
-        <p class="lede">An admin can rename an account, set a new password, disable it, or delete it. The daily limit counts what an account used today and resets at 00:00 UTC; a key can have its own cap, which does not reset, and the account limit applies on top of it. Disabling signs the account out and its keys stop working, and deleting takes the account, its keys and everything recorded for it. The account you are signed in with cannot be deleted.</p>
+        <p class="lede">The daily limit counts what an account used today and resets at 00:00 UTC; a key can have its own cap, which does not reset, and the account limit applies on top of it. Disabling an account signs it out and its keys stop working. The account you are signed in with cannot be deleted.</p>
         <div class="field" id="registration-field" hidden>
           <span>Self-registration</span>
-          <p class="help">Closed as soon as the first account exists. While it is open, anyone can register; the first account to register is the admin.</p>
+          <p class="help">Closed as soon as the first account exists. While it is open, anyone can register.</p>
           <div class="menu-wrap" id="registration-menu"></div>
         </div>
         <div class="field" id="approval-field" hidden>
-          <span>New accounts need approval</span>
+          <span>Approval for new accounts</span>
           <p class="help">On by default. While it is on, an account that registers itself cannot sign in until an admin approves it in the table below. Turning it off lets an account sign in straight away.</p>
           <div class="menu-wrap" id="approval-menu"></div>
         </div>
         <form id="account-form" hidden>
           <label class="field">Username<input name="username" required></label>
-          <label class="field">Daily limit<p class="help">Optional. Leave it empty for no limit.</p><input name="daily_token_cap" type="number" min="1"></label>
+          <div class="field">
+            <label for="account-daily-limit">Daily limit</label>
+            <p class="help" id="account-daily-limit-help">Optional. Leave it empty for no limit.</p>
+            <input id="account-daily-limit" name="daily_token_cap" type="number" min="1" aria-describedby="account-daily-limit-help">
+          </div>
           <button type="submit">Create account</button>
         </form>
         <div class="table">
           <table id="accounts">
-            <thead><tr><th>Account</th><th>Daily limit</th><th>Used today</th><th>Requests</th><th>Tokens</th><th></th></tr></thead>
+            <thead><tr><th>Account</th><th>Daily limit</th><th>Used today</th><th>Requests</th><th>Tokens</th><th><span class="visually-hidden">Actions</span></th></tr></thead>
             <tbody id="accounts-body"></tbody>
           </table>
         </div>
