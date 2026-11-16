@@ -92,6 +92,23 @@ author's summary, and checks:
 The author implements what the review finds, and the review result is recorded in
 the pull request. Fixes from a review go on the same branch, not on a new one.
 
+## Pull request checklist
+
+Every pull request ends with this checklist, checked against the rules as they
+stand in this file at the time of the pull request, not as they were when the
+branch was cut. The form is `.github/PULL_REQUEST_TEMPLATE.md`; fill it in as
+part of the description, and mark an item `n/a` only when it genuinely does not
+apply, saying why.
+
+- [ ] One branch, one change, opened against `main`; nothing pushed to `main`
+- [ ] `cargo fmt`, `cargo test`, and `cargo clippy --all-targets -- -D warnings` pass
+- [ ] New behaviour reviewed by an independent sub-agent, and the result recorded in the description
+- [ ] Edge cases considered: empty values, deleted keys, accounts that are not approved yet
+- [ ] No existing behaviour changed silently; migrations hold for a database written before the change
+- [ ] Tests cover the new behaviour, or the reason they do not is stated
+- [ ] `README.md` matches the behaviour the code now has
+- [ ] Comments and naming follow the conventions above; no dependency added without a reason
+
 ## A few things to leave alone
 
 - `data/` and `target/` are gitignored and are runtime state; do not commit them.
