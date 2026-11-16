@@ -147,6 +147,16 @@ function openMenu(wrap) {
   closeMenus();
   menu.hidden = false;
   wrap.querySelector('.menu-button').setAttribute('aria-expanded', 'true');
+
+  // The theme list is the one that can end up past the edge of the window, because its control sits at
+  // the bottom of the shell and a short screen cannot show the whole list above it. The room is measured
+  // at the moment the menu is shown rather than in the stylesheet, and the list is capped to it, so a
+  // choice is read without scrolling the page.
+  if (wrap.dataset.name === 'theme') {
+    const room = wrap.querySelector('.menu-button').getBoundingClientRect().top - 8;
+    menu.style.maxHeight = `${Math.max(room, 140)}px`;
+  }
+
   const first = menu.querySelector('[aria-selected="true"]') || menu.querySelector('[role="option"]');
   if (first) first.focus();
 }
