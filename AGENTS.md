@@ -64,14 +64,20 @@ changes to `web/` take effect on reload.
 
 ## Workflow
 
-- **Never push to `main`.** Every change starts on a branch and reaches `main`
-  through a pull request.
+- **Nothing is pushed straight to `main` or `dev`.** Every change starts on a branch and reaches `dev`
+  through a pull request. `dev` reaches `main` by hand, not by an agent: what is released is a decision
+  about what `dev` has collected, not the last thing that was merged.
 
   ```sh
-  git checkout -b <short-name>     # one branch per change
+  git checkout -b <short-name> origin/dev   # one branch per change
   git commit -m "what changed, in one sentence"
   git push -u origin <branch>
   ```
+
+- A branch is cleaned up when the work on it is done: once its pull request closes, the branch is
+  deleted on the remote and locally. A branch closed without merging is deleted as well, unless someone
+  asked for the work to be kept. A branch that outlives its change is read later as if it still meant
+  something, so nothing is left standing for the sake of how it was named.
 
 - One branch, one change. A branch that mixes a feature with unrelated cleanup is
   harder to review; split it.
@@ -81,10 +87,13 @@ changes to `web/` take effect on reload.
 - Before opening the pull request: `cargo fmt`, `cargo test`, and
   `cargo clippy --all-targets -- -D warnings` must pass.
 - CI runs on every pull request, and each rule it can check appears there as its own check: the base
-  branch, `cargo fmt --check`, clippy, the tests, and the description — that every checklist item is
-  answered and the Review section says the findings or that the change adds no behaviour. The toolchain
-  is pinned rather than left to `stable`, so the build does not move on its own, and nothing else is in
-  CI: a failure always says something about the change.
+  branch — a pull request targets `dev`, and the only one that may target `main` is the `dev` to `main`
+  merge, which is the one a person makes by hand — `cargo fmt --check`, clippy, the tests, and the
+  description, that every checklist item is answered and the Review section says the findings or that the
+  change adds no behaviour. Cleaning up a branch is not in CI: it happens after the pull request closes,
+  so there is nothing there for it to look at. The toolchain is pinned rather than left to `stable`, so
+  the build does not move on its own, and nothing else is in CI: a failure always says something about
+  the change.
 - The pull request description says what the change does and why, at the level of
   behaviour rather than of files.
 
@@ -127,7 +136,8 @@ checklist asks that CI cannot check (a judgement, a review, whether the README m
 assertion in the description, and the description is read from the copy of this file that the pull
 request itself carries, so a pull request that changes the list is held to its own version of it.
 
-- [ ] One branch, one change, opened against `main`; nothing pushed to `main` — CI checks the base branch
+- [ ] One branch, one change, opened against `dev`; nothing pushed to `main` or `dev` — CI checks the base branch, and the `dev` to `main` merge is the one pull request a person makes by hand
+- [ ] The branch is deleted when its pull request closes, on the remote and locally — CI cannot check this, so it stays an assertion in the description
 - [ ] `cargo fmt --check`, clippy and the tests pass — CI runs them, with `--locked` so the committed dependency set is checked rather than resolved
 - [ ] If the change adds behaviour: reviewed by a reviewer who is not the author, and the result recorded in the description — CI can only see that the description says one or the other
 - [ ] Edge cases considered: empty values, deleted keys, accounts that are not approved yet
