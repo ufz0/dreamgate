@@ -80,6 +80,10 @@ changes to `web/` take effect on reload.
 - Before opening the pull request: `cargo test` and
   `cargo clippy --all-targets -- -D warnings` must pass. `cargo fmt --check` is not
   expected to pass on files you did not write.
+- CI runs clippy and the tests on every pull request, so a change that does not pass
+  them is visible before it is merged. `.github/workflows/ci.yml` is deliberately small:
+  no `cargo fmt --check`, because the existing code does not pass it, and nothing else
+  that could fail for a reason unrelated to the change.
 - The pull request description says what the change does and why, at the level of
   behaviour rather than of files.
 
@@ -102,9 +106,10 @@ the pull request. Fixes from a review go on the same branch, not on a new one.
 A change that does not add behaviour — documentation, a comment, a rename — does not
 need a review, and says so in the checklist instead of pretending to have had one.
 
-Nothing here is enforced by CI or branch protection, so the review and the checklist
-are the only control. A pull request may be merged once the checklist is filled in
-honestly, and a change that adds behaviour only after its review is recorded.
+CI enforces the tests and clippy. The review and the checklist are the only control for
+everything else, and there is no branch protection. A pull request may be merged once CI
+is green and the checklist is filled in honestly, and a change that adds behaviour only
+after its review is recorded.
 
 ## Pull request checklist
 
@@ -114,13 +119,14 @@ branch was cut. This section is the only copy of the list:
 `.github/PULL_REQUEST_TEMPLATE.md` points here instead of keeping its own, which is
 how the two would drift.
 
-The author fills it in. There is no CI and no branch protection, so an item is an
-assertion in the description rather than something the repository can verify on its
-own. Mark an item `n/a` only when it genuinely does not apply, with the reason, and
+The author fills it in. CI runs clippy and the tests on every pull request, so those
+two items are checked by the build rather than by the author's word; everything else in
+the list is still an assertion in the description, because nothing else can verify it.
+Mark an item `n/a` only when it genuinely does not apply, with the reason, and
 leave an item unchecked rather than quietly dropping it.
 
 - [ ] One branch, one change, opened against `main`; nothing pushed to `main`
-- [ ] `cargo test` and `cargo clippy --all-targets -- -D warnings` pass; `cargo fmt --check` is allowed to fail on code this change did not write, saying so
+- [ ] `cargo test` and `cargo clippy --all-targets -- -D warnings` pass — CI runs them on every pull request; `cargo fmt --check` is not in CI, because the existing code does not pass it
 - [ ] If the change adds behaviour: reviewed by a reviewer who is not the author, and the result recorded in the description
 - [ ] Edge cases considered: empty values, deleted keys, accounts that are not approved yet
 - [ ] No existing behaviour changed silently; migrations hold for a database written before the change
