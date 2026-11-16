@@ -70,12 +70,12 @@
         <h1>Overview</h1>
         <div class="readout-pair">
           <div>
-            <p class="readout" id="global-tokens">0</p>
-            <p class="readout-note">tokens through the gate in total, every account and key</p>
+            <p class="readout" id="generated-tokens">0</p>
+            <p class="readout-note">what the models generated, every account and key</p>
           </div>
           <div>
-            <p class="readout" id="generated-tokens">0</p>
-            <p class="readout-note">only what the models generated, so the text sent in is not counted</p>
+            <p class="readout" id="global-input-tokens">0</p>
+            <p class="readout-note" id="global-input-note">what was sent in, every account and key</p>
           </div>
         </div>
 
@@ -90,12 +90,12 @@
 
         <div class="readout-pair">
           <div>
-            <p class="readout" id="total-tokens">0</p>
-            <p class="readout-note">tokens counted so far for this account</p>
+            <p class="readout" id="account-generated-tokens">0</p>
+            <p class="readout-note">what the models generated for this account</p>
           </div>
           <div>
-            <p class="readout" id="account-generated-tokens">0</p>
-            <p class="readout-note">only what the models generated for this account, so the text sent in is not counted</p>
+            <p class="readout" id="account-input-tokens">0</p>
+            <p class="readout-note" id="account-input-note">what this account sent in</p>
           </div>
         </div>
 
@@ -106,7 +106,7 @@
         <dl class="panel" id="presence"></dl>
         <p class="note">Online means a request came through the gateway from that account in the last five minutes. Generating means one is in flight now. This clears when the gateway is restarted.</p>
 
-        <h2>Token rate, last 24 hours</h2>
+        <h2>Token rate (input + output), last 24 hours</h2>
         <div class="chart" id="chart-hourly"></div>
 
         <h2>Requests per day, last 14 days</h2>
