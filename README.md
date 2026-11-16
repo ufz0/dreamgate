@@ -284,7 +284,10 @@ What an unauthenticated request can reach is the entry screen: `POST /api/regist
 - A session row is refused after the window the cookie lasts (30 days), so a token taken from a shared
   browser and replayed does not work forever.
 - Sign-in attempts are bounded to 10 per account per minute, and an unknown username answers exactly as
-  a wrong password does, so an attempt cannot be used to list the accounts. A state-changing request
+  a wrong password does, so an attempt cannot be used to list the accounts. Registering does say when a
+  username is taken, because the person has to pick another, so while self-registration is open a name
+  can be tried there; a name that is free becomes an account, held for approval by default. While
+  registration is closed the answer is 403 before the name is checked against the accounts. A state-changing request
   from another site carries no session cookie, so a cross-site form cannot act as the signed-in account.
 - Adding, removing or checking a connection is an admin action in the API as well as in the page, and
   the key a connection carries is returned to an admin alone. A disabled account is refused at both
@@ -296,8 +299,10 @@ Two things this pass left as they are, and a public release should decide on the
 admin makes has no password until its first sign-in, so whoever signs in with that username first is the
 one who sets it — the intended feature, but a guessed username can be claimed by anyone who reaches the
 instance. And the role is decided by counting rows before the insert, so two first sign-ins at the same
-moment on an empty instance can both be told they own it. Error responses pass the driver text through,
-so a constraint name can reach a client, and bcrypt only reads the first 72 bytes of a password.
+moment on an empty instance can both be told they own it. A taken username is named when an account is
+registered; other error responses pass the driver text through, so a constraint name (a duplicate
+connection name, for instance) can still reach a client, and bcrypt only reads the first 72 bytes of a
+password.
 
 ## Tests
 
@@ -312,7 +317,8 @@ the model recorded for a streamed request when nothing is pinned to a key or a c
 per-key limits and their validation, the keys list being the caller's own with the other
 accounts read by an admin alone, per-account daily token limits including the day
 boundary and the admin-only rule for setting one, the admin/user scoping of the stats
-queries and the split between a caller's own figures and the platform total, the registration setting being read before sign in and closed by default after the
+queries and the split between a caller's own figures and the platform total, a taken username named when registering, including one held for approval, with any other failure
+answered as a server error, the registration setting being read before sign in and closed by default after the
 first account, approval being on by default and blocking a sign-in until an admin grants it, an
 account made by an admin with no password until its first sign-in, the account actions (disable,
 rename, new password, approve, delete) and what they do to a sign-in, a key and the recorded usage,
