@@ -1,8 +1,8 @@
 use axum::body::{Body, Bytes};
-use axum::extract::{State as AxumState};
-use axum::http::{header, HeaderValue};
+use axum::extract::State as AxumState;
+use axum::http::{HeaderValue, header};
 use axum::response::{IntoResponse, Response};
-use futures_util::{stream, StreamExt};
+use futures_util::{StreamExt, stream};
 use serde::Serialize;
 use serde_json::json;
 use tokio::sync::broadcast;
@@ -46,12 +46,19 @@ pub async fn stream_events(AxumState(st): AxumState<State>, caller: Caller) -> R
     // The page shows both: the account's own figures and the total across every account, so
     // the snapshot has to carry both rather than one role-dependent set.
     let self_totals = stats::totals(&st, true, user_id).await.unwrap_or(json!({}));
-    let global = stats::totals(&st, false, user_id).await.unwrap_or(json!({}));
-    let snapshot = json!({ "type": "snapshot", "scoped": scoped, "self": self_totals, "global": global }).to_string();
+    let global = stats::totals(&st, false, user_id)
+        .await
+        .unwrap_or(json!({}));
+    let snapshot =
+        json!({ "type": "snapshot", "scoped": scoped, "self": self_totals, "global": global })
+            .to_string();
     let receiver = st.hub.subscribe();
 
-    let body = stream::once(async move { Ok::<_, BoxError>(Bytes::from(format!("data: {snapshot}\n\n"))) }).chain(
-        stream::unfold(receiver, move |mut receiver| async move {
+    let body =
+        stream::once(
+            async move { Ok::<_, BoxError>(Bytes::from(format!("data: {snapshot}\n\n"))) },
+        )
+        .chain(stream::unfold(receiver, move |mut receiver| async move {
             loop {
                 let event = match receiver.recv().await {
                     Ok(event) => event,
@@ -63,20 +70,30 @@ pub async fn stream_events(AxumState(st): AxumState<State>, caller: Caller) -> R
                     HubEvent::Usage(usage) if scoped && usage.user_id != user_id => continue,
                     HubEvent::Usage(usage) => {
                         let payload = json!({ "type": "usage", "event": usage }).to_string();
-                        return Some((Ok::<_, BoxError>(Bytes::from(format!("data: {payload}\n\n"))), receiver));
+                        return Some((
+                            Ok::<_, BoxError>(Bytes::from(format!("data: {payload}\n\n"))),
+                            receiver,
+                        ));
                     }
                     HubEvent::Presence(presence) => {
-                        let payload = json!({ "type": "presence", "presence": presence }).to_string();
-                        return Some((Ok::<_, BoxError>(Bytes::from(format!("data: {payload}\n\n"))), receiver));
+                        let payload =
+                            json!({ "type": "presence", "presence": presence }).to_string();
+                        return Some((
+                            Ok::<_, BoxError>(Bytes::from(format!("data: {payload}\n\n"))),
+                            receiver,
+                        ));
                     }
                 }
             }
-        }),
-    );
+        }));
 
     let mut out = Response::new(Body::empty());
-    out.headers_mut().insert(header::CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
-    out.headers_mut().insert(header::CACHE_CONTROL, HeaderValue::from_static("no-cache"));
+    out.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("text/event-stream"),
+    );
+    out.headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-cache"));
     *out.body_mut() = Body::from_stream(body);
     out.into_response()
 }

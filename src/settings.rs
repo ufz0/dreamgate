@@ -1,4 +1,4 @@
-use axum::extract::{State as AxumState};
+use axum::extract::State as AxumState;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Json, Response};
 use serde::Deserialize;
@@ -47,7 +47,9 @@ async fn value(st: &State, key: &str, default: &str) -> bool {
         .await
         .ok()
         .flatten();
-    row.map(|row| row.get::<String, _>("value")).unwrap_or(default.to_string()) == "1"
+    row.map(|row| row.get::<String, _>("value"))
+        .unwrap_or(default.to_string())
+        == "1"
 }
 
 // Read before anyone is signed in, because the entry screen has to know whether registering
@@ -70,14 +72,29 @@ pub struct Settings {
 }
 
 // Only the field present in the body is applied, so changing one setting does not rewrite the other.
-pub async fn update(AxumState(st): AxumState<State>, caller: Caller, Json(body): Json<Settings>) -> Response {
+pub async fn update(
+    AxumState(st): AxumState<State>,
+    caller: Caller,
+    Json(body): Json<Settings>,
+) -> Response {
     if caller.role != "admin" {
-        return error(StatusCode::FORBIDDEN, "forbidden", "only an admin can change registration");
+        return error(
+            StatusCode::FORBIDDEN,
+            "forbidden",
+            "only an admin can change registration",
+        );
     }
     if body.open_registration.is_none() && body.require_approval.is_none() {
-        return error(StatusCode::BAD_REQUEST, "invalid_request", "nothing to change was given");
+        return error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "nothing to change was given",
+        );
     }
-    for (key, setting) in [(KEY, body.open_registration), (APPROVAL_KEY, body.require_approval)] {
+    for (key, setting) in [
+        (KEY, body.open_registration),
+        (APPROVAL_KEY, body.require_approval),
+    ] {
         let Some(value) = setting else { continue };
         let result = sqlx::query(
             "INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
@@ -87,7 +104,11 @@ pub async fn update(AxumState(st): AxumState<State>, caller: Caller, Json(body):
         .execute(&st.pool)
         .await;
         if let Err(err) = result {
-            return error(StatusCode::INTERNAL_SERVER_ERROR, "server_error", err.to_string());
+            return error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "server_error",
+                err.to_string(),
+            );
         }
     }
     Json(json!({

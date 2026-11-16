@@ -1,11 +1,11 @@
 use std::time::Instant;
 
 use axum::body::{Body, Bytes};
-use axum::extract::{State as AxumState};
-use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
+use axum::extract::State as AxumState;
+use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Json, Response};
-use futures_util::{stream, StreamExt};
-use serde_json::{json, Value};
+use futures_util::{StreamExt, stream};
+use serde_json::{Value, json};
 use sqlx::Row;
 use sqlx::sqlite::SqliteRow;
 
@@ -94,26 +94,31 @@ async fn enforce_limits(st: &State, key: &KeyInfo) -> Option<Response> {
             "SELECT COUNT(*) AS n FROM usage WHERE api_key_id = ? \
              AND strftime('%Y-%m-%d %H:%M:%S', created_at) >= datetime('now', '-1 minute')",
         )
-            .bind(key.id)
-            .fetch_one(&st.pool)
-            .await
-            .map(|row| row.get::<i64, _>("n"))
-            .unwrap_or(0);
+        .bind(key.id)
+        .fetch_one(&st.pool)
+        .await
+        .map(|row| row.get::<i64, _>("n"))
+        .unwrap_or(0);
         if recent >= limit {
             return Some(error(
                 StatusCode::TOO_MANY_REQUESTS,
                 "rate_limit",
-                format!("key '{}' is limited to {limit} requests per minute", key.name),
+                format!(
+                    "key '{}' is limited to {limit} requests per minute",
+                    key.name
+                ),
             ));
         }
     }
     if let Some(cap) = key.token_cap {
-        let used = sqlx::query("SELECT COALESCE(SUM(total_tokens), 0) AS used FROM usage WHERE api_key_id = ?")
-            .bind(key.id)
-            .fetch_one(&st.pool)
-            .await
-            .map(|row| row.get::<i64, _>("used"))
-            .unwrap_or(0);
+        let used = sqlx::query(
+            "SELECT COALESCE(SUM(total_tokens), 0) AS used FROM usage WHERE api_key_id = ?",
+        )
+        .bind(key.id)
+        .fetch_one(&st.pool)
+        .await
+        .map(|row| row.get::<i64, _>("used"))
+        .unwrap_or(0);
         if used >= cap {
             return Some(error(
                 StatusCode::TOO_MANY_REQUESTS,
@@ -135,16 +140,19 @@ async fn enforce_limits(st: &State, key: &KeyInfo) -> Option<Response> {
             "SELECT COALESCE(SUM(total_tokens), 0) AS used FROM usage \
              WHERE user_id = ? AND strftime('%Y-%m-%d', created_at) = date('now')",
         )
-            .bind(key.user_id)
-            .fetch_one(&st.pool)
-            .await
-            .map(|row| row.get::<i64, _>("used"))
-            .unwrap_or(0);
+        .bind(key.user_id)
+        .fetch_one(&st.pool)
+        .await
+        .map(|row| row.get::<i64, _>("used"))
+        .unwrap_or(0);
         if used >= cap {
             return Some(error(
                 StatusCode::TOO_MANY_REQUESTS,
                 "token_cap",
-                format!("account '{}' has used its daily token limit of {cap}", account.get::<String, _>("username")),
+                format!(
+                    "account '{}' has used its daily token limit of {cap}",
+                    account.get::<String, _>("username")
+                ),
             ));
         }
     }
@@ -163,7 +171,9 @@ fn build_payload(body: &Value, model: &str) -> Value {
     payload["model"] = Value::String(model.to_string());
     // Upstreams that support stream_options report real usage at the end of the
     // stream; without it the gateway has to estimate completion tokens.
-    if body.get("stream").and_then(Value::as_bool).unwrap_or(false) && payload.get("stream_options").is_none() {
+    if body.get("stream").and_then(Value::as_bool).unwrap_or(false)
+        && payload.get("stream_options").is_none()
+    {
         payload["stream_options"] = json!({ "include_usage": true });
     }
     payload
@@ -204,7 +214,12 @@ fn scan_line(line: &[u8], generated: &mut String, reported: &mut Option<(i64, i6
             *reported = Some((prompt.unwrap_or(0), completion.unwrap_or(0)));
         }
     }
-    for choice in value.get("choices").and_then(Value::as_array).into_iter().flatten() {
+    for choice in value
+        .get("choices")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
         let Some(delta) = choice.get("delta") else {
             continue;
         };
@@ -294,19 +309,37 @@ fn stream_body(
         // while it is running.
         drop(ctx.present);
     });
-    stream::unfold(rx, |mut rx| async move { rx.recv().await.map(|item| (item, rx)) })
+    stream::unfold(rx, |mut rx| async move {
+        rx.recv().await.map(|item| (item, rx))
+    })
 }
 
-pub async fn chat_completions(AxumState(st): AxumState<State>, headers: HeaderMap, Json(body): Json<Value>) -> Response {
+pub async fn chat_completions(
+    AxumState(st): AxumState<State>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Response {
     let started = Instant::now();
     let Some(raw) = virtual_key(&headers) else {
-        return error(StatusCode::UNAUTHORIZED, "invalid_request", "missing Authorization: Bearer <virtual key>");
+        return error(
+            StatusCode::UNAUTHORIZED,
+            "invalid_request",
+            "missing Authorization: Bearer <virtual key>",
+        );
     };
     let Some(key) = lookup_key(&st, &raw).await else {
-        return error(StatusCode::UNAUTHORIZED, "invalid_api_key", "unknown virtual key");
+        return error(
+            StatusCode::UNAUTHORIZED,
+            "invalid_api_key",
+            "unknown virtual key",
+        );
     };
     if !key.enabled {
-        return error(StatusCode::FORBIDDEN, "key_disabled", "this key is disabled");
+        return error(
+            StatusCode::FORBIDDEN,
+            "key_disabled",
+            "this key is disabled",
+        );
     }
     // Counted from here, so a request that is refused by a limit still marks the account as
     // active; the guard is released when the request finishes, including for a stream.
@@ -317,7 +350,11 @@ pub async fn chat_completions(AxumState(st): AxumState<State>, headers: HeaderMa
 
     let candidates = registry::candidates(&st, key.connection_id).await;
     if candidates.is_empty() {
-        return error(StatusCode::BAD_GATEWAY, "no_upstream", "no enabled connection is available for this key");
+        return error(
+            StatusCode::BAD_GATEWAY,
+            "no_upstream",
+            "no enabled connection is available for this key",
+        );
     }
     let wants_stream = body.get("stream").and_then(Value::as_bool).unwrap_or(false);
     let prompt_tokens = tokens::prompt_estimate(body.get("messages").unwrap_or(&Value::Null));
@@ -334,7 +371,10 @@ pub async fn chat_completions(AxumState(st): AxumState<State>, headers: HeaderMa
         let upstream = match st
             .http
             .post(&url)
-            .header(header::AUTHORIZATION, format!("Bearer {}", conn.api_key.clone().unwrap_or_default()))
+            .header(
+                header::AUTHORIZATION,
+                format!("Bearer {}", conn.api_key.clone().unwrap_or_default()),
+            )
             .json(&payload)
             .send()
             .await
@@ -350,8 +390,12 @@ pub async fn chat_completions(AxumState(st): AxumState<State>, headers: HeaderMa
         if wants_stream && status.is_success() {
             let mut out = Response::new(Body::empty());
             *out.status_mut() = status;
-            out.headers_mut().insert(header::CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
-            out.headers_mut().insert(header::CACHE_CONTROL, HeaderValue::from_static("no-cache"));
+            out.headers_mut().insert(
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("text/event-stream"),
+            );
+            out.headers_mut()
+                .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-cache"));
             let ctx = StreamContext {
                 st: st.clone(),
                 key: key.clone(),
@@ -383,8 +427,14 @@ pub async fn chat_completions(AxumState(st): AxumState<State>, headers: HeaderMa
             .join(" ");
         let (prompt, completion) = match block {
             Some(block) => (
-                block.get("prompt_tokens").and_then(Value::as_i64).unwrap_or(prompt_tokens),
-                block.get("completion_tokens").and_then(Value::as_i64).unwrap_or(0),
+                block
+                    .get("prompt_tokens")
+                    .and_then(Value::as_i64)
+                    .unwrap_or(prompt_tokens),
+                block
+                    .get("completion_tokens")
+                    .and_then(Value::as_i64)
+                    .unwrap_or(0),
             ),
             None => (prompt_tokens, tokens::estimate_tokens(&completion_text)),
         };
@@ -404,13 +454,18 @@ pub async fn chat_completions(AxumState(st): AxumState<State>, headers: HeaderMa
                 estimated: block.is_none(),
                 created_at: crate::clock::now(),
             },
-        ).await;
+        )
+        .await;
 
         let mut out = Response::new(Body::empty());
         *out.status_mut() = status;
         out.headers_mut().insert(
             header::CONTENT_TYPE,
-            HeaderValue::from_static(if parsed.is_some() { "application/json" } else { "text/plain; charset=utf-8" }),
+            HeaderValue::from_static(if parsed.is_some() {
+                "application/json"
+            } else {
+                "text/plain; charset=utf-8"
+            }),
         );
         *out.body_mut() = Body::from(bytes);
         return out;
@@ -432,30 +487,58 @@ pub async fn chat_completions(AxumState(st): AxumState<State>, headers: HeaderMa
             estimated: true,
             created_at: crate::clock::now(),
         },
-    ).await;
+    )
+    .await;
     error(StatusCode::BAD_GATEWAY, "upstream_unavailable", last_error)
 }
 
 pub async fn list_models(AxumState(st): AxumState<State>, headers: HeaderMap) -> Response {
     let Some(raw) = virtual_key(&headers) else {
-        return error(StatusCode::UNAUTHORIZED, "invalid_request", "missing Authorization: Bearer <virtual key>");
+        return error(
+            StatusCode::UNAUTHORIZED,
+            "invalid_request",
+            "missing Authorization: Bearer <virtual key>",
+        );
     };
     let Some(key) = lookup_key(&st, &raw).await else {
-        return error(StatusCode::UNAUTHORIZED, "invalid_api_key", "unknown virtual key");
+        return error(
+            StatusCode::UNAUTHORIZED,
+            "invalid_api_key",
+            "unknown virtual key",
+        );
     };
     if !key.enabled {
-        return error(StatusCode::FORBIDDEN, "key_disabled", "this key is disabled");
+        return error(
+            StatusCode::FORBIDDEN,
+            "key_disabled",
+            "this key is disabled",
+        );
     }
-    if let Some(blocked) = account_row(&st, key.user_id).await.as_ref().and_then(disabled_account) {
+    if let Some(blocked) = account_row(&st, key.user_id)
+        .await
+        .as_ref()
+        .and_then(disabled_account)
+    {
         return blocked;
     }
-    let Some(conn) = registry::candidates(&st, key.connection_id).await.first().cloned() else {
-        return error(StatusCode::BAD_GATEWAY, "no_upstream", "no enabled connection is available for this key");
+    let Some(conn) = registry::candidates(&st, key.connection_id)
+        .await
+        .first()
+        .cloned()
+    else {
+        return error(
+            StatusCode::BAD_GATEWAY,
+            "no_upstream",
+            "no enabled connection is available for this key",
+        );
     };
     let result = st
         .http
         .get(registry::endpoint(&conn.base_url, "models"))
-        .header(header::AUTHORIZATION, format!("Bearer {}", conn.api_key.clone().unwrap_or_default()))
+        .header(
+            header::AUTHORIZATION,
+            format!("Bearer {}", conn.api_key.clone().unwrap_or_default()),
+        )
         .send()
         .await;
     match result {
@@ -463,14 +546,27 @@ pub async fn list_models(AxumState(st): AxumState<State>, headers: HeaderMap) ->
             let status = upstream.status();
             let bytes = match upstream.bytes().await {
                 Ok(bytes) => bytes,
-                Err(err) => return error(StatusCode::BAD_GATEWAY, "upstream_unavailable", format!("{}: {err}", conn.name)),
+                Err(err) => {
+                    return error(
+                        StatusCode::BAD_GATEWAY,
+                        "upstream_unavailable",
+                        format!("{}: {err}", conn.name),
+                    );
+                }
             };
             let mut out = Response::new(Body::empty());
             *out.status_mut() = status;
-            out.headers_mut().insert(header::CONTENT_TYPE, HeaderValue::from_static("application/json"));
+            out.headers_mut().insert(
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("application/json"),
+            );
             *out.body_mut() = Body::from(bytes);
             out.into_response()
         }
-        Err(err) => error(StatusCode::BAD_GATEWAY, "upstream_unavailable", format!("{}: {err}", conn.name)),
+        Err(err) => error(
+            StatusCode::BAD_GATEWAY,
+            "upstream_unavailable",
+            format!("{}: {err}", conn.name),
+        ),
     }
 }

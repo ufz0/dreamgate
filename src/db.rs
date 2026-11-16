@@ -1,8 +1,8 @@
 use std::str::FromStr;
 
+use sqlx::Executor;
 use sqlx::Row;
 use sqlx::sqlite::{Sqlite, SqliteConnectOptions, SqlitePool, SqlitePoolOptions};
-use sqlx::Executor;
 
 pub const SCHEMA: &[&str] = &[
     "CREATE TABLE IF NOT EXISTS users (
@@ -86,11 +86,13 @@ async fn column_is_required<'e, E>(db: E, column: &str) -> Result<bool, sqlx::Er
 where
     E: Executor<'e, Database = Sqlite>,
 {
-    let required = sqlx::query("SELECT COUNT(*) AS n FROM pragma_table_info('users') WHERE name = ? AND \"notnull\" = 1")
-        .bind(column)
-        .fetch_one(db)
-        .await?
-        .get::<i64, _>("n");
+    let required = sqlx::query(
+        "SELECT COUNT(*) AS n FROM pragma_table_info('users') WHERE name = ? AND \"notnull\" = 1",
+    )
+    .bind(column)
+    .fetch_one(db)
+    .await?
+    .get::<i64, _>("n");
     Ok(required > 0)
 }
 
@@ -104,7 +106,9 @@ pub async fn connect(url: &str) -> Result<SqlitePool, sqlx::Error> {
         sqlx::query(*statement).execute(&pool).await?;
     }
     migrate(&pool).await?;
-    sqlx::query("PRAGMA journal_mode = WAL").execute(&pool).await?;
+    sqlx::query("PRAGMA journal_mode = WAL")
+        .execute(&pool)
+        .await?;
     Ok(pool)
 }
 
@@ -115,7 +119,10 @@ pub async fn connect(url: &str) -> Result<SqlitePool, sqlx::Error> {
 pub async fn migrate(pool: &SqlitePool) -> Result<(), sqlx::Error> {
     // An email with a UNIQUE constraint cannot be dropped, and a NOT NULL password cannot be
     // relaxed, so a table that is still in either shape is rebuilt.
-    if has_column(pool, "email").await? || column_is_required(pool, "password_hash").await? || !has_column(pool, "pending").await? {
+    if has_column(pool, "email").await?
+        || column_is_required(pool, "password_hash").await?
+        || !has_column(pool, "pending").await?
+    {
         rebuild_accounts(pool).await?;
     } else {
         if !has_column(pool, "daily_token_cap").await? {
@@ -137,10 +144,14 @@ pub async fn migrate(pool: &SqlitePool) -> Result<(), sqlx::Error> {
             sqlx::query(statement).execute(pool).await?;
         }
         if has_column(pool, "email").await? {
-            sqlx::query("ALTER TABLE users DROP COLUMN email").execute(pool).await?;
+            sqlx::query("ALTER TABLE users DROP COLUMN email")
+                .execute(pool)
+                .await?;
         }
         if !has_column(pool, "enabled").await? {
-            sqlx::query("ALTER TABLE users ADD COLUMN enabled INTEGER NOT NULL DEFAULT 1").execute(pool).await?;
+            sqlx::query("ALTER TABLE users ADD COLUMN enabled INTEGER NOT NULL DEFAULT 1")
+                .execute(pool)
+                .await?;
         }
     }
     relax_key_reference(pool).await
@@ -164,7 +175,9 @@ async fn relax_key_reference(pool: &SqlitePool) -> Result<(), sqlx::Error> {
     }
 
     let mut conn = pool.acquire().await?;
-    sqlx::query("PRAGMA foreign_keys = OFF").execute(conn.as_mut()).await?;
+    sqlx::query("PRAGMA foreign_keys = OFF")
+        .execute(conn.as_mut())
+        .await?;
     sqlx::query(
         "CREATE TABLE usage_new (
             id INTEGER PRIMARY KEY,
@@ -182,7 +195,8 @@ async fn relax_key_reference(pool: &SqlitePool) -> Result<(), sqlx::Error> {
             created_at TEXT NOT NULL
         )",
     )
-    .execute(conn.as_mut()).await?;
+    .execute(conn.as_mut())
+    .await?;
     // Both shapes have the same columns, so the rows move as they are.
     sqlx::query(
         "INSERT INTO usage_new (id, api_key_id, user_id, connection_id, model, prompt_tokens, \
@@ -191,11 +205,19 @@ async fn relax_key_reference(pool: &SqlitePool) -> Result<(), sqlx::Error> {
                 total_tokens, latency_ms, status, streamed, estimated, created_at FROM usage",
     )
     .execute(conn.as_mut()).await?;
-    sqlx::query("DROP TABLE usage").execute(conn.as_mut()).await?;
-    sqlx::query("ALTER TABLE usage_new RENAME TO usage").execute(conn.as_mut()).await?;
+    sqlx::query("DROP TABLE usage")
+        .execute(conn.as_mut())
+        .await?;
+    sqlx::query("ALTER TABLE usage_new RENAME TO usage")
+        .execute(conn.as_mut())
+        .await?;
     // Dropping the table drops the index on the key with it, so that one is made again.
-    sqlx::query("CREATE INDEX IF NOT EXISTS idx_usage_key ON usage (api_key_id)").execute(conn.as_mut()).await?;
-    sqlx::query("PRAGMA foreign_keys = ON").execute(conn.as_mut()).await?;
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_usage_key ON usage (api_key_id)")
+        .execute(conn.as_mut())
+        .await?;
+    sqlx::query("PRAGMA foreign_keys = ON")
+        .execute(conn.as_mut())
+        .await?;
     Ok(())
 }
 
@@ -204,12 +226,30 @@ async fn relax_key_reference(pool: &SqlitePool) -> Result<(), sqlx::Error> {
 // still resolve against the rebuilt table.
 async fn rebuild_accounts(pool: &SqlitePool) -> Result<(), sqlx::Error> {
     let mut conn = pool.acquire().await?;
-    let source_name = if has_column(conn.as_mut(), "name").await? { "name" } else { "username" };
-    let source_cap = if has_column(conn.as_mut(), "token_cap").await? { "token_cap" } else { "daily_token_cap" };
+    let source_name = if has_column(conn.as_mut(), "name").await? {
+        "name"
+    } else {
+        "username"
+    };
+    let source_cap = if has_column(conn.as_mut(), "token_cap").await? {
+        "token_cap"
+    } else {
+        "daily_token_cap"
+    };
     // A table that never had these gets the defaults; a table that has them keeps what is stored.
-    let source_enabled = if has_column(conn.as_mut(), "enabled").await? { "enabled" } else { "1" };
-    let source_pending = if has_column(conn.as_mut(), "pending").await? { "pending" } else { "0" };
-    sqlx::query("PRAGMA foreign_keys = OFF").execute(conn.as_mut()).await?;
+    let source_enabled = if has_column(conn.as_mut(), "enabled").await? {
+        "enabled"
+    } else {
+        "1"
+    };
+    let source_pending = if has_column(conn.as_mut(), "pending").await? {
+        "pending"
+    } else {
+        "0"
+    };
+    sqlx::query("PRAGMA foreign_keys = OFF")
+        .execute(conn.as_mut())
+        .await?;
     sqlx::query(
         "CREATE TABLE users_new (
             id INTEGER PRIMARY KEY,
@@ -228,11 +268,19 @@ async fn rebuild_accounts(pool: &SqlitePool) -> Result<(), sqlx::Error> {
         "INSERT INTO users_new (id, username, password_hash, role, daily_token_cap, enabled, pending, created_at) \
          SELECT id, {source_name}, password_hash, role, {source_cap}, {source_enabled}, {source_pending}, created_at FROM users"
     );
-    sqlx::query(sqlx::AssertSqlSafe(copy.as_str())).execute(conn.as_mut()).await?;
-    sqlx::query("DROP TABLE users").execute(conn.as_mut()).await?;
-    sqlx::query("ALTER TABLE users_new RENAME TO users").execute(conn.as_mut()).await?;
+    sqlx::query(sqlx::AssertSqlSafe(copy.as_str()))
+        .execute(conn.as_mut())
+        .await?;
+    sqlx::query("DROP TABLE users")
+        .execute(conn.as_mut())
+        .await?;
+    sqlx::query("ALTER TABLE users_new RENAME TO users")
+        .execute(conn.as_mut())
+        .await?;
     // The rest of the application relies on ON DELETE CASCADE, so this connection goes back with
     // foreign keys on.
-    sqlx::query("PRAGMA foreign_keys = ON").execute(conn.as_mut()).await?;
+    sqlx::query("PRAGMA foreign_keys = ON")
+        .execute(conn.as_mut())
+        .await?;
     Ok(())
 }

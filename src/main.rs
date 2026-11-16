@@ -8,15 +8,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
 
-    let database = std::env::var("DREAMGATE_DB").unwrap_or_else(|_| "data/dreamgate.db".to_string());
-    if let Some(parent) = Path::new(&database).parent() && !parent.as_os_str().is_empty() {
+    let database =
+        std::env::var("DREAMGATE_DB").unwrap_or_else(|_| "data/dreamgate.db".to_string());
+    if let Some(parent) = Path::new(&database).parent()
+        && !parent.as_os_str().is_empty()
+    {
         std::fs::create_dir_all(parent)?;
     }
     let pool = db::connect(&database).await?;
 
     let st = state::State {
         pool,
-        http: reqwest::Client::builder().timeout(std::time::Duration::from_secs(120)).build()?,
+        http: reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(120))
+            .build()?,
         hub: live::hub(),
         presence: Default::default(),
         attempts: Default::default(),

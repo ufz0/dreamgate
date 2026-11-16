@@ -1,10 +1,10 @@
 use std::time::{Duration, Instant};
 
 use axum::extract::{FromRequestParts, Request, State as AxumState};
-use axum::http::header::{SET_COOKIE, HeaderValue};
+use axum::http::StatusCode;
+use axum::http::header::{HeaderValue, SET_COOKIE};
 use axum::http::request::Parts;
 use axum::http::uri::Scheme;
-use axum::http::StatusCode;
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Json, Response};
 use serde::Deserialize;
@@ -62,7 +62,11 @@ pub fn cookie_value(req: &Request, name: &str) -> Option<String> {
     None
 }
 
-pub async fn require_session(AxumState(st): AxumState<State>, mut req: Request, next: Next) -> Response {
+pub async fn require_session(
+    AxumState(st): AxumState<State>,
+    mut req: Request,
+    next: Next,
+) -> Response {
     let Some(token) = cookie_value(&req, COOKIE_NAME) else {
         return error(StatusCode::UNAUTHORIZED, "invalid_session", "not signed in");
     };
@@ -72,12 +76,26 @@ pub async fn require_session(AxumState(st): AxumState<State>, mut req: Request, 
         "SELECT u.id, u.username, u.role FROM sessions s JOIN users u ON u.id = s.user_id \
          WHERE s.token = ? AND strftime('%Y-%m-%d %H:%M:%S', s.created_at) >= datetime('now', '-{SESSION_MAX_AGE_DAYS} days')",
     );
-    let row = match sqlx::query(sqlx::AssertSqlSafe(sql.as_str())).bind(&token).fetch_optional(&st.pool).await {
+    let row = match sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
+        .bind(&token)
+        .fetch_optional(&st.pool)
+        .await
+    {
         Ok(row) => row,
-        Err(err) => return error(StatusCode::INTERNAL_SERVER_ERROR, "server_error", err.to_string()),
+        Err(err) => {
+            return error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "server_error",
+                err.to_string(),
+            );
+        }
     };
     let Some(row) = row else {
-        return error(StatusCode::UNAUTHORIZED, "invalid_session", "session expired");
+        return error(
+            StatusCode::UNAUTHORIZED,
+            "invalid_session",
+            "session expired",
+        );
     };
     req.extensions_mut().insert(Caller {
         id: row.get::<i64, _>("id"),
@@ -91,7 +109,9 @@ pub async fn require_session(AxumState(st): AxumState<State>, mut req: Request, 
 // survive a restart.
 fn attempt_allowed(st: &State, username: &str) -> bool {
     let mut windows = st.attempts.lock().expect("attempts lock");
-    let window = windows.entry(username.to_string()).or_insert((0, Instant::now()));
+    let window = windows
+        .entry(username.to_string())
+        .or_insert((0, Instant::now()));
     if window.1.elapsed() >= Duration::from_secs(ATTEMPT_WINDOW_SECS) {
         window.0 = 0;
         window.1 = Instant::now();
@@ -136,9 +156,10 @@ fn with_cookie(mut resp: Response, token: &str, secure: bool) -> Response {
     if secure {
         value.push_str("; Secure");
     }
-    resp
-        .headers_mut()
-        .insert(SET_COOKIE, HeaderValue::try_from(value).expect("valid cookie"));
+    resp.headers_mut().insert(
+        SET_COOKIE,
+        HeaderValue::try_from(value).expect("valid cookie"),
+    );
     resp
 }
 
@@ -148,13 +169,25 @@ pub struct RegisterBody {
     pub password: String,
 }
 
-pub async fn register(AxumState(st): AxumState<State>, parts: Parts, Json(body): Json<RegisterBody>) -> Response {
+pub async fn register(
+    AxumState(st): AxumState<State>,
+    parts: Parts,
+    Json(body): Json<RegisterBody>,
+) -> Response {
     let username = body.username.trim().to_string();
     if username.is_empty() || username.chars().any(char::is_whitespace) {
-        return error(StatusCode::BAD_REQUEST, "invalid_request", "username is required and cannot contain spaces");
+        return error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "username is required and cannot contain spaces",
+        );
     }
     if body.password.len() < 8 {
-        return error(StatusCode::BAD_REQUEST, "invalid_request", "password must be at least 8 characters");
+        return error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "password must be at least 8 characters",
+        );
     }
     if !crate::settings::can_register(&st).await {
         return error(
@@ -164,9 +197,18 @@ pub async fn register(AxumState(st): AxumState<State>, parts: Parts, Json(body):
         );
     }
 
-    let count = match sqlx::query("SELECT COUNT(*) AS n FROM users").fetch_one(&st.pool).await {
+    let count = match sqlx::query("SELECT COUNT(*) AS n FROM users")
+        .fetch_one(&st.pool)
+        .await
+    {
         Ok(row) => row.get::<i64, _>("n"),
-        Err(err) => return error(StatusCode::INTERNAL_SERVER_ERROR, "server_error", err.to_string()),
+        Err(err) => {
+            return error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "server_error",
+                err.to_string(),
+            );
+        }
     };
     // The first account to register owns the instance.
     let role = if count == 0 { "admin" } else { "user" };
@@ -174,7 +216,13 @@ pub async fn register(AxumState(st): AxumState<State>, parts: Parts, Json(body):
     let pending = count > 0 && crate::settings::requires_approval(&st).await;
     let hash = match bcrypt::hash(&body.password, 10) {
         Ok(hash) => hash,
-        Err(err) => return error(StatusCode::INTERNAL_SERVER_ERROR, "server_error", err.to_string()),
+        Err(err) => {
+            return error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "server_error",
+                err.to_string(),
+            );
+        }
     };
 
     let row = match sqlx::query(
@@ -194,11 +242,18 @@ pub async fn register(AxumState(st): AxumState<State>, parts: Parts, Json(body):
     let id = row.get::<i64, _>("id");
     if pending {
         // No session yet: the account is signed in after an admin approves it.
-        return Json(json!({ "id": id, "username": username, "role": role, "pending": true })).into_response();
+        return Json(json!({ "id": id, "username": username, "role": role, "pending": true }))
+            .into_response();
     }
     let token = match create_session(&st, id).await {
         Ok(token) => token,
-        Err(err) => return error(StatusCode::INTERNAL_SERVER_ERROR, "server_error", err.to_string()),
+        Err(err) => {
+            return error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "server_error",
+                err.to_string(),
+            );
+        }
     };
     let resp = Json(json!({ "id": id, "username": username, "role": role })).into_response();
     with_cookie(resp, &token, served_over_tls(&parts))
@@ -210,7 +265,11 @@ pub struct LoginBody {
     pub password: String,
 }
 
-pub async fn login(AxumState(st): AxumState<State>, parts: Parts, Json(body): Json<LoginBody>) -> Response {
+pub async fn login(
+    AxumState(st): AxumState<State>,
+    parts: Parts,
+    Json(body): Json<LoginBody>,
+) -> Response {
     let username = body.username.trim().to_string();
     if !attempt_allowed(&st, &username) {
         return error(
@@ -219,44 +278,78 @@ pub async fn login(AxumState(st): AxumState<State>, parts: Parts, Json(body): Js
             "too many sign-in attempts for that account, try again in a minute",
         );
     }
-    let row = match sqlx::query("SELECT id, username, password_hash, role, enabled, pending FROM users WHERE username = ?")
-        .bind(&username)
-        .fetch_optional(&st.pool)
-        .await
+    let row = match sqlx::query(
+        "SELECT id, username, password_hash, role, enabled, pending FROM users WHERE username = ?",
+    )
+    .bind(&username)
+    .fetch_optional(&st.pool)
+    .await
     {
         Ok(row) => row,
-        Err(err) => return error(StatusCode::INTERNAL_SERVER_ERROR, "server_error", err.to_string()),
+        Err(err) => {
+            return error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "server_error",
+                err.to_string(),
+            );
+        }
     };
     // The same answer for an account that does not exist and a password that does not match, so a
     // sign-in attempt cannot be used to find out which usernames the instance has.
     let Some(row) = row else {
-        return error(StatusCode::UNAUTHORIZED, "invalid_credentials", "username or password is not correct");
+        return error(
+            StatusCode::UNAUTHORIZED,
+            "invalid_credentials",
+            "username or password is not correct",
+        );
     };
     if row.get::<i64, _>("pending") == 1 {
-        return error(StatusCode::FORBIDDEN, "account_pending", "this account is waiting for an admin to approve it");
+        return error(
+            StatusCode::FORBIDDEN,
+            "account_pending",
+            "this account is waiting for an admin to approve it",
+        );
     }
     let id = row.get::<i64, _>("id");
 
     // Checked before anything is written, so a disabled account is not changed by a sign-in that
     // it is not allowed to make.
     if row.get::<i64, _>("enabled") == 0 {
-        return error(StatusCode::FORBIDDEN, "account_disabled", "this account is disabled");
+        return error(
+            StatusCode::FORBIDDEN,
+            "account_disabled",
+            "this account is disabled",
+        );
     }
     // An account made by an admin has no password until the person signs in for the first time;
     // what they enter then becomes their own password.
     match row.get::<Option<String>, _>("password_hash") {
         Some(hash) => {
             if !bcrypt::verify(&body.password, &hash).unwrap_or(false) {
-                return error(StatusCode::UNAUTHORIZED, "invalid_credentials", "username or password is not correct");
+                return error(
+                    StatusCode::UNAUTHORIZED,
+                    "invalid_credentials",
+                    "username or password is not correct",
+                );
             }
         }
         None => {
             if body.password.len() < 8 {
-                return error(StatusCode::BAD_REQUEST, "invalid_request", "password must be at least 8 characters");
+                return error(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_request",
+                    "password must be at least 8 characters",
+                );
             }
             let hash = match bcrypt::hash(&body.password, 10) {
                 Ok(hash) => hash,
-                Err(err) => return error(StatusCode::INTERNAL_SERVER_ERROR, "server_error", err.to_string()),
+                Err(err) => {
+                    return error(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "server_error",
+                        err.to_string(),
+                    );
+                }
             };
             if let Err(err) = sqlx::query("UPDATE users SET password_hash = ? WHERE id = ?")
                 .bind(&hash)
@@ -264,14 +357,24 @@ pub async fn login(AxumState(st): AxumState<State>, parts: Parts, Json(body): Js
                 .execute(&st.pool)
                 .await
             {
-                return error(StatusCode::INTERNAL_SERVER_ERROR, "server_error", err.to_string());
+                return error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "server_error",
+                    err.to_string(),
+                );
             }
         }
     }
 
     let token = match create_session(&st, id).await {
         Ok(token) => token,
-        Err(err) => return error(StatusCode::INTERNAL_SERVER_ERROR, "server_error", err.to_string()),
+        Err(err) => {
+            return error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "server_error",
+                err.to_string(),
+            );
+        }
     };
     let resp = Json(json!({
         "id": id,
@@ -298,5 +401,6 @@ pub async fn logout(AxumState(st): AxumState<State>, req: Request) -> Response {
 }
 
 pub async fn me(caller: Caller) -> Response {
-    Json(json!({ "id": caller.id, "username": caller.username, "role": caller.role })).into_response()
+    Json(json!({ "id": caller.id, "username": caller.username, "role": caller.role }))
+        .into_response()
 }
