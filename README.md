@@ -39,9 +39,11 @@ Environment variables:
 2. Create a key. A DreamGate key is what clients use — the upstream key stays server-side.
    Optionally bind a key to one connection, pin a model, or set a requests-per-minute limit
    and a token cap. An admin can set a token limit for any account from the Accounts view;
-   that limit counts the tokens used in the current day and resets at 00:00 UTC, and it
+   that limit counts the tokens used in the current day — the input and the generated text
+   together, as they are recorded in the usage row — and resets at 00:00 UTC, and it
    applies on top of a key's own cap, so a key cannot be used to work around it. Clearing
-   the value clears the limit.
+   the value clears the limit. A key's own cap is the same sum over the life of the key. Splitting
+   the figures on the Overview does not change what either limit counts.
 3. Point a client at the gateway, for example OpenWebUI:
    - API base: `http://127.0.0.1:8787/v1`
    - API key: the DreamGate key
@@ -76,6 +78,20 @@ connections are health-checked every 30 seconds. A key with no connection routes
 enabled connection by priority, and a connection that is down or fails at the transport
 level falls over to the next one.
 
+A recorded row also carries what the engine said about the request itself, when it said anything:
+the part of the prompt served from its cache, and how long reading the prompt took against how long
+generating the answer took. An OpenAI-shaped server reports the cache hit as
+`usage.prompt_tokens_details.cached_tokens`; a llama.cpp build reports the same things in `timings` as
+`cache_n`, `prompt_ms` and `predicted_ms`. Either shape is read from wherever it appears, and timings
+are stored as whole milliseconds. Not every engine reports any of it, so a field the upstream did not
+report is stored as null and the Overview leaves that figure out rather than showing a zero — nothing in
+these fields is estimated. The Overview shows a cache split only when some engine reported one, and the
+generation speed is measured over the rows whose token counts an upstream reported, so a row counted by
+the gateway's own estimate is not in it. A stream that ends because the client disconnected is still
+recorded, with whatever the upstream had reported up to that point; the final usage chunk, which is
+where a cache hit and the timings appear, is not seen, and no test covers that case because the mock
+upstream does not stop the client.
+
 A recorded request outlives the key it came in on. Deleting a key leaves its rows standing, so the
 counters do not move when a key is removed; an activity row whose key is gone is marked key
 removed.
@@ -87,13 +103,19 @@ URL hash (`#/overview`, `#/activity`, `#/keys`, `#/connections`, `#/connect`, `#
 `#/accounts`):
 
 - **Overview** — the gate readout (client → key → upstream, following the key and the
-  connection the last request actually used, which is not necessarily the first key), the count of
-  every token that has ever crossed the gate from any account beside the count of the tokens the
-  models generated, which leaves the prompt text out. The same pair for this account alone, so the
-  generated figure is what this account produced and not what every account produced, then the rest
-  of its figures including today's, a "Right now" panel for who is online and generating, and the
-  token rate per hour and requests per day for this account. Totals across accounts are in the
-  Accounts view.
+  connection the last request actually used, which is not necessarily the first key), the tokens the
+  models generated as the headline figure for the whole gate, with the input tokens beside it as one
+  number and a note saying how much of that input came from a prompt cache when any engine reported
+  one. What was sent in is not counted as what was generated: an agentic client sends the whole
+  conversation again on every turn, so the input figure is mostly repeats. The same pair for this
+  account alone, so the generated figure is what this account produced and not what every account
+  produced, then the rest of its figures including today's split into input and generated, a
+  "Right now" panel for who is online and generating, and the token rate per hour (input and output
+  together, as it has always counted them) and requests per day for this account. Average prompt
+  processing time and average generation speed appear only when an engine reported timings for some
+  request, and the speed is measured over the rows whose counts an upstream reported rather than over
+  estimated ones; when nothing reported timings those rows are not shown. Totals across accounts are
+  in the Accounts view.
 - **Activity** — every recorded request, newest first, plus usage by model.
 - **Keys** — create, copy, disable and delete keys, with per-key usage, and a note when a
   key's binding points at a connection that is turned off. A key that is turned off stays listed and
@@ -205,5 +227,10 @@ counters standing, the presence counts while a request is in flight, the connect
 admin-only with the key a connection carries returned to an admin alone, the model list refusing a
 disabled account the same way the completion path does, sign-in attempts being bounded per account, a
 session refused past the window the cookie lasts, the cookie marked Secure only when the request came
-over TLS, and the migration of a database written with the old columns (a display name, an email, a
+over TLS, the migration of a usage table written before the prompt cache and timing columns — the rows
+already there keep their values and read as unknown, and a value already reported is carried across the
+rebuild of that table — and which fields a recorded row carries when an engine reports a cache hit or
+timings against when it reports nothing, including a usage block that reports no token counts and is
+therefore estimated, and the migration of a database
+written with the old columns (a display name, an email, a
 lifetime cap), or with usage rows that were taken with the key, to the current shape.
