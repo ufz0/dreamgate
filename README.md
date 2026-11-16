@@ -188,7 +188,8 @@ waiting. Hashing and verifying are therefore done on the blocking pool; the auth
 admission, so what bounds them is the blocking pool itself, which is tokio's default of 128 threads. The
 health check round reads the connections once and checks them at once, bounded to eight, so a connection that
 does not answer can only delay its own row now; the round is still bounded rather than unbounded, because a
-health check is a request to a connection that may already be working.
+health check is a request to a connection that may already be working. A round that stops on a panic is logged
+and started again after the same 30 seconds, so health checking does not end with it.
 
 ## Dashboard
 
@@ -313,6 +314,7 @@ cargo test
 The suite runs the gateway against a mock OpenAI-compatible upstream and covers usage
 recording, estimation when the upstream reports nothing including reasoning text, SSE
 pass-through, that a client's reasoning level reaches the upstream unchanged, upstream failover,
+the round of health checks marking a connection that answers,
 the model recorded for a streamed request when nothing is pinned to a key or a connection,
 per-key limits and their validation, the keys list being the caller's own with the other
 accounts read by an admin alone, per-account daily token limits including the day

@@ -1127,6 +1127,46 @@ async fn fails_over_to_a_healthy_connection() {
     assert_eq!(usage[0]["completion_tokens"], 7);
 }
 
+// The round of health checks is started by the binary rather than by a route, so no other test reaches
+// it. A connection is created without a check, so its row reads unknown until a round has looked at it.
+#[tokio::test]
+async fn the_health_check_round_marks_a_connection_that_answers() {
+    let st = test_state().await;
+    let router = build_router(st.clone());
+    let base_url = mock_upstream().await;
+    let cookie = register(&router, "ada").await;
+    let (_, created) = post_json(
+        &router,
+        "/api/connections",
+        &cookie,
+        json!({ "name": "live", "base_url": base_url }),
+    )
+    .await;
+    let id = created["id"].as_i64().unwrap();
+
+    // The first round runs as soon as the task starts, and the mock answers at once, so the window is
+    // far longer than the round needs. A round that stops is only started again after 30 seconds, so a
+    // round that cannot read the row is caught here as a row that still reads unknown.
+    let round = tokio::spawn(dreamgate::registry::health_checker(st.clone()));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let health: String = sqlx::query_scalar("SELECT health FROM connections WHERE id = ?")
+            .bind(id)
+            .fetch_one(&st.pool)
+            .await
+            .unwrap();
+        if health == "ok" {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the connection still reads {health} after the first round"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    round.abort();
+}
+
 #[tokio::test]
 async fn per_key_rate_limit_blocks_the_third_request() {
     let st = test_state().await;
