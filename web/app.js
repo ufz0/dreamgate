@@ -19,7 +19,7 @@ const ICONS = {
   accounts: '<circle cx="12" cy="9" r="4"/><path d="M4 20a8 8 0 0 1 16 0"/>',
   sandbox: '<path d="M4 5h16v11H9l-5 4z"/><path d="M8 10h8"/>',
   check: '<circle cx="12" cy="12" r="9"/><path d="M8.5 12.5l2.5 2.5 5-5"/>',
-  alert: '<path d="M12 4l8 14H4z"/><path d="M12 9v3M12 15h.01"/>',
+  alert: '<path d="M12 3l9 17H3z"/><path d="M12 9v4M12 16.5h.01"/>',
   pending: '<circle cx="12" cy="12" r="9"/><path d="M12 7.5V12l3 2"/>',
   chevron: '<path d="M9 6l6 6-6 6"/>',
   panel: '<rect x="3" y="4" width="18" height="16" rx="2"/><path d="M9 4v16"/>',
@@ -36,12 +36,18 @@ function paintIcons(root) {
   for (const el of root.querySelectorAll('[data-icon]')) el.innerHTML = icon(el.dataset.icon);
 }
 
-// A connection reads unknown until a check has run on it, which is not the same as down: the gateway
-// only skips a connection whose check failed, so one that was never checked does not get the warning.
+// The stored health is unknown until a check has run on a connection, which is not the same as down: the
+// gateway only skips a connection whose check failed, so one that was never checked does not get the
+// warning. A value this page does not know is shown as it is stored rather than read as one of these.
+const HEALTH = {
+  ok: ['ok', 'check', 'ok'],
+  down: ['down', 'alert', 'down'],
+  unknown: ['', 'pending', 'not checked yet'],
+};
+
 function healthChip(health) {
-  const [kind, glyph, label] =
-    health === 'ok' ? ['ok', 'check', 'ok'] : health === 'down' ? ['down', 'alert', 'down'] : ['', 'pending', 'not checked yet'];
-  return `<span class="chip ${kind}"><span class="icon">${icon(glyph)}</span><span>${esc(label)}</span></span>`;
+  const [kind, glyph, label] = Object.hasOwn(HEALTH, health) ? HEALTH[health] : ['', null, health];
+  return `<span class="chip ${kind}">${glyph ? `<span class="icon">${icon(glyph)}</span>` : ''}<span>${esc(label)}</span></span>`;
 }
 
 const state = {
@@ -456,7 +462,10 @@ function renderGate() {
   const bound = key && key.connection_id ? state.connections.find((c) => c.id === key.connection_id && c.enabled) : null;
   const conn = bound || topConnection();
   $('gate-key').textContent = last ? last.key : (state.keys.length ? state.keys[0].name : 'no key yet');
-  $('gate-upstream').innerHTML = conn ? `${esc(conn.name)} ${healthChip(conn.health)}` : 'no connection yet';
+  // The name is clamped to the width of a leg, and the chip sits beside it rather than inside it, so a
+  // long name is cut short and the health still shows.
+  $('gate-upstream').textContent = conn ? conn.name : 'no connection yet';
+  $('gate-health').innerHTML = conn ? healthChip(conn.health) : '';
 
   if (!last) {
     $('gate-read').textContent = 'Nothing has crossed the gate yet.';
