@@ -16,15 +16,17 @@
     <p class="note" id="first-account-note">The first account to register becomes the admin.</p>
   </div>
   <form class="entry-form" id="auth-form">
+    <!-- The mode is chosen when the screen renders, so this markup only says what it shows for an
+         instance that already has accounts; a first account is opened on Register by the app. -->
     <div class="switch" role="group" aria-label="Account">
-      <button type="button" id="mode-register" aria-pressed="true">Register</button>
-      <button type="button" id="mode-login" aria-pressed="false">Sign in</button>
+      <button type="button" id="mode-register" aria-pressed="false">Register</button>
+      <button type="button" id="mode-login" aria-pressed="true">Sign in</button>
     </div>
     <p class="note" id="register-note" hidden>Self-registration is closed, so an admin has to open it before a new account can be made.</p>
     <p class="note" id="first-password-note" hidden>For an account an admin made, the first password you enter here becomes your own.</p>
     <label>Username<input name="username" autocomplete="username" required></label>
     <label>Password<input name="password" type="password" minlength="8" required></label>
-    <button type="submit" id="auth-submit">Register</button>
+    <button type="submit" id="auth-submit">Sign in</button>
     <p class="notice" id="auth-error" role="status"></p>
   </form>
 </section>
