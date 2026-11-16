@@ -9,7 +9,7 @@ use axum::{
     extract::{Json, State as AxumState},
     http::{HeaderValue, StatusCode, header},
     response::{IntoResponse, Response},
-    routing::post,
+    routing::{get, post},
 };
 use dreamgate::{build_router, db, limits, live, state::State};
 use futures_util::{future::join_all, stream};
@@ -20,20 +20,48 @@ use tower::ServiceExt;
 
 static SEED: AtomicUsize = AtomicUsize::new(1);
 
-// A shared in-memory database with more than one connection. Plain "sqlite::memory:" gives every
-// connection its own database, so a test that wants to see requests at the database at the same time has
-// to name the file and share the cache.
-async fn test_state(global: usize, per_connection: usize, pool: u32) -> State {
+// The time bounds are the ones the gateway runs with, unless a test is about a time bound and names its own:
+// a stall cannot be measured in two minutes. `test_state` builds the client through `limits.http_client()`, the
+// same builder `src/main.rs` uses, so what a test measures is the configuration the gateway actually runs with
+// rather than one the test invented.
+fn test_time_limits(
+    global: usize,
+    per_connection: usize,
+    request_timeout: Duration,
+    stream_stall: Duration,
+) -> limits::Limits {
+    limits::Limits::new(
+        global,
+        per_connection,
+        request_timeout,
+        stream_stall,
+        Duration::from_secs(limits::DEFAULT_CONNECT_TIMEOUT_SECS),
+    )
+}
+
+fn test_limits(global: usize, per_connection: usize) -> limits::Limits {
+    test_time_limits(
+        global,
+        per_connection,
+        Duration::from_secs(limits::DEFAULT_REQUEST_TIMEOUT_SECS),
+        Duration::from_secs(limits::DEFAULT_STREAM_STALL_SECS),
+    )
+}
+
+// A shared in-memory database with more than one connection. Plain "sqlite::memory:" gives every connection its
+// own database, so a test that wants to see requests at the database at the same time has to name the file and
+// share the cache.
+async fn test_state(limits: limits::Limits, pool: u32) -> State {
     let name = SEED.fetch_add(1, Ordering::SeqCst);
     let url = format!("sqlite://file:concurrency{name}?mode=memory&cache=shared");
     let pool = db::connect(&url, pool).await.unwrap();
     State {
         pool,
-        http: reqwest::Client::new(),
+        http: limits.http_client(),
         hub: live::hub(),
         presence: Default::default(),
         attempts: Default::default(),
-        limits: Arc::new(limits::Limits::new(global, per_connection)),
+        limits: Arc::new(limits),
     }
 }
 
@@ -85,6 +113,11 @@ struct Mock {
     peak: Arc<AtomicUsize>,
     cut_short: Arc<AtomicBool>,
     delay_ms: u64,
+    // A quiet window before the usage chunk. Nothing arriving for it is what a stalled connection looks like
+    // from the other side of the gateway, and the stream is not finished at that point.
+    quiet_ms: u64,
+    // A delay before the mock answers at all, so the wait for the first bytes is the whole of it.
+    first_byte_ms: u64,
     chunks: usize,
 }
 
@@ -95,8 +128,20 @@ impl Mock {
             peak: Arc::new(AtomicUsize::new(0)),
             cut_short: Arc::new(AtomicBool::new(false)),
             delay_ms,
+            quiet_ms: 0,
+            first_byte_ms: 0,
             chunks,
         }
+    }
+
+    fn quiet(mut self, quiet_ms: u64) -> Mock {
+        self.quiet_ms = quiet_ms;
+        self
+    }
+
+    fn responds_after(mut self, first_byte_ms: u64) -> Mock {
+        self.first_byte_ms = first_byte_ms;
+        self
     }
 
     fn peak(&self) -> usize {
@@ -142,6 +187,12 @@ async fn mock_chat(AxumState(mock): AxumState<Mock>, Json(body): Json<Value>) ->
     let marker = body.get("marker").and_then(Value::as_i64).unwrap_or(0);
     let mut guard = Guard::new(&mock);
 
+    // A connection that takes the request and says nothing back. The gateway's window for the first bytes is
+    // what ends this, and there is no answer for it to be an answer of.
+    if mock.first_byte_ms > 0 {
+        tokio::time::sleep(Duration::from_millis(mock.first_byte_ms)).await;
+    }
+
     if body.get("stream").and_then(Value::as_bool).unwrap_or(false) {
         let mut out = Response::new(Body::empty());
         out.headers_mut().insert(
@@ -149,8 +200,8 @@ async fn mock_chat(AxumState(mock): AxumState<Mock>, Json(body): Json<Value>) ->
             HeaderValue::from_static("text/event-stream"),
         );
         *out.body_mut() = Body::from_stream(stream::unfold(guard, move |mut guard| async move {
-            tokio::time::sleep(Duration::from_millis(guard.mock.delay_ms)).await;
             if guard.sent < guard.mock.chunks {
+                tokio::time::sleep(Duration::from_millis(guard.mock.delay_ms)).await;
                 guard.sent += 1;
                 let line = json!({ "choices": [{ "delta": { "content": format!("c{marker}-{}", guard.sent - 1) } }] });
                 return Some((
@@ -160,6 +211,11 @@ async fn mock_chat(AxumState(mock): AxumState<Mock>, Json(body): Json<Value>) ->
             }
             if guard.reported {
                 return None;
+            }
+            // The quiet window is read from the moment the last chunk was sent, which is where a stalled
+            // connection is measured from.
+            if guard.mock.quiet_ms > 0 {
+                tokio::time::sleep(Duration::from_millis(guard.mock.quiet_ms)).await;
             }
             // The usage chunk is the last thing an engine that reports usage sends, so a stream cut short
             // never carries it.
@@ -182,9 +238,19 @@ async fn mock_chat(AxumState(mock): AxumState<Mock>, Json(body): Json<Value>) ->
     Json(payload).into_response()
 }
 
+// The mock answers the model list after the same first-byte delay, so a test that gives the model list a
+// deadline shorter than that delay is measuring the gateway, not the mock.
+async fn mock_models(AxumState(mock): AxumState<Mock>) -> Response {
+    if mock.first_byte_ms > 0 {
+        tokio::time::sleep(Duration::from_millis(mock.first_byte_ms)).await;
+    }
+    Json(json!({ "data": [] })).into_response()
+}
+
 async fn mock_upstream(mock: &Mock) -> String {
     let app = Router::new()
         .route("/v1/chat/completions", post(mock_chat))
+        .route("/v1/models", get(mock_models))
         .with_state(mock.clone());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -288,7 +354,7 @@ async fn requests_to_one_connection_are_handled_at_the_same_time() {
     let mock = Mock::new(delay_ms, 0);
     // The limits are above what the test sends, so this test is about whether the requests run at the
     // same time, not about admission. The tests that check admission set their own.
-    let st = test_state(128, 128, 8).await;
+    let st = test_state(test_limits(128, 128), 8).await;
     let base_url = mock_upstream(&mock).await;
     seed(&st, "ada", &base_url, "dreamgate_test", None).await;
 
@@ -334,7 +400,7 @@ async fn requests_to_one_connection_are_handled_at_the_same_time() {
 #[tokio::test]
 async fn many_streams_run_at_the_same_time_and_are_recorded_separately() {
     let mock = Mock::new(40, 3);
-    let st = test_state(128, 64, 4).await;
+    let st = test_state(test_limits(128, 64), 4).await;
     let base_url = mock_upstream(&mock).await;
     seed(&st, "ada", &base_url, "dreamgate_test", None).await;
     let router = build_router(st.clone());
@@ -378,7 +444,7 @@ async fn many_streams_run_at_the_same_time_and_are_recorded_separately() {
 async fn a_slow_connection_does_not_hold_requests_that_go_elsewhere() {
     let slow = Mock::new(600, 0);
     let fast = Mock::new(20, 0);
-    let st = test_state(128, 64, 4).await;
+    let st = test_state(test_limits(128, 64), 4).await;
     let slow_url = mock_upstream(&slow).await;
     let fast_url = mock_upstream(&fast).await;
     seed(&st, "ada", &slow_url, "key-slow", None).await;
@@ -441,7 +507,7 @@ async fn a_slow_connection_does_not_hold_requests_that_go_elsewhere() {
 async fn a_connection_at_its_limit_answers_without_queueing_the_request() {
     let mock = Mock::new(400, 0);
     // The default is below what the test sends, so three of the five cannot be admitted.
-    let st = test_state(128, 2, 4).await;
+    let st = test_state(test_limits(128, 2), 4).await;
     let base_url = mock_upstream(&mock).await;
     seed(&st, "ada", &base_url, "dreamgate_test", None).await;
 
@@ -489,7 +555,7 @@ async fn a_connection_at_its_limit_answers_without_queueing_the_request() {
 async fn a_connection_that_states_its_own_capability_is_admitted_by_it() {
     let mock = Mock::new(400, 0);
     // The gateway default is larger than what this connection says it can take.
-    let st = test_state(128, 16, 4).await;
+    let st = test_state(test_limits(128, 16), 4).await;
     let base_url = mock_upstream(&mock).await;
     seed(&st, "ada", &base_url, "dreamgate_test", Some(3)).await;
 
@@ -508,7 +574,7 @@ async fn a_connection_that_states_its_own_capability_is_admitted_by_it() {
 #[tokio::test]
 async fn a_gateway_at_its_total_limit_answers_with_503() {
     let mock = Mock::new(400, 0);
-    let st = test_state(1, 64, 4).await;
+    let st = test_state(test_limits(1, 64), 4).await;
     let base_url = mock_upstream(&mock).await;
     seed(&st, "ada", &base_url, "dreamgate_test", None).await;
 
@@ -536,7 +602,7 @@ async fn a_gateway_at_its_total_limit_answers_with_503() {
 // from being answered as an overload on a later attempt, which would be a request that left no row.
 #[tokio::test]
 async fn a_request_that_reached_a_connection_is_recorded_even_when_it_failed_there() {
-    let st = test_state(1, 64, 4).await;
+    let st = test_state(test_limits(1, 64), 4).await;
     seed(&st, "ada", "http://127.0.0.1:1", "dreamgate_test", None).await;
 
     let (statuses, _) = run_at_once(&st, "dreamgate_test", vec![1]).await;
@@ -555,7 +621,7 @@ async fn a_request_that_reached_a_connection_is_recorded_even_when_it_failed_the
 #[tokio::test]
 async fn a_client_that_goes_away_mid_stream_stops_the_upstream_and_is_still_recorded() {
     let mock = Mock::new(60, 6);
-    let st = test_state(128, 64, 4).await;
+    let st = test_state(test_limits(128, 64), 4).await;
     let base_url = mock_upstream(&mock).await;
     seed(&st, "ada", &base_url, "dreamgate_test", None).await;
     let router = build_router(st.clone());
@@ -598,7 +664,7 @@ async fn a_client_that_goes_away_mid_stream_stops_the_upstream_and_is_still_reco
 #[tokio::test]
 async fn a_stream_holds_its_slot_until_it_ends_and_then_gives_it_back() {
     let mock = Mock::new(60, 3);
-    let st = test_state(128, 1, 4).await;
+    let st = test_state(test_limits(128, 1), 4).await;
     let base_url = mock_upstream(&mock).await;
     seed(&st, "ada", &base_url, "dreamgate_test", None).await;
     let router = build_router(st.clone());
@@ -637,11 +703,271 @@ async fn a_stream_holds_its_slot_until_it_ends_and_then_gives_it_back() {
     );
 }
 
+// The bug this test holds. A deadline for the whole of a response cuts a stream that is still producing an
+// answer, and a cut stream is what a client feels as the socket dying in the middle of a generation. A stream
+// has no known end, so it is bounded by silence instead, and an answer that keeps arriving is not stalled
+// however long it takes. Here the mock runs past the request deadline without ever going quiet, so the answer
+// has to arrive whole — including its usage chunk, which is what makes the row a reported figure rather than
+// an estimate.
+#[tokio::test]
+async fn a_stream_that_runs_past_the_request_deadline_arrives_in_full() {
+    // Four chunks at 120 ms each is half a second, past the deadline the test gives. The stall window is far
+    // longer, so nothing in this stream is quiet and nothing should be cut.
+    let mock = Mock::new(120, 4);
+    let limits = test_time_limits(64, 64, Duration::from_millis(200), Duration::from_secs(10));
+    let st = test_state(limits, 4).await;
+    let base_url = mock_upstream(&mock).await;
+    seed(&st, "ada", &base_url, "dreamgate_test", None).await;
+    let router = build_router(st.clone());
+
+    let response = gateway_call(&router, "dreamgate_test", 11, true).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let collected = response.into_body().collect().await;
+    assert!(
+        collected.is_ok(),
+        "the stream was cut before it finished: {collected:?}"
+    );
+    let text = String::from_utf8_lossy(&collected.unwrap().to_bytes()).to_string();
+    assert_eq!(
+        text.matches("data: ").count(),
+        5,
+        "the answer arrived as: {text}"
+    );
+    assert!(
+        text.contains("\"usage\""),
+        "the usage chunk is the last thing the mock sends and it did not arrive"
+    );
+
+    let rows = wait_for_rows(&st.pool, 1).await;
+    assert_eq!(rows[0]["model"], "m11");
+    assert_eq!(rows[0]["streamed"], true);
+    assert_eq!(
+        rows[0]["estimated"], false,
+        "the upstream reported its usage, so this row is not an estimate"
+    );
+
+    // And the same mock, read past the deadline, is not seen as stalled by the stall window: the two bounds
+    // measure different things and the test would be meaningless if one were inside the other.
+    assert!(
+        !mock.cut_short(),
+        "the mock's stream was cut, so the answer did not arrive in full"
+    );
+}
+
+// What is kept: the deadline for a single answer, applied where there is an end. It is applied per request by
+// the gateway rather than by the client to the whole response, which is what stops it reaching a stream. A
+// request that was given up on at a connection has already crossed the gate, so it is answered as that failure
+// and recorded, as it was before. Read on its own this test cannot tell the two mechanisms apart — a client
+// total deadline would answer the same way — so it is the test above, where a stream runs past the deadline and
+// is not cut, that says which one the gateway uses.
+#[tokio::test]
+async fn a_single_answer_is_still_given_its_deadline() {
+    let mock = Mock::new(400, 0);
+    let limits = test_time_limits(64, 64, Duration::from_millis(100), Duration::from_secs(10));
+    let st = test_state(limits, 4).await;
+    let base_url = mock_upstream(&mock).await;
+    seed(&st, "ada", &base_url, "dreamgate_test", None).await;
+    let router = build_router(st.clone());
+
+    let response = gateway_call(&router, "dreamgate_test", 12, false).await;
+    assert_eq!(
+        response.status(),
+        StatusCode::BAD_GATEWAY,
+        "a single answer that takes longer than its deadline is still given up on"
+    );
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    let json = serde_json::from_slice::<Value>(&body).unwrap();
+    assert_eq!(json["error"]["type"], "upstream_unavailable");
+    assert_eq!(
+        row_count(&st.pool).await,
+        1,
+        "the request reached a connection, so its row stands"
+    );
+}
+
+// A stream that goes quiet for the stall window is closed rather than held open: silence for the window is a
+// dead connection, not a slow generation, and a request that holds a slot for a dead connection holds it away
+// from other requests. The client sees the stream end with an error, so it can tell the answer is incomplete,
+// and the row stands as an estimate because nothing was reported for a stream that never reached its usage
+// chunk.
+#[tokio::test]
+async fn a_stream_that_goes_quiet_is_closed_and_its_slot_is_given_back() {
+    // Two chunks, then two seconds of silence before the usage chunk — an order of magnitude longer than the
+    // window, so the silence is what ends the stream rather than the answer being finished, and the margins are
+    // wide enough that a loaded runner cannot turn the ordering around.
+    let mock = Mock::new(25, 2).quiet(2000);
+    let limits = test_time_limits(64, 1, Duration::from_secs(10), Duration::from_millis(500));
+    let st = test_state(limits, 4).await;
+    let base_url = mock_upstream(&mock).await;
+    seed(&st, "ada", &base_url, "dreamgate_test", None).await;
+    let router = build_router(st.clone());
+
+    let response = gateway_call(&router, "dreamgate_test", 13, true).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let mut body = response.into_body();
+    for _ in 0..2 {
+        let frame = body.frame().await.expect("a chunk arrived");
+        assert!(frame.is_ok(), "the stream was closed before it went quiet");
+    }
+
+    // While it is quiet it still holds the only slot, so a request that arrives is answered at once rather
+    // than made to wait for the stream.
+    let while_quiet = gateway_call(&router, "dreamgate_test", 14, false).await;
+    assert_eq!(
+        while_quiet.status(),
+        StatusCode::TOO_MANY_REQUESTS,
+        "a request was queued behind the stream instead of being answered at once"
+    );
+
+    let frame = body
+        .frame()
+        .await
+        .expect("the stream was closed at the silence");
+    assert!(
+        frame.is_err(),
+        "the stream ended as a complete answer, so the silence did not close it"
+    );
+
+    // The mock's stream is dropped when the gateway stops reading it, which is what the mock counts as a
+    // stream cut short. That happens in the gateway's stream task, so it is polled rather than asserted at
+    // once; if the mock had been allowed to finish, it would have reported its usage chunk and this would say
+    // the answer was complete.
+    for _ in 0..200 {
+        if mock.cut_short() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(
+        mock.cut_short(),
+        "the mock finished its usage chunk, so the stream was not cut at the silence"
+    );
+
+    let rows = wait_for_rows(&st.pool, 1).await;
+    assert_eq!(rows[0]["model"], "m13");
+    assert_eq!(rows[0]["streamed"], true);
+    assert_eq!(
+        rows[0]["estimated"], true,
+        "nothing was reported for a stream closed at the silence"
+    );
+
+    // The slot is given back when the stalled stream ends, so the next request is admitted. The release
+    // happens in the stream task, so this is polled rather than asserted at once.
+    let mut admitted = StatusCode::TOO_MANY_REQUESTS;
+    for _ in 0..100 {
+        admitted = gateway_call(&router, "dreamgate_test", 15, false)
+            .await
+            .status();
+        if admitted == StatusCode::OK {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(
+        admitted,
+        StatusCode::OK,
+        "the stalled stream still held its slot"
+    );
+}
+
+// The window bounds silence, not the length of the answer, so it restarts after every read that arrives. A
+// stream that goes quiet for less than the window and then continues is a working connection and must not be
+// closed: a test that only looked at a silence longer than the window could not tell a per-read window from a
+// deadline for the whole answer.
+#[tokio::test]
+async fn a_stream_that_goes_quiet_below_the_window_and_then_resumes_is_not_closed() {
+    // Eighty milliseconds of silence against a window four times that. The usage chunk still arrives, so the row
+    // is a reported figure and not an estimate, and the mock finishes its stream.
+    let mock = Mock::new(40, 2).quiet(80);
+    let limits = test_time_limits(64, 64, Duration::from_secs(10), Duration::from_millis(400));
+    let st = test_state(limits, 4).await;
+    let base_url = mock_upstream(&mock).await;
+    seed(&st, "ada", &base_url, "dreamgate_test", None).await;
+    let router = build_router(st.clone());
+
+    let response = gateway_call(&router, "dreamgate_test", 16, true).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let collected = response.into_body().collect().await;
+    assert!(
+        collected.is_ok(),
+        "a silence shorter than the window closed the stream: {collected:?}"
+    );
+
+    let rows = wait_for_rows(&st.pool, 1).await;
+    assert_eq!(rows[0]["model"], "m16");
+    assert_eq!(
+        rows[0]["estimated"], false,
+        "the usage chunk arrived after a short silence, so the answer was not cut"
+    );
+    assert!(
+        !mock.cut_short(),
+        "the mock's stream was cut short by the window"
+    );
+}
+
+// The model list is not a stream, so the same deadline covers it as covers any single answer, as the client's
+// total deadline did before this change. A connection that never answers the list is given up on.
+#[tokio::test]
+async fn the_model_list_keeps_the_deadline_a_single_answer_is_given() {
+    let mock = Mock::new(0, 0).responds_after(400);
+    let limits = test_time_limits(
+        64,
+        64,
+        Duration::from_millis(100),
+        Duration::from_millis(100),
+    );
+    let st = test_state(limits, 4).await;
+    let base_url = mock_upstream(&mock).await;
+    seed(&st, "ada", &base_url, "dreamgate_test", None).await;
+    let router = build_router(st.clone());
+
+    let response = router
+        .clone()
+        .oneshot(
+            axum::http::Request::get("/v1/models")
+                .header("authorization", "Bearer dreamgate_test")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status(),
+        StatusCode::BAD_GATEWAY,
+        "a connection that never answers the model list is given up on"
+    );
+}
+
+// The same window covers the wait for the first bytes, which is the reported symptom in its plainest form: a
+// connection that takes the request and never answers. There is no answer to cut here, so the request is given
+// up on and answered as the connection failing, as any other transport failure is.
+#[tokio::test]
+async fn a_connection_that_never_answers_is_given_up_on_within_the_window() {
+    let mock = Mock::new(0, 2).responds_after(500);
+    let limits = test_time_limits(64, 64, Duration::from_secs(10), Duration::from_millis(150));
+    let st = test_state(limits, 4).await;
+    let base_url = mock_upstream(&mock).await;
+    seed(&st, "ada", &base_url, "dreamgate_test", None).await;
+    let router = build_router(st.clone());
+
+    let response = gateway_call(&router, "dreamgate_test", 17, true).await;
+    assert_eq!(
+        response.status(),
+        StatusCode::BAD_GATEWAY,
+        "a connection that never answered is answered as a failed connection"
+    );
+    assert_eq!(
+        row_count(&st.pool).await,
+        1,
+        "the request reached a connection, so its row stands"
+    );
+}
+
 #[tokio::test]
 async fn usage_records_written_by_many_requests_at_once_are_all_there_and_do_not_mix() {
     let mock = Mock::new(10, 0);
     // More requests than the database had connections before this change.
-    let st = test_state(256, 256, 16).await;
+    let st = test_state(test_limits(256, 256), 16).await;
     let base_url = mock_upstream(&mock).await;
     seed(&st, "ada", &base_url, "dreamgate_test", None).await;
 
@@ -679,7 +1005,7 @@ async fn usage_records_written_by_many_requests_at_once_are_all_there_and_do_not
 // refusals would say nothing about the request path.
 async fn measure(mock: &Mock, count: usize, pool: u32) {
     // Every request has to be admitted, so the limits have to be at least as large as the batch.
-    let st = test_state(count + 1, count + 1, pool).await;
+    let st = test_state(test_limits(count + 1, count + 1), pool).await;
     let base_url = mock_upstream(mock).await;
     seed(&st, "ada", &base_url, "dreamgate_test", None).await;
     let router = build_router(st.clone());

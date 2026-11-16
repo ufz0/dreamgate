@@ -37,7 +37,10 @@ Environment variables:
   capability, default 8
 - `DREAMGATE_CONNECT_TIMEOUT_SECS` — how long a connection to an upstream is allowed to take before it is
   given up on, default 10
-- `DREAMGATE_REQUEST_TIMEOUT_SECS` — the request timeout, default 120 as it was before
+- `DREAMGATE_REQUEST_TIMEOUT_SECS` — the deadline for a single answer, default 120 as it was before. It is not
+  applied to a stream: a stream has no known end and is bounded by silence instead.
+- `DREAMGATE_STREAM_STALL_SECS` — how long a stream may go without producing anything before it is closed as a
+  dead connection, default 120
 
 ## Using it
 
@@ -103,8 +106,9 @@ generation speed is measured over the rows whose token counts an upstream report
 the gateway's own estimate is not in it. A stream that ends because the client disconnected is still
 recorded, with whatever the upstream had reported up to that point; the final usage chunk, which is
 where a cache hit and the timings appear, is not seen, so a stream cut short before it is recorded as
-estimated. This is covered: the mock upstream counts a stream that ends before its usage chunk as cut
-short, and the test reads that as the client having gone away.
+estimated — the same is true of a stream closed by the stall window, where nothing was reported either. This is
+covered: the mock upstream counts a stream that ends before its usage chunk as cut short, and the tests read
+that as the client having gone away and as the connection having gone quiet.
 
 A recorded request outlives the key it came in on. Deleting a key leaves its rows standing, so the
 counters do not move when a key is removed; an activity row whose key is gone is marked key
@@ -151,12 +155,28 @@ than by the pool; the busy timeout of five seconds is what makes a concurrent wr
 than fail, and WAL, which is set on start, is what lets the reads run against the same file while a write is
 happening. The connections the HTTP client keeps idle are bounded by the default per-connection limit rather
 than by what an individual connection states, because the client is shared by every connection; a stated
-capability bounds how many requests reach that connection, not how many sockets are kept for it. The connect
-timeout is a separate cap on the part of a request that is only waiting to reach a connection — a connection
-that cannot be made should be given up on in seconds, not in the time an inference is allowed to take — but it
-sits inside the request timeout rather than outside it, because reqwest measures one deadline from the moment
-the request starts connecting until its body has finished. The request timeout itself is what it was, 120
-seconds.
+capability bounds how many requests reach that connection, not how many sockets are kept for it.
+
+The client is built without a total deadline, and that is the whole of the fix for a connection that dies
+mid-generation. Reqwest measures one deadline from the moment a request starts connecting until the response
+body has finished, and it does not reset per chunk, so a stream still producing an answer is cut in the middle
+of it: a generation longer than the timeout ended as a dead socket on the client's side. What the gateway does
+instead is give a single answer its deadline — 120 seconds, `DREAMGATE_REQUEST_TIMEOUT_SECS`, unchanged —
+applied per request, where the end of an answer is known. That covers the model list as well, which is a single
+answer and was bounded by the client's deadline before. A stream is bounded by silence instead:
+`DREAMGATE_STREAM_STALL_SECS` (default 120) is how long a stream may go without producing anything before it is
+treated as a dead connection rather than a slow generation, and the same window is applied to the wait for the
+response head before any read happens. The window restarts after every read that arrives, so a stream that keeps
+producing is never cut however long it takes, and one that goes quiet for less than the window is not a stalled
+connection. A connection that has stopped answering does not hold its slot for the whole of its limit.
+
+When the silence closes a stream, the stream is ended as an error rather than completed: on the wire a client
+that already received a 200 sees the stream stop without the `[DONE]` line, which is what lets it tell an
+incomplete answer from a finished one. The row is recorded as an estimate, because nothing was reported for a
+stream that never reached its usage chunk. The connect timeout (`DREAMGATE_CONNECT_TIMEOUT_SECS`, default 10) is
+a cap of its own now: a connection that cannot be made should be given up on in seconds, not in the time an
+inference is allowed to take. The health check round keeps the fixed ten seconds it had before this change,
+because a health check is not a generation.
 
 A client that goes away mid-stream is dropped, and the drop reaches the upstream: the stream task ends, the
 connection to the backend is released, and the slots the request held are given back. The row for that request
@@ -315,20 +335,30 @@ another: ten, fifty and a hundred at once, twenty streams at once, a slow connec
 go elsewhere, a connection at its limit answering at once instead of queueing and giving its slot back to the
 next batch, a connection admitted by the capability it states rather than by the default, the gateway as a whole
 answering 503 when it is full, a stream holding its slot until it ends, and a client that leaves mid-stream.
-Each request carries its own marker and the mock answers with that marker, so the tests can tell which response
-and which usage row belong to which request and that no row is a mix of two, and the tests that check a limit
-assert that the rows are the requests that were admitted and no more. Where timing is asserted it is asserted
-as an ordering, or as a wall clock well under what the same requests would take one after another, rather than
-as a particular request taking a particular number of milliseconds, because a shared runner can be slow. The
-stated capability, its validation and the column being added to a database written before it are tested in the
-same way the key limits and the other migrations are.
+The time bounds are tested the same way: a stream that runs past the request deadline without ever going quiet
+has to arrive whole, including its usage chunk, so the row is not an estimate; a single answer is still given its
+deadline; a stream that goes quiet for the stall window is closed, its row recorded as an estimate, and its slot
+given back; a stream that goes quiet for less than the window and then continues is not closed, because the
+window bounds silence and restarts after each read; a connection that never answers at all is given up on within
+the window; and the model list, which is not a stream, is given up on by the same deadline. Each request carries its own marker and the mock answers with that marker, so the tests can
+tell which response and which usage row belong to which request and that no row is a mix of two, and the tests
+that check a limit assert that the rows are the requests that were admitted and no more. Where timing is asserted
+it is asserted as an ordering, or as a wall clock well under what the same requests would take one after another,
+rather than as a particular request taking a particular number of milliseconds, because a shared runner can be
+slow, and the time-bound tests keep an order of magnitude between a delay and the window it is testing. A test
+that is about a time bound names its own — a stall cannot be measured in two minutes — but the client it builds
+is the client the gateway builds, through `limits::http_client()`, so what a test measures is the configuration
+the gateway runs with rather than one the test invented: if the total deadline came back, the long stream test
+fails at the point where the answer is cut. The stated capability, its validation and the column being added to a
+database written before it are tested in the same way the key limits and the other migrations are.
 
 The numbers are not part of the normal run: they measure, so they are only read when asked for, with
 `cargo test --release -- --ignored --nocapture`, and the runtime there is the multi-thread one because a
 single-threaded runtime would measure one worker rather than the gateway. There is no Go-style race detector in
 Rust, so what stands in its place is that shared state is only reachable through types the compiler requires to
-be `Send` and `Sync`, plus running the concurrency tests repeatedly. The environment variables are read in
-`src/main.rs`, which is the composition root and nothing in the suite reaches it, so the pool size, the connect
-timeout and the idle connection count are not exercised by a test; the pool and the busy timeout are exercised
-through `db::connect` against a shared-cache in-memory database, which is not the same mechanism as writer
-contention on a file.
+be `Send` and `Sync`, plus running the concurrency tests repeatedly. The environment variables themselves are
+read in `src/main.rs`, which is the composition root and nothing in the suite reaches it, so the pool size is not
+exercised by a test. The two time bounds are exercised, because the tests build the client and the state through
+the same functions the gateway uses; the connect timeout and the number of connections kept idle are read through
+that builder but no test asserts what they do. The pool and the busy timeout are exercised through `db::connect`
+against a shared-cache in-memory database, which is not the same mechanism as writer contention on a file.

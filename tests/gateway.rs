@@ -26,16 +26,25 @@ async fn test_state() -> State {
     for statement in db::SCHEMA {
         sqlx::query(*statement).execute(&pool).await.unwrap();
     }
+
+    // Far above what any test in this file sends, so a test is not shaped by admission: as a result the main
+    // suite never exercises it, including its interaction with the failover test. The tests that check admission
+    // build their own state in tests/concurrency.rs. The time bounds are the ones the gateway runs with,
+    // because the mock answers long before either of them.
+    let limits = limits::Limits::new(
+        1024,
+        1024,
+        Duration::from_secs(limits::DEFAULT_REQUEST_TIMEOUT_SECS),
+        Duration::from_secs(limits::DEFAULT_STREAM_STALL_SECS),
+        Duration::from_secs(limits::DEFAULT_CONNECT_TIMEOUT_SECS),
+    );
     State {
         pool,
-        http: reqwest::Client::new(),
+        http: limits.http_client(),
         hub: live::hub(),
         presence: Default::default(),
         attempts: Default::default(),
-        // Far above what any test in this file sends, so a test is not shaped by admission: as a result the
-        // main suite never exercises it, including its interaction with the failover test. The tests that check
-        // admission build their own state in tests/concurrency.rs.
-        limits: Arc::new(limits::Limits::new(1024, 1024)),
+        limits: Arc::new(limits),
     }
 }
 

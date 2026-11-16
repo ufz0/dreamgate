@@ -360,7 +360,29 @@ fn stream_body(
         let mut generated = String::new();
         let mut report = Report::default();
         let mut incoming = upstream.bytes_stream();
-        while let Some(chunk) = incoming.next().await {
+        // A stream is bounded by how long it goes quiet, not by a deadline for its whole length: an answer that
+        // keeps arriving is not stalled, however long it takes, and cutting one that is still coming is the
+        // socket dying on the client's side. Silence for the window is a dead connection, and the request
+        // should not hold its slot for one forever.
+        let stall = ctx.st.limits.stream_stall();
+        loop {
+            let chunk = match tokio::time::timeout(stall, incoming.next()).await {
+                Ok(Some(chunk)) => chunk,
+                Ok(None) => break,
+                Err(_) => {
+                    tracing::warn!(
+                        "upstream went quiet for {stall:?} and the stream was closed: {}",
+                        ctx.model
+                    );
+                    // The client has already been sent a 200, so there is no status left to change: the stream
+                    // ends as an error rather than as a completed answer, which is what lets a client tell an
+                    // answer that was cut from one that finished.
+                    let _ = tx
+                        .send(Err(BoxError::from("the upstream went quiet")))
+                        .await;
+                    break;
+                }
+            };
             match chunk {
                 Ok(bytes) => {
                     buffer.extend_from_slice(&bytes);
@@ -501,17 +523,31 @@ pub async fn chat_completions(
         let url = registry::endpoint(&conn.base_url, "chat/completions");
         let payload = build_payload(&body, &model);
         attempted = true;
-        let upstream = match st
+        let mut request = st
             .http
             .post(&url)
             .header(
                 header::AUTHORIZATION,
                 format!("Bearer {}", conn.api_key.clone().unwrap_or_default()),
             )
-            .json(&payload)
-            .send()
-            .await
-        {
+            .json(&payload);
+        // Only a single answer is given a deadline for the whole of it, because for that there is an end. A
+        // stream is bounded by how long it goes quiet instead, and the same window is what bounds the wait for
+        // its head: a connection that takes the request and never answers is a dead connection, not a slow
+        // generation. Cutting a stream that is still producing an answer is what the client feels as the socket
+        // dying, and that is what this path used to do.
+        if !wants_stream {
+            request = request.timeout(st.limits.request_timeout());
+        }
+        let sent = if wants_stream {
+            tokio::time::timeout(st.limits.stream_stall(), request.send())
+                .await
+                .map_err(|_| BoxError::from("nothing arrived within the stall window"))
+                .and_then(|result| result.map_err(BoxError::from))
+        } else {
+            request.send().await.map_err(BoxError::from)
+        };
+        let upstream = match sent {
             Ok(upstream) => upstream,
             Err(err) => {
                 last_error = format!("{}: {err}", conn.name);
@@ -694,6 +730,8 @@ pub async fn list_models(AxumState(st): AxumState<State>, headers: HeaderMap) ->
             "no enabled connection is available for this key",
         );
     };
+    // The model list is a single answer, not a stream, so the same deadline covers it as covers any single
+    // answer, as the client's total deadline did before this change.
     let result = st
         .http
         .get(registry::endpoint(&conn.base_url, "models"))
@@ -701,6 +739,7 @@ pub async fn list_models(AxumState(st): AxumState<State>, headers: HeaderMap) ->
             header::AUTHORIZATION,
             format!("Bearer {}", conn.api_key.clone().unwrap_or_default()),
         )
+        .timeout(st.limits.request_timeout())
         .send()
         .await;
     match result {
