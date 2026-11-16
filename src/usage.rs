@@ -13,6 +13,12 @@ pub struct UsageRow {
     pub prompt_tokens: i64,
     pub completion_tokens: i64,
     pub total_tokens: i64,
+    // What the upstream said about the request rather than what the gateway worked out. An engine that
+    // does not report a cache hit or timings leaves these unset, and they are stored as null so the
+    // page can say the figure is unknown instead of showing a number that was not reported.
+    pub cached_tokens: Option<i64>,
+    pub prompt_ms: Option<i64>,
+    pub generation_ms: Option<i64>,
     pub latency_ms: i64,
     pub status: i64,
     pub streamed: bool,
@@ -23,8 +29,9 @@ pub struct UsageRow {
 pub async fn record(st: &State, row: &UsageRow) -> Result<(), sqlx::Error> {
     let id = sqlx::query(
         "INSERT INTO usage (api_key_id, user_id, connection_id, model, prompt_tokens, \
-         completion_tokens, total_tokens, latency_ms, status, streamed, estimated, created_at) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id",
+         completion_tokens, total_tokens, cached_tokens, prompt_ms, generation_ms, latency_ms, \
+         status, streamed, estimated, created_at) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id",
     )
     .bind(row.api_key_id)
     .bind(row.user_id)
@@ -33,6 +40,9 @@ pub async fn record(st: &State, row: &UsageRow) -> Result<(), sqlx::Error> {
     .bind(row.prompt_tokens)
     .bind(row.completion_tokens)
     .bind(row.total_tokens)
+    .bind(row.cached_tokens)
+    .bind(row.prompt_ms)
+    .bind(row.generation_ms)
     .bind(row.latency_ms)
     .bind(row.status)
     .bind(row.streamed as i64)
@@ -67,6 +77,7 @@ pub async fn record(st: &State, row: &UsageRow) -> Result<(), sqlx::Error> {
         prompt_tokens: row.prompt_tokens,
         completion_tokens: row.completion_tokens,
         total_tokens: row.total_tokens,
+        cached_tokens: row.cached_tokens,
         latency_ms: row.latency_ms,
         status: row.status,
         streamed: row.streamed,

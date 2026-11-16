@@ -277,19 +277,28 @@ async function refresh(path) {
 
 // A counter moves with the same event the feed does. The top counter covers every account, so
 // any event counts; an account's own figures only move for the event that belongs to it.
+// Averages are not updated here: they are the mean of the stored rows, and one event cannot move a
+// mean that was computed over all of them.
 const isToday = (value) => String(value).slice(0, 10) === new Date().toISOString().slice(0, 10);
 
 function countTotals(totals, event) {
   if (!totals) return;
-  totals.total_tokens = num(totals.total_tokens) + event.total_tokens;
+  totals.prompt_tokens = num(totals.prompt_tokens) + num(event.prompt_tokens);
   // What a model generated is the answer side on its own, so the generation counter keeps its own
   // figure rather than reading the total.
-  totals.completion_tokens = num(totals.completion_tokens) + event.completion_tokens;
+  totals.completion_tokens = num(totals.completion_tokens) + num(event.completion_tokens);
+  // The cached part only counts when the engine reported it, which is what the page's note checks.
+  if (event.cached_tokens !== null && event.cached_tokens !== undefined) {
+    totals.cached_tokens = num(totals.cached_tokens) + event.cached_tokens;
+    totals.cached_reported = num(totals.cached_reported) + 1;
+  }
   totals.requests = num(totals.requests) + 1;
   // The day figures are what a daily account limit is measured against.
   if (isToday(event.created_at)) {
     totals.today_tokens = num(totals.today_tokens) + event.total_tokens;
     totals.today_requests = num(totals.today_requests) + 1;
+    totals.today_prompt_tokens = num(totals.today_prompt_tokens) + num(event.prompt_tokens);
+    totals.today_completion_tokens = num(totals.today_completion_tokens) + num(event.completion_tokens);
   }
 }
 
@@ -455,27 +464,53 @@ function renderGate() {
 }
 
 // Both pairs ask the same two questions of a different scope: the top one is the whole gate, the
-// one below the gate diagram is this account. Each shows all tokens and the generated side on its
-// own, so the generation figure reads completion tokens rather than the total, as the live counter
-// does. The support panel below repeats that number as part of its prompt-and-generation breakdown;
-// it is the same figure, not a second one.
+// one below the gate diagram is this account. The generated side is the headline, and the input is
+// shown on its own beside it. An agentic client sends the whole conversation again on every turn, so
+// the input figure is mostly repeats and the generated figure is the part that says what happened.
+// The support panel below repeats the generated number as part of its breakdown; it is the same
+// figure, not a second one.
 function renderReadout() {
-  $('global-tokens').textContent = nf.format(state.summary.global?.total_tokens || 0);
-  $('generated-tokens').textContent = nf.format(state.summary.global?.completion_tokens || 0);
+  renderPair('generated-tokens', 'global-input-tokens', 'global-input-note', state.summary.global);
+  renderPair('account-generated-tokens', 'account-input-tokens', 'account-input-note', state.summary.self);
+  renderSupport(state.summary.self);
+}
 
-  const t = state.summary.self;
-  $('total-tokens').textContent = nf.format(t.total_tokens || 0);
-  $('account-generated-tokens').textContent = nf.format(t.completion_tokens || 0);
+// The cached part of the input is only a note when an engine reported it. Nothing is invented here:
+// a row that reported no cache is stored as unknown, so a zero cache across the whole instance reads
+// as "no engine reported a cache hit", not as a cache that never hit.
+function renderPair(generatedId, inputId, noteId, totals) {
+  const t = totals || {};
+  $('' + generatedId).textContent = nf.format(num(t.completion_tokens));
+  $('' + inputId).textContent = nf.format(num(t.prompt_tokens));
+  const note = $(noteId);
+  if (num(t.cached_reported)) {
+    note.textContent = `what was sent in, of which ${nf.format(num(t.cached_tokens))} came from the prompt cache`;
+  } else {
+    note.textContent = 'what was sent in. No engine reported a prompt cache hit.';
+  }
+}
 
+function renderSupport(t) {
   const rows = [
     ['Requests', nf.format(t.requests || 0)],
     ['Requests today', nf.format(t.today_requests || 0)],
-    ['Tokens today', nf.format(t.today_tokens || 0)],
-    ['Prompt tokens', nf.format(t.prompt_tokens || 0)],
-    ['Completion tokens', nf.format(t.completion_tokens || 0)],
+    [
+      'Tokens today (input + output)',
+      `${nf.format(t.today_tokens || 0)} — ${nf.format(t.today_prompt_tokens || 0)} in, ${nf.format(t.today_completion_tokens || 0)} generated`,
+    ],
     ['Average latency', `${nf.format(t.avg_latency_ms || 0)} ms`],
     ['Errors (status 400 or worse)', nf.format(t.errors || 0)],
   ];
+  // These appear only for an engine that reports timings. The API gives null when no row has one, so
+  // the row is left out rather than shown as a zero; the speed is measured over the rows whose counts
+  // the upstream reported, so an estimated row cannot move it. Averages belong to the stored rows and
+  // do not move with a live event.
+  if (t.avg_prompt_ms !== null && t.avg_prompt_ms !== undefined) {
+    rows.push(['Average prompt processing', `${nf.format(t.avg_prompt_ms)} ms`]);
+  }
+  if (t.generation_tokens_per_second !== null && t.generation_tokens_per_second !== undefined) {
+    rows.push(['Average generation speed', `${nf.format(t.generation_tokens_per_second)} tokens/s`]);
+  }
   $('support').innerHTML = rows
     .map(([label, value]) => `<div class="row"><dt>${esc(label)}</dt><dd>${esc(value)}</dd></div>`)
     .join('');

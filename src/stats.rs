@@ -24,15 +24,27 @@ pub async fn totals(
     scoped: bool,
     user_id: i64,
 ) -> Result<serde_json::Value, sqlx::Error> {
+    // The figures are kept apart rather than added together: what was sent in and what the model
+    // produced are different things, and a prompt cache hit is part of the input, not a second count of
+    // it. A timing figure is null when no engine reported one for this instance, and the page leaves the
+    // row out rather than showing a zero. Generation speed is measured only over rows whose token counts
+    // the upstream reported, so a row counted by the gateway's estimate cannot make a model look faster
+    // than it was.
     let sql = format!(
         "SELECT COUNT(*) AS requests, \
                 COALESCE(SUM(prompt_tokens), 0) AS prompt_tokens, \
                 COALESCE(SUM(completion_tokens), 0) AS completion_tokens, \
                 COALESCE(SUM(total_tokens), 0) AS total_tokens, \
+                COALESCE(SUM(cached_tokens), 0) AS cached_tokens, \
                 COALESCE(CAST(AVG(latency_ms) AS INTEGER), 0) AS avg_latency_ms, \
                 SUM(CASE WHEN status >= 400 THEN 1 ELSE 0 END) AS errors, \
                 SUM(CASE WHEN strftime('%Y-%m-%d', created_at) = date('now') THEN 1 ELSE 0 END) AS today_requests, \
-                COALESCE(SUM(CASE WHEN strftime('%Y-%m-%d', created_at) = date('now') THEN total_tokens ELSE 0 END), 0) AS today_tokens \
+                COALESCE(SUM(CASE WHEN strftime('%Y-%m-%d', created_at) = date('now') THEN total_tokens ELSE 0 END), 0) AS today_tokens, \
+                COALESCE(SUM(CASE WHEN strftime('%Y-%m-%d', created_at) = date('now') THEN prompt_tokens ELSE 0 END), 0) AS today_prompt_tokens, \
+                COALESCE(SUM(CASE WHEN strftime('%Y-%m-%d', created_at) = date('now') THEN completion_tokens ELSE 0 END), 0) AS today_completion_tokens, \
+                COALESCE(SUM(CASE WHEN cached_tokens IS NOT NULL THEN 1 ELSE 0 END), 0) AS cached_reported, \
+                CAST(ROUND(AVG(prompt_ms)) AS INTEGER) AS avg_prompt_ms, \
+                CAST(ROUND(AVG(CASE WHEN estimated = 0 AND generation_ms > 0 AND completion_tokens > 0 THEN completion_tokens * 1000.0 / generation_ms END)) AS INTEGER) AS generation_tokens_per_second \
          FROM usage{scope}",
         scope = scope_clause(scoped, "usage.user_id")
     );
@@ -47,10 +59,19 @@ pub async fn totals(
         "prompt_tokens": row.get::<i64, _>("prompt_tokens"),
         "completion_tokens": row.get::<i64, _>("completion_tokens"),
         "total_tokens": row.get::<i64, _>("total_tokens"),
+        "cached_tokens": row.get::<i64, _>("cached_tokens"),
+        // Whether any row reported a cache hit at all. A zero that was reported and a figure that was
+        // never reported are different things, and the page says them differently.
+        "cached_reported": row.get::<i64, _>("cached_reported"),
         "avg_latency_ms": row.get::<i64, _>("avg_latency_ms"),
         "errors": row.get::<i64, _>("errors"),
         "today_requests": row.get::<i64, _>("today_requests"),
         "today_tokens": row.get::<i64, _>("today_tokens"),
+        "today_prompt_tokens": row.get::<i64, _>("today_prompt_tokens"),
+        "today_completion_tokens": row.get::<i64, _>("today_completion_tokens"),
+        // Null when nothing reported them, so the page can say so instead of showing a figure.
+        "avg_prompt_ms": row.get::<Option<i64>, _>("avg_prompt_ms"),
+        "generation_tokens_per_second": row.get::<Option<i64>, _>("generation_tokens_per_second"),
     }))
 }
 
