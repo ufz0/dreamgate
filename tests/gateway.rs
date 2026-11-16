@@ -1,4 +1,4 @@
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use axum::{
     Router,
@@ -9,6 +9,7 @@ use axum::{
     routing::{get, post},
 };
 use dreamgate::{build_router, db, live, presence, state::State};
+use futures_util::stream;
 use http_body_util::BodyExt;
 use serde_json::{Value, json};
 use sqlx::{Row, sqlite::SqlitePool, sqlite::SqlitePoolOptions};
@@ -33,6 +34,14 @@ async fn test_state() -> State {
     }
 }
 
+// One SSE line for a tool-call delta, so the mock and the test that reads it build the same bytes.
+fn delta_line(piece: &Value) -> String {
+    let delta = json!({
+        "choices": [{ "delta": { "tool_calls": [{ "function": { "name": "shell", "arguments": piece } }] } }],
+    });
+    format!("data: {delta}\n\n")
+}
+
 // The arguments of a tool call as an upstream would send them: OpenAI puts them in a JSON string, some
 // servers send them already parsed, and a stream carries them in pieces across deltas.
 fn tool_arguments(model: &str) -> Option<Vec<Value>> {
@@ -40,42 +49,64 @@ fn tool_arguments(model: &str) -> Option<Vec<Value>> {
         "calls-tool" => Some(vec![json!("echo hello")]),
         "parsed-arguments" => Some(vec![json!({ "command": "echo hello" })]),
         "split-arguments" => Some(vec![json!("{\"comma"), json!("nd\":\"nd\"}")]),
+        "paused-arguments" => Some(vec![
+            json!("{\"command\""),
+            json!(":\"echo"),
+            json!(" hello"),
+            json!("\"}"),
+        ]),
         _ => None,
     }
 }
 
 // An OpenAI-compatible upstream with four behaviours: it reports usage, reports none, answers with a
-// reasoning section beside the answer, or answers with a tool call and nothing else.
+// reasoning section beside the answer, or answers with a tool call and nothing else. One of the tool
+// call shapes sends its pieces with a gap between them, so a client can tell a line forwarded as it
+// arrived from a line held until the stream ended.
 async fn mock_chat(Json(body): Json<Value>) -> Response {
     let model = body.get("model").and_then(Value::as_str).unwrap_or("");
     let reports_usage = model == "reports-usage";
     if body.get("stream").and_then(Value::as_bool).unwrap_or(false) {
-        let mut chunks = String::new();
+        let mut lines: Vec<String> = Vec::new();
         if model == "reasons" {
-            chunks.push_str(
-                "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"think hard\"}}]}\n\n",
+            lines.push(
+                "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"think hard\"}}]}\n\n"
+                    .to_string(),
             );
         }
         if let Some(pieces) = tool_arguments(model) {
             for piece in pieces {
-                let delta = json!({
-                    "choices": [{ "delta": { "tool_calls": [{ "function": { "name": "shell", "arguments": piece } }] } }],
-                });
-                chunks.push_str(&format!("data: {delta}\n\n"));
+                lines.push(delta_line(&piece));
             }
         } else {
-            chunks.push_str("data: {\"choices\":[{\"delta\":{\"content\":\"hello world\"}}]}\n\n");
+            lines.push(
+                "data: {\"choices\":[{\"delta\":{\"content\":\"hello world\"}}]}\n\n".to_string(),
+            );
         }
         if reports_usage {
-            chunks.push_str("data: {\"choices\":[],\"usage\":{\"prompt_tokens\":11,\"completion_tokens\":7}}\n\n");
+            lines.push(
+                "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":11,\"completion_tokens\":7}}\n\n".to_string(),
+            );
         }
-        chunks.push_str("data: [DONE]\n\n");
+        lines.push("data: [DONE]\n\n".to_string());
+
         let mut out = Response::new(Body::empty());
         out.headers_mut().insert(
             header::CONTENT_TYPE,
             HeaderValue::from_static("text/event-stream"),
         );
-        *out.body_mut() = Body::from(chunks);
+        // Only the paused shape is streamed, because the test that reads arrivals is the reason it
+        // exists; the others answer at once.
+        if model == "paused-arguments" {
+            *out.body_mut() = Body::from_stream(stream::unfold(lines, move |pending| async move {
+                let line = pending.first()?.clone();
+                let rest = pending[1..].to_vec();
+                tokio::time::sleep(Duration::from_millis(150)).await;
+                Some((Ok::<_, std::io::Error>(line.into_bytes()), rest))
+            }));
+            return out;
+        }
+        *out.body_mut() = Body::from(lines.concat());
         return out;
     }
     let message = if model == "reasons" {
@@ -598,6 +629,72 @@ async fn counts_each_piece_of_a_fragmented_tool_call_as_the_stream_sent_it() {
     let row = usage.last().unwrap();
     assert_eq!(row["estimated"], true, "{row}");
     assert_eq!(row["completion_tokens"], 5);
+}
+
+#[tokio::test]
+async fn forwards_a_tool_call_stream_as_the_pieces_arrive_rather_than_at_the_end() {
+    let st = test_state().await;
+    let router = build_router(st.clone());
+    let base_url = mock_upstream().await;
+    let cookie = register(&router, "ada").await;
+
+    post_json(
+        &router,
+        "/api/connections",
+        &cookie,
+        json!({ "name": "test", "base_url": base_url, "default_model": "paused-arguments" }),
+    )
+    .await;
+    let (_, created) =
+        post_json(&router, "/api/keys", &cookie, json!({ "name": "test key" })).await;
+    let key = created["key"].as_str().unwrap().to_string();
+
+    let response = gateway_call(
+        &router,
+        &key,
+        json!({
+            "messages": [{ "role": "user", "content": "hi" }],
+            "stream": true,
+            "tools": [{ "type": "function", "function": { "name": "shell" } }],
+        }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    // The upstream puts one line on the wire every 150 ms, so every gap between the arrivals here is one
+    // the upstream made. A gateway that held the body until the stream ended would deliver the pieces in
+    // one read, with no gaps at all. The margin is wide so this says something about the behaviour and
+    // not about the speed of the machine.
+    let started = Instant::now();
+    let mut body = response.into_body();
+    let mut arrivals = Vec::new();
+    let mut received = String::new();
+    while let Some(frame) = body.frame().await {
+        let frame = frame.unwrap();
+        let Some(bytes) = frame.data_ref() else {
+            continue;
+        };
+        received.push_str(&String::from_utf8_lossy(bytes));
+        arrivals.push(started.elapsed());
+    }
+
+    assert_eq!(arrivals.len(), 5, "the pieces and the end of the stream");
+    let gaps = arrivals
+        .windows(2)
+        .filter(|gap| gap[1] - gap[0] >= Duration::from_millis(100))
+        .count();
+    assert!(
+        gaps >= 3,
+        "the pieces arrived in one read rather than as they were sent: {arrivals:?}"
+    );
+    // The bytes reach the client unchanged, in the order the upstream sent them.
+    let expected: String = tool_arguments("paused-arguments")
+        .unwrap()
+        .iter()
+        .map(delta_line)
+        .chain(std::iter::once("data: [DONE]\n\n".to_string()))
+        .collect();
+    assert_eq!(received, expected);
 }
 
 #[tokio::test]
