@@ -188,7 +188,8 @@ waiting. Hashing and verifying are therefore done on the blocking pool; the auth
 admission, so what bounds them is the blocking pool itself, which is tokio's default of 128 threads. The
 health check round reads the connections once and checks them at once, bounded to eight, so a connection that
 does not answer can only delay its own row now; the round is still bounded rather than unbounded, because a
-health check is a request to a connection that may already be working.
+health check is a request to a connection that may already be working. A round that stops on a panic is logged
+and started again after the same 30 seconds, so health checking does not end with it.
 
 ## Dashboard
 

@@ -1083,7 +1083,8 @@ async fn the_health_check_round_marks_a_connection_that_answers() {
     let id = created["id"].as_i64().unwrap();
 
     // The first round runs as soon as the task starts, and the mock answers at once, so the window is
-    // far longer than the round needs; it only bounds a round that never writes the row.
+    // far longer than the round needs. A round that stops is only started again after 30 seconds, so a
+    // round that cannot read the row is caught here as a row that still reads unknown.
     let round = tokio::spawn(dreamgate::registry::health_checker(st.clone()));
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
@@ -1094,10 +1095,6 @@ async fn the_health_check_round_marks_a_connection_that_answers() {
             .unwrap();
         if health == "ok" {
             break;
-        }
-        if round.is_finished() {
-            let ended = round.await;
-            panic!("the health check round stopped before it checked the connection: {ended:?}");
         }
         assert!(
             Instant::now() < deadline,
