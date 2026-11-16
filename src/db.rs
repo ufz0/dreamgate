@@ -1,4 +1,5 @@
 use std::str::FromStr;
+use std::time::Duration;
 
 use sqlx::Executor;
 use sqlx::Row;
@@ -30,6 +31,7 @@ pub const SCHEMA: &[&str] = &[
         priority INTEGER NOT NULL DEFAULT 0,
         health TEXT NOT NULL DEFAULT 'unknown',
         last_checked_at TEXT,
+        max_concurrent INTEGER,
         created_at TEXT NOT NULL
     )",
     "CREATE TABLE IF NOT EXISTS api_keys (
@@ -101,10 +103,20 @@ where
     Ok(required > 0)
 }
 
-pub async fn connect(url: &str) -> Result<SqlitePool, sqlx::Error> {
-    let options = SqliteConnectOptions::from_str(url)?.create_if_missing(true);
+// The pool is the ceiling on how many requests can be at the database at once, so it is not left at
+// the small default: a request reads the key, the account and its limits, and writes its own row, and a
+// pool of a few connections turns that into a queue for every request. SQLite itself still takes one
+// writer at a time, so writes are ordered by the database rather than by the pool; the busy timeout is
+// what makes a concurrent write wait for the row rather than fail. WAL is what lets the reads run
+// against that same file while a write is happening.
+pub const DEFAULT_POOL_SIZE: u32 = 16;
+
+pub async fn connect(url: &str, max_connections: u32) -> Result<SqlitePool, sqlx::Error> {
+    let options = SqliteConnectOptions::from_str(url)?
+        .create_if_missing(true)
+        .busy_timeout(Duration::from_secs(5));
     let pool = SqlitePoolOptions::new()
-        .max_connections(5)
+        .max_connections(max_connections.max(1))
         .connect_with(options)
         .await?;
     for statement in SCHEMA {
@@ -163,6 +175,7 @@ pub async fn migrate(pool: &SqlitePool) -> Result<(), sqlx::Error> {
     // same columns on both sides and a value an engine already reported for a row is not dropped with the
     // table.
     add_usage_columns(pool).await?;
+    add_connection_limit(pool).await?;
     relax_key_reference(pool).await
 }
 
@@ -181,6 +194,18 @@ async fn add_usage_columns(pool: &SqlitePool) -> Result<(), sqlx::Error> {
             .execute(pool)
             .await?;
     }
+    Ok(())
+}
+
+// A connection that states no capability is admitted by the default, so the column is nullable and a
+// row written before the change keeps its meaning: nothing stated.
+async fn add_connection_limit(pool: &SqlitePool) -> Result<(), sqlx::Error> {
+    if has_column(pool, "connections", "max_concurrent").await? {
+        return Ok(());
+    }
+    sqlx::query("ALTER TABLE connections ADD COLUMN max_concurrent INTEGER")
+        .execute(pool)
+        .await?;
     Ok(())
 }
 

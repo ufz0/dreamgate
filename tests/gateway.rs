@@ -1,3 +1,4 @@
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use axum::{
@@ -8,7 +9,7 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, post},
 };
-use dreamgate::{build_router, db, live, presence, state::State};
+use dreamgate::{build_router, db, limits, live, presence, state::State};
 use futures_util::stream;
 use http_body_util::BodyExt;
 use serde_json::{Value, json};
@@ -31,6 +32,10 @@ async fn test_state() -> State {
         hub: live::hub(),
         presence: Default::default(),
         attempts: Default::default(),
+        // Far above what any test in this file sends, so a test is not shaped by admission: as a result the
+        // main suite never exercises it, including its interaction with the failover test. The tests that check
+        // admission build their own state in tests/concurrency.rs.
+        limits: Arc::new(limits::Limits::new(1024, 1024)),
     }
 }
 
@@ -1123,6 +1128,117 @@ async fn key_limits_must_be_positive() {
     )
     .await;
     assert_eq!(status, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn a_connection_can_state_its_capability_or_leave_it_out_but_not_state_zero() {
+    let st = test_state().await;
+    let router = build_router(st.clone());
+    let admin = register(&router, "ada").await;
+
+    // A capability of 0 would admit nothing, which is not what leaving it out means, so it is rejected
+    // rather than stored, as a key limit of 0 is.
+    let (status, _) = post_json(
+        &router,
+        "/api/connections",
+        &admin,
+        json!({ "name": "zero", "base_url": "http://127.0.0.1:8080", "max_concurrent": 0 }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    // Leaving it out is not a limit of one: it is nothing stated, and the default applies to that
+    // connection alone.
+    let (status, body) = post_json(
+        &router,
+        "/api/connections",
+        &admin,
+        json!({ "name": "unstated", "base_url": "http://127.0.0.1:8080" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["connections"][0]["max_concurrent"], json!(null));
+}
+
+#[tokio::test]
+async fn the_connection_limit_is_added_to_a_database_written_before_it() {
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
+        .unwrap();
+    for statement in db::SCHEMA {
+        sqlx::query(*statement).execute(&pool).await.unwrap();
+    }
+
+    // A connections table as it was before a capability could be stated, with a row written then.
+    sqlx::query("DROP TABLE connections")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "CREATE TABLE connections (
+            id INTEGER PRIMARY KEY,
+            name TEXT NOT NULL UNIQUE,
+            base_url TEXT NOT NULL,
+            api_key TEXT,
+            default_model TEXT,
+            enabled INTEGER NOT NULL DEFAULT 1,
+            priority INTEGER NOT NULL DEFAULT 0,
+            health TEXT NOT NULL DEFAULT 'unknown',
+            last_checked_at TEXT,
+            created_at TEXT NOT NULL
+        )",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query("INSERT INTO connections (name, base_url, created_at) VALUES ('old', 'http://127.0.0.1:8080', '2026-01-01T00:00:00Z')")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    db::migrate(&pool).await.unwrap();
+
+    // The row that was already there reads as nothing stated, which is not a limit of one.
+    let row = sqlx::query("SELECT name, max_concurrent FROM connections")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(row.get::<String, _>("name"), "old");
+    assert_eq!(
+        row.get::<Option<i64>, _>("max_concurrent"),
+        None,
+        "a connection written before the change reads as nothing stated"
+    );
+
+    // Running it again on a table that is already current changes nothing.
+    db::migrate(&pool).await.unwrap();
+    assert_eq!(
+        sqlx::query("SELECT max_concurrent FROM connections")
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+            .get::<Option<i64>, _>("max_concurrent"),
+        None
+    );
+
+    // A connection can state its capability now.
+    sqlx::query(
+        "INSERT INTO connections (name, base_url, max_concurrent, created_at) \
+         VALUES ('stated', 'http://127.0.0.1:11434', 3, '2026-01-01T00:00:00Z')",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        sqlx::query("SELECT max_concurrent FROM connections WHERE name = 'stated'")
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+            .get::<Option<i64>, _>("max_concurrent"),
+        Some(3)
+    );
 }
 
 #[tokio::test]

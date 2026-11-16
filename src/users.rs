@@ -209,14 +209,10 @@ pub async fn update(
                         "password must be at least 8 characters",
                     );
                 }
-                let hash = match bcrypt::hash(raw, 10) {
+                let hash = match crate::auth::hash_password(raw).await {
                     Ok(hash) => hash,
                     Err(err) => {
-                        return error(
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            "server_error",
-                            err.to_string(),
-                        );
+                        return error(StatusCode::INTERNAL_SERVER_ERROR, "server_error", err);
                     }
                 };
                 match sqlx::query("UPDATE users SET password_hash = ? WHERE id = ?")

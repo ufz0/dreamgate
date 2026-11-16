@@ -10,6 +10,7 @@ use sqlx::Row;
 use sqlx::sqlite::SqliteRow;
 
 use crate::api::error;
+use crate::limits::Admission;
 use crate::presence::{self, Active};
 use crate::registry::{self, Connection};
 use crate::state::State;
@@ -344,6 +345,7 @@ struct StreamContext {
     conn: Connection,
     model: String,
     present: Active,
+    admission: Admission,
 }
 
 fn stream_body(
@@ -406,8 +408,10 @@ fn stream_body(
             tracing::warn!("usage record failed: {err}");
         }
         // Released here rather than when the handler returned, so a stream is still counted
-        // while it is running.
+        // while it is running. The connection slot is given back at the same point, because the request
+        // is still in flight for as long as the stream is being read.
         drop(ctx.present);
+        drop(ctx.admission);
     });
     stream::unfold(rx, |mut rx| async move {
         rx.recv().await.map(|item| (item, rx))
@@ -459,15 +463,44 @@ pub async fn chat_completions(
     let wants_stream = body.get("stream").and_then(Value::as_bool).unwrap_or(false);
     let prompt_tokens = tokens::prompt_estimate(body.get("messages").unwrap_or(&Value::Null));
     let requested = body.get("model").and_then(Value::as_str);
+    // The request is admitted as a whole, before anything is asked of a connection, and the slots are held for
+    // as long as it runs. Nothing is queued here: a connection that is full is skipped, so one slow
+    // connection cannot hold unrelated requests behind it. Admitting once, at the start, is also what keeps a
+    // request that has already reached a connection answering as that connection failed: once something has
+    // crossed the gate it is recorded, so it cannot be turned into an overload on the next attempt.
+    let Some(global) = st.limits.try_global() else {
+        return error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "overloaded",
+            format!(
+                "the gateway is at its limit of {} requests at once",
+                st.limits.global_limit()
+            ),
+        );
+    };
     let mut last_error = String::from("no connection responded");
+    // Connections that were already at their limit when this request arrived. They are remembered so that a
+    // request which never reached an upstream can be answered as an overload rather than as a failure of an
+    // upstream that was never asked.
+    let mut full: Vec<String> = Vec::new();
+    let mut attempted = false;
 
     for conn in &candidates {
         if conn.health == "down" && candidates.len() > 1 {
             continue;
         }
+        let Ok(slot) = st
+            .limits
+            .for_connection(conn.id, conn.max_concurrent)
+            .try_acquire_owned()
+        else {
+            full.push(conn.name.clone());
+            continue;
+        };
         let model = resolve_model(key.model.as_deref(), conn, requested);
         let url = registry::endpoint(&conn.base_url, "chat/completions");
         let payload = build_payload(&body, &model);
+        attempted = true;
         let upstream = match st
             .http
             .post(&url)
@@ -496,12 +529,18 @@ pub async fn chat_completions(
             );
             out.headers_mut()
                 .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-cache"));
+            // The slots are handed to the stream task, so they are held until the stream ends rather than
+            // until this handler returns.
             let ctx = StreamContext {
                 st: st.clone(),
                 key: key.clone(),
                 conn: conn.clone(),
                 model,
                 present,
+                admission: Admission {
+                    global,
+                    connection: slot,
+                },
             };
             *out.body_mut() = Body::from_stream(stream_body(ctx, upstream, started, prompt_tokens));
             return out;
@@ -575,6 +614,19 @@ pub async fn chat_completions(
         );
         *out.body_mut() = Body::from(bytes);
         return out;
+    }
+
+    // A request that was never sent because every connection it could use was already at its limit is not
+    // recorded as one that crossed the gate. It is answered as an overload, with the limits it ran into.
+    if !attempted && !full.is_empty() {
+        return error(
+            StatusCode::TOO_MANY_REQUESTS,
+            "connection_full",
+            format!(
+                "every connection available to this key is at its limit of requests at once: {}",
+                full.join(", ")
+            ),
+        );
     }
 
     record(
