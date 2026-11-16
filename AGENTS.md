@@ -118,7 +118,9 @@ need a review, and says so in the checklist instead of pretending to have had on
 
 CI reports checks; it cannot block a merge by itself, because this repository has no branch
 protection. A pull request may be merged once its checks are green and the checklist is filled in
-honestly, and a change that adds behaviour only after its review is recorded.
+honestly, and a change that adds behaviour only after its review is recorded. An agent that wrote the
+change merges its own pull request into `dev` when those are true, and cleans up the branch with it as
+the Workflow section says. The merge from `dev` to `main` is the one an agent does not make.
 
 ## Pull request checklist
 
