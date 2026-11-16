@@ -3,16 +3,23 @@ use axum::extract::State as AxumState;
 use axum::http::{HeaderValue, header};
 use axum::response::{IntoResponse, Response};
 use futures_util::{StreamExt, stream};
+use std::time::Duration;
+
 use serde::Serialize;
 use serde_json::json;
 use tokio::sync::broadcast;
+use tokio::time::MissedTickBehavior;
 
 use crate::auth::Caller;
-use crate::presence::PresenceEvent;
+use crate::presence::{self, PresenceEvent};
 use crate::state::{Hub, State};
 use crate::stats;
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
+
+// How often a page is told how far the streams in flight have got: often enough that a counter reads as
+// moving, and rare enough that a page with nothing else to do is not kept busy repainting.
+pub const PROGRESS_EVERY: Duration = Duration::from_millis(250);
 
 #[derive(Clone, Serialize)]
 pub enum HubEvent {
@@ -37,6 +44,9 @@ pub struct LiveEvent {
     pub status: i64,
     pub streamed: bool,
     pub created_at: String,
+    // The stream this row settles, when it was one; the page drops that stream's progress as it adds the
+    // row, so the two are never counted together.
+    pub stream: Option<u64>,
 }
 
 pub fn hub() -> Hub {
@@ -56,39 +66,53 @@ pub async fn stream_events(AxumState(st): AxumState<State>, caller: Caller) -> R
         json!({ "type": "snapshot", "scoped": scoped, "self": self_totals, "global": global })
             .to_string();
     let receiver = st.hub.subscribe();
+    // The progress of the streams in flight is read on a tick rather than sent through the hub: a stream
+    // changes with every chunk, and the hub would carry each change to every page, so its rate would grow
+    // with the number of streams. Read on a tick, a page gets at most four updates a second however many
+    // streams are running, and none while nothing changes. A tick that falls behind is not made up.
+    let mut ticks = tokio::time::interval(PROGRESS_EVERY);
+    ticks.set_missed_tick_behavior(MissedTickBehavior::Delay);
 
-    let body =
-        stream::once(
-            async move { Ok::<_, BoxError>(Bytes::from(format!("data: {snapshot}\n\n"))) },
-        )
-        .chain(stream::unfold(receiver, move |mut receiver| async move {
-            loop {
-                let event = match receiver.recv().await {
-                    Ok(event) => event,
-                    Err(_) => return None,
-                };
-                // Presence is a count, so it goes to everyone; usage is scoped to the account
-                // that owns it. Skipping an event must not end the stream for the client.
-                match &event {
-                    HubEvent::Usage(usage) if scoped && usage.user_id != user_id => continue,
-                    HubEvent::Usage(usage) => {
-                        let payload = json!({ "type": "usage", "event": usage }).to_string();
-                        return Some((
-                            Ok::<_, BoxError>(Bytes::from(format!("data: {payload}\n\n"))),
-                            receiver,
-                        ));
-                    }
-                    HubEvent::Presence(presence) => {
-                        let payload =
-                            json!({ "type": "presence", "presence": presence }).to_string();
-                        return Some((
-                            Ok::<_, BoxError>(Bytes::from(format!("data: {payload}\n\n"))),
-                            receiver,
-                        ));
-                    }
+    let body = stream::once(async move {
+        Ok::<_, BoxError>(Bytes::from(format!("data: {snapshot}\n\n")))
+    })
+    .chain(stream::unfold(
+        (receiver, ticks, None::<u64>),
+        move |(mut receiver, mut ticks, mut seen)| {
+            let st = st.clone();
+            async move {
+                loop {
+                    let payload = tokio::select! {
+                        event = receiver.recv() => {
+                            let Ok(event) = event else {
+                                return None;
+                            };
+                            // Presence is a count, so it goes to everyone; usage is scoped to the account
+                            // that owns it. Skipping an event must not end the stream for the client.
+                            match event {
+                                HubEvent::Usage(usage) if scoped && usage.user_id != user_id => continue,
+                                HubEvent::Usage(usage) => json!({ "type": "usage", "event": usage }),
+                                HubEvent::Presence(presence) => {
+                                    json!({ "type": "presence", "presence": presence })
+                                }
+                            }
+                        }
+                        _ = ticks.tick() => match presence::progress(&st, scoped, user_id, seen) {
+                            Some((version, payload)) => {
+                                seen = Some(version);
+                                payload
+                            }
+                            None => continue,
+                        },
+                    };
+                    return Some((
+                        Ok::<_, BoxError>(Bytes::from(format!("data: {payload}\n\n"))),
+                        (receiver, ticks, seen),
+                    ));
                 }
             }
-        }));
+        },
+    ));
 
     let mut out = Response::new(Body::empty());
     out.headers_mut().insert(

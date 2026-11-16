@@ -4,7 +4,7 @@ use std::time::Instant;
 use axum::extract::State as AxumState;
 use axum::response::{IntoResponse, Json, Response};
 use serde::Serialize;
-use serde_json::json;
+use serde_json::{Value, json};
 use sqlx::Row;
 
 use crate::auth::Caller;
@@ -27,6 +27,134 @@ pub struct PresenceEvent {
 pub struct Presence {
     generating: HashMap<i64, usize>,
     last_seen: HashMap<i64, Instant>,
+    streams: HashMap<u64, Progress>,
+    next_stream: u64,
+    // Moves on every change to the streams, so a page can be told only when there is something new
+    // without comparing the streams themselves.
+    version: u64,
+}
+
+// A stream in flight and how far it has got. The counts are the gateway's own estimate, the same one a
+// row is given when nothing is reported, until the upstream reports its own, which most only do in their
+// last chunk; `estimated` says which of the two they are.
+#[derive(Clone, Serialize)]
+pub struct Progress {
+    pub stream: u64,
+    pub user_id: i64,
+    pub key: String,
+    pub model: String,
+    pub prompt_tokens: i64,
+    pub completion_tokens: i64,
+    pub estimated: bool,
+    pub started_at: String,
+}
+
+// Held by a stream task while it reads, so a page can show a generation as it happens rather than only
+// once its row is written. Dropping it takes the stream off the list; the task does that just before it
+// writes the row, so on the page the row's event is what replaces the stream's progress.
+pub struct InFlight {
+    st: State,
+    stream: u64,
+}
+
+pub fn start_stream(
+    st: &State,
+    user_id: i64,
+    key: &str,
+    model: &str,
+    prompt_tokens: i64,
+) -> InFlight {
+    let mut presence = st.presence.lock().expect("presence lock");
+    presence.next_stream += 1;
+    let stream = presence.next_stream;
+    presence.streams.insert(
+        stream,
+        Progress {
+            stream,
+            user_id,
+            key: key.to_string(),
+            model: model.to_string(),
+            prompt_tokens,
+            completion_tokens: 0,
+            estimated: true,
+            started_at: crate::clock::now(),
+        },
+    );
+    presence.version += 1;
+    InFlight {
+        st: st.clone(),
+        stream,
+    }
+}
+
+impl InFlight {
+    pub fn stream(&self) -> u64 {
+        self.stream
+    }
+
+    pub fn update(&self, prompt_tokens: i64, completion_tokens: i64, estimated: bool) {
+        let mut guard = self.st.presence.lock().expect("presence lock");
+        let presence = &mut *guard;
+        let Some(progress) = presence.streams.get_mut(&self.stream) else {
+            return;
+        };
+        let next = (prompt_tokens, completion_tokens, estimated);
+        if (
+            progress.prompt_tokens,
+            progress.completion_tokens,
+            progress.estimated,
+        ) != next
+        {
+            (
+                progress.prompt_tokens,
+                progress.completion_tokens,
+                progress.estimated,
+            ) = next;
+            presence.version += 1;
+        }
+    }
+}
+
+impl Drop for InFlight {
+    fn drop(&mut self) {
+        let mut presence = self.st.presence.lock().expect("presence lock");
+        if presence.streams.remove(&self.stream).is_some() {
+            presence.version += 1;
+        }
+    }
+}
+
+// What a page is sent about the streams in flight, or nothing when they have not changed since `seen`.
+// The total across every account is part of the platform total anyone signed in sees; the streams
+// themselves are scoped like the rest of the usage, every account's for an admin and otherwise the
+// caller's own. The list is copied out so the lock is not held while it is written as JSON.
+pub fn progress(st: &State, scoped: bool, user_id: i64, seen: Option<u64>) -> Option<(u64, Value)> {
+    let (version, generating, estimated, mut streams) = {
+        let presence = st.presence.lock().expect("presence lock");
+        if seen == Some(presence.version) {
+            return None;
+        }
+        (
+            presence.version,
+            presence
+                .streams
+                .values()
+                .map(|p| p.completion_tokens)
+                .sum::<i64>(),
+            presence.streams.values().any(|p| p.estimated),
+            presence
+                .streams
+                .values()
+                .filter(|p| !scoped || p.user_id == user_id)
+                .cloned()
+                .collect::<Vec<_>>(),
+        )
+    };
+    streams.sort_by_key(|p| p.stream);
+    Some((
+        version,
+        json!({ "type": "progress", "generating": generating, "estimated": estimated, "streams": streams }),
+    ))
 }
 
 impl Presence {

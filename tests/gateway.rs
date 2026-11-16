@@ -2740,3 +2740,227 @@ async fn the_session_cookie_is_marked_secure_only_when_the_request_arrived_over_
         "the cookie and the stored session last the same window"
     );
 }
+
+// An upstream that streams one word every `delay_ms`, `words` times, and reports usage in its last chunk as
+// an OpenAI-shaped server does, so a stream is still running for long enough to be watched from the page.
+async fn slow_upstream(words: usize, delay_ms: u64) -> String {
+    let chat = move || async move {
+        let body = stream::unfold(0usize, move |sent| async move {
+            if sent > words {
+                return None;
+            }
+            tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+            let line = if sent < words {
+                json!({ "choices": [{ "delta": { "content": format!("word{sent}") } }] })
+            } else {
+                json!({ "choices": [], "usage": { "prompt_tokens": 11, "completion_tokens": 42 } })
+            };
+            Some((
+                Ok::<_, std::io::Error>(format!("data: {line}\n\n")),
+                sent + 1,
+            ))
+        });
+        let mut out = Response::new(Body::from_stream(body));
+        out.headers_mut().insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("text/event-stream"),
+        );
+        out
+    };
+    let app = Router::new().route("/v1/chat/completions", post(chat));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    format!("http://{addr}")
+}
+
+// The live stream read the way the page reads it: one event at a time, each a `data:` line and a blank line.
+// A read waits no longer than five seconds, so a stream that stops sending fails the test rather than
+// hanging it.
+struct Live {
+    body: Body,
+    buffer: String,
+}
+
+impl Live {
+    async fn open(router: &Router, cookie: &str) -> Live {
+        let response = call(
+            router,
+            Request::get("/api/live")
+                .header("cookie", cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        Live {
+            body: response.into_body(),
+            buffer: String::new(),
+        }
+    }
+
+    async fn next(&mut self) -> Value {
+        loop {
+            if let Some(end) = self.buffer.find("\n\n") {
+                let event: String = self.buffer.drain(..end + 2).collect();
+                let data = event.trim().strip_prefix("data: ").unwrap();
+                return serde_json::from_str(data).unwrap();
+            }
+            let frame = tokio::time::timeout(Duration::from_secs(5), self.body.frame())
+                .await
+                .expect("an event within five seconds")
+                .expect("the live stream is still open")
+                .unwrap();
+            if let Ok(data) = frame.into_data() {
+                self.buffer.push_str(std::str::from_utf8(&data).unwrap());
+            }
+        }
+    }
+}
+
+// A stream that is still running is on the live stream, and its count moves while it runs rather than
+// arriving with the row. The count is the gateway's estimate until the upstream reports one, and the row
+// that settles the stream names it, so the page can put one in the other's place. The stream is two seconds
+// of words against a progress tick of a quarter of a second, so it is seen moving with room to spare.
+#[tokio::test]
+async fn a_stream_in_flight_is_on_the_live_stream_and_its_row_takes_its_place() {
+    let st = test_state().await;
+    let router = build_router(st.clone());
+    let base_url = slow_upstream(40, 50).await;
+    let cookie = register(&router, "ada").await;
+    post_json(
+        &router,
+        "/api/connections",
+        &cookie,
+        json!({ "name": "slow", "base_url": base_url }),
+    )
+    .await;
+    let (_, created) = post_json(&router, "/api/keys", &cookie, json!({ "name": "watched" })).await;
+    let key = created["key"].as_str().unwrap().to_string();
+
+    let mut live = Live::open(&router, &cookie).await;
+    assert_eq!(live.next().await["type"], "snapshot");
+
+    let answer = {
+        let router = router.clone();
+        tokio::spawn(async move {
+            let response = gateway_call(
+                &router,
+                &key,
+                json!({ "model": "slow-model", "stream": true, "messages": [{ "role": "user", "content": "hi" }] }),
+            )
+            .await;
+            response.into_body().collect().await.unwrap().to_bytes()
+        })
+    };
+
+    let mut counts = Vec::new();
+    let mut stream = None;
+    let mut usage = None;
+    let mut cleared = false;
+    while usage.is_none() || !cleared {
+        let event = live.next().await;
+        match event["type"].as_str() {
+            Some("progress") => match event["streams"].as_array().unwrap().first() {
+                Some(progress) => {
+                    assert!(
+                        usage.is_none(),
+                        "the stream's progress came after the row that settles it"
+                    );
+                    assert_eq!(progress["key"], "watched");
+                    assert_eq!(progress["model"], "slow-model");
+                    assert_eq!(progress["estimated"], true);
+                    assert_eq!(event["generating"], progress["completion_tokens"]);
+                    stream = Some(progress["stream"].clone());
+                    counts.push(progress["completion_tokens"].as_i64().unwrap());
+                    cleared = false;
+                }
+                None if stream.is_some() => {
+                    assert_eq!(event["generating"], 0);
+                    cleared = true;
+                }
+                None => {}
+            },
+            Some("usage") => usage = Some(event),
+            _ => {}
+        }
+    }
+    answer.await.unwrap();
+
+    assert!(
+        counts.windows(2).all(|pair| pair[0] <= pair[1]),
+        "the count only goes up while the stream runs: {counts:?}"
+    );
+    let mut moving = counts.clone();
+    moving.retain(|count| *count > 0);
+    moving.dedup();
+    assert!(
+        moving.len() >= 2,
+        "the count was seen moving while the stream ran, not only at its end: {counts:?}"
+    );
+    let usage = usage.unwrap();
+    assert_eq!(
+        usage["event"]["stream"],
+        stream.unwrap(),
+        "the row names the stream it settles"
+    );
+    assert_eq!(
+        usage["event"]["completion_tokens"], 42,
+        "the row has what the upstream reported, not the estimate"
+    );
+}
+
+// Another account's stream moves the total across every account, which anyone signed in sees, but the
+// stream itself, its key and its model, is only listed for an admin, as the rest of the usage is.
+#[tokio::test]
+async fn another_accounts_stream_counts_toward_the_total_without_being_listed() {
+    let st = test_state().await;
+    let router = build_router(st.clone());
+    let base_url = slow_upstream(40, 50).await;
+    let admin = register(&router, "ada").await;
+    open_registration(&router, &admin).await;
+    no_approval(&router, &admin).await;
+    let member = register(&router, "ben").await;
+    post_json(
+        &router,
+        "/api/connections",
+        &admin,
+        json!({ "name": "slow", "base_url": base_url }),
+    )
+    .await;
+    let (_, created) = post_json(&router, "/api/keys", &admin, json!({ "name": "ada's" })).await;
+    let key = created["key"].as_str().unwrap().to_string();
+
+    let mut live = Live::open(&router, &member).await;
+    assert_eq!(live.next().await["type"], "snapshot");
+
+    let answer = {
+        let router = router.clone();
+        tokio::spawn(async move {
+            let response = gateway_call(
+                &router,
+                &key,
+                json!({ "stream": true, "messages": [{ "role": "user", "content": "hi" }] }),
+            )
+            .await;
+            response.into_body().collect().await.unwrap().to_bytes()
+        })
+    };
+
+    loop {
+        let event = live.next().await;
+        if event["type"] == "progress" && event["generating"].as_i64().unwrap() > 0 {
+            assert_eq!(
+                event["streams"],
+                json!([]),
+                "another account's stream is not listed for a member"
+            );
+            break;
+        }
+        assert_ne!(
+            event["type"], "usage",
+            "another account's row is not sent to a member"
+        );
+    }
+    answer.await.unwrap();
+}

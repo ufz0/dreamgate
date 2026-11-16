@@ -69,6 +69,9 @@ const state = {
   // first account is never blocked by a failed request.
   settings: { open_registration: true, require_approval: true, has_accounts: false },
   presence: { online: 0, generating: 0, users: [] },
+  // The streams in flight, as the gateway last said: what every account has generated in them so far,
+  // and the streams themselves as far as this account may see them.
+  progress: { generating: 0, estimated: false, streams: [] },
   chat: [],
   models: [],
   modelNote: '',
@@ -345,13 +348,27 @@ function subscribe() {
       return;
     }
     if (payload.type === 'presence') {
-      state.presence = payload.presence;
+      // The live event carries the counts and the ids of the accounts generating, not their names, which
+      // only /api/presence gives, and only to an admin. The names already known are kept for the ids still
+      // generating, and the list is read again only when an account the page cannot name has started.
+      const known = new Map((state.presence.users || []).map((user) => [user.id, user]));
+      const ids = payload.presence.generating_ids || [];
+      state.presence = { ...payload.presence, users: ids.filter((id) => known.has(id)).map((id) => known.get(id)) };
+      if (state.me.role === 'admin' && state.presence.users.length < ids.length) {
+        refreshPresence().then(() => render(false)).catch(() => {});
+      }
       render(false);
+      return;
+    }
+    if (payload.type === 'progress') {
+      state.progress = payload;
+      renderProgress();
       return;
     }
     state.events.unshift(payload.event);
     state.events = state.events.slice(0, 50);
     const event = payload.event;
+    retireStream(event.stream);
     // Every event counts toward the total the gate has produced, but only the caller's own events
     // move the account figures or the charts.
     countTotals(state.summary.global, event);
@@ -367,6 +384,24 @@ function subscribe() {
     setTimeout(() => wire.classList.remove('arrive'), 180);
     render(true);
   };
+}
+
+// A recorded row takes the place of the stream it settles, in the same render that adds the row's
+// figures, so the two are never counted together while the next progress update is on its way.
+function retireStream(id) {
+  const stream = state.progress.streams.find((s) => s.stream === id);
+  if (!stream) return;
+  state.progress.streams = state.progress.streams.filter((s) => s !== stream);
+  state.progress.generating = Math.max(0, num(state.progress.generating) - num(stream.completion_tokens));
+}
+
+// Progress arrives up to four times a second while anything is generating, so it repaints only what it
+// moves, on the Overview, rather than the whole view: a full render rebuilds every table and menu on the
+// page, and an open menu or a half-typed field would not survive it that often.
+function renderProgress() {
+  if (state.view !== 'overview') return;
+  renderReadout();
+  renderFeed(false);
 }
 
 // Time axes. Buckets persist between renders so a live event can add to them.
@@ -502,24 +537,38 @@ function renderGate() {
 // The support panel below repeats the generated number as part of its breakdown; it is the same
 // figure, not a second one.
 function renderReadout() {
-  renderPair('generated-tokens', 'global-input-tokens', 'global-input-note', state.summary.global, 'what every account and key sent in');
-  renderPair('account-generated-tokens', 'account-input-tokens', 'account-input-note', state.summary.self, 'what this account sent in');
+  const own = state.progress.streams.filter((s) => s.user_id === state.me.id);
+  renderPair(['generated-tokens', 'global-generated-note', 'global-input-tokens', 'global-input-note'], state.summary.global, 'every account and key', {
+    tokens: num(state.progress.generating),
+    estimated: Boolean(state.progress.estimated),
+  });
+  renderPair(['account-generated-tokens', 'account-generated-note', 'account-input-tokens', 'account-input-note'], state.summary.self, 'this account', {
+    tokens: own.reduce((sum, s) => sum + num(s.completion_tokens), 0),
+    estimated: own.some((s) => s.estimated),
+  });
   renderSupport(state.summary.self);
 }
 
 // The cached part of the input is only a note when an engine reported it. Nothing is invented here:
 // a row that reported no cache is stored as unknown, so a zero cache across the whole instance reads
-// as "no engine reported a cache hit", not as a cache that never hit. The note opens with the scope,
+// as "no engine reported a cache hit", not as a cache that never hit. The notes open with the scope,
 // because the two pairs show the same figures for a different set of requests.
-function renderPair(generatedId, inputId, noteId, totals, sent) {
+// What a stream still running has generated counts toward the generated figure as it arrives, so the
+// number moves with the answer. The note says how much of the figure is still in flight and, while the
+// gateway is counting it rather than the upstream, that it is an estimate until the request is recorded.
+function renderPair([generatedId, generatedNoteId, inputId, inputNoteId], totals, scope, inflight) {
   const t = totals || {};
-  $('' + generatedId).textContent = nf.format(num(t.completion_tokens));
-  $('' + inputId).textContent = nf.format(num(t.prompt_tokens));
-  const note = $(noteId);
+  $(generatedId).textContent = nf.format(num(t.completion_tokens) + inflight.tokens);
+  const running = inflight.estimated ? 'still being generated, an estimate until it is recorded' : 'still being generated';
+  $(generatedNoteId).textContent = inflight.tokens
+    ? `what the models generated for ${scope}, including ${nf.format(inflight.tokens)} ${running}`
+    : `what the models generated for ${scope}`;
+  $(inputId).textContent = nf.format(num(t.prompt_tokens));
+  const note = $(inputNoteId);
   if (num(t.cached_reported)) {
-    note.textContent = `${sent}, of which ${nf.format(num(t.cached_tokens))} came from the prompt cache`;
+    note.textContent = `what ${scope} sent in, of which ${nf.format(num(t.cached_tokens))} came from the prompt cache`;
   } else {
-    note.textContent = `${sent}. No engine reported a prompt cache hit.`;
+    note.textContent = `what ${scope} sent in. No engine reported a prompt cache hit.`;
   }
 }
 
@@ -573,24 +622,42 @@ function renderCharts() {
 
 // An admin's stream carries every account's requests, and anyone else's only their own, so the heading
 // says which of the two the feed is.
+// A stream still running is a row of its own above the recorded ones, with live in place of a status it
+// does not have yet. Its tokens are the input and what has been generated so far, which is what the
+// column counts for a recorded row, and a ~ marks them while they are the gateway's estimate.
+function streamRow(stream) {
+  const tokens = num(stream.prompt_tokens) + num(stream.completion_tokens);
+  const how = stream.estimated ? 'Estimated by the gateway until the request is recorded' : 'As the upstream has reported so far';
+  return `<li class="inflight">
+    <span>${esc(stream.started_at.slice(11, 19))}</span>
+    <span>${esc(stream.key)}</span>
+    <span>${esc(stream.model || 'no model')}</span>
+    <span>live</span>
+    <span class="tokens" title="${how}">${stream.estimated ? '~' : ''}${nf.format(tokens)}</span>
+  </li>`;
+}
+
 function renderFeed(arrived) {
   $('feed-title').textContent = state.me.role === 'admin' ? 'Live traffic, every account' : 'Live traffic for this account';
-  $('feed-head').hidden = !state.events.length;
-  $('feed').innerHTML = state.events.length
-    ? state.events
-        .slice(0, 12)
-        .map(
-          (event, i) =>
-            `<li class="${arrived && i === 0 ? ' arrived' : ''}">
-              <span>${esc(event.created_at.slice(11, 19))}</span>
-              <span>${esc(keyLabel(event))}</span>
-              <span>${esc(event.model || 'no model')}</span>
-              <span class="${event.status >= 400 ? 'danger' : ''}">${esc(event.status)}</span>
-              <span class="tokens">${nf.format(event.total_tokens)}</span>
-            </li>`,
-        )
-        .join('')
-    : empty('No requests yet. Create a key and send one, and the row lands here as it happens.');
+  const streams = [...state.progress.streams].sort((a, b) => b.stream - a.stream);
+  $('feed-head').hidden = !state.events.length && !streams.length;
+  const recorded = state.events
+    .slice(0, 12)
+    .map(
+      (event, i) =>
+        `<li class="${arrived && i === 0 ? ' arrived' : ''}">
+          <span>${esc(event.created_at.slice(11, 19))}</span>
+          <span>${esc(keyLabel(event))}</span>
+          <span>${esc(event.model || 'no model')}</span>
+          <span class="${event.status >= 400 ? 'danger' : ''}">${esc(event.status)}</span>
+          <span class="tokens">${nf.format(event.total_tokens)}</span>
+        </li>`,
+    )
+    .join('');
+  $('feed').innerHTML =
+    streams.length || state.events.length
+      ? streams.map(streamRow).join('') + recorded
+      : empty('No requests yet. Create a key and send one, and the row lands here as it happens.');
 }
 
 // Activity

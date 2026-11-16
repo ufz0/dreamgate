@@ -24,6 +24,9 @@ pub struct UsageRow {
     pub streamed: bool,
     pub estimated: bool,
     pub created_at: String,
+    // The stream whose progress the page was showing, so the row can take its place there. It is not
+    // stored: it only means something while the process that numbered the stream is running.
+    pub stream: Option<u64>,
 }
 
 pub async fn record(st: &State, row: &UsageRow) -> Result<(), sqlx::Error> {
@@ -82,6 +85,7 @@ pub async fn record(st: &State, row: &UsageRow) -> Result<(), sqlx::Error> {
         status: row.status,
         streamed: row.streamed,
         created_at: row.created_at.clone(),
+        stream: row.stream,
     };
     let _ = st.hub.send(HubEvent::Usage(event));
     Ok(())
