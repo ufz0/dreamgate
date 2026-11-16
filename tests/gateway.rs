@@ -1129,10 +1129,12 @@ async fn the_summary_separates_the_callers_own_figures_from_the_platform_total()
     gateway_call(&router, member_key["key"].as_str().unwrap(), json!({ "messages": [{ "role": "user", "content": "hi" }] })).await;
 
     // The summary reports the caller's own figures and the platform total separately, so the
-    // page does not have to infer which one it is showing.
+    // page does not have to infer which one it is showing. The generated side is reported for
+    // both scopes, because the overview shows it for both.
     let admin_summary = get_json(&router, "/api/stats/summary", &admin).await;
     assert_eq!(admin_summary["self"]["requests"], 1, "an admin's own figures are their own");
     assert_eq!(admin_summary["self"]["total_tokens"], 18);
+    assert_eq!(admin_summary["self"]["completion_tokens"], 7, "the own figures carry the generated side, not only the total");
     assert_eq!(admin_summary["global"]["requests"], 2);
     assert_eq!(admin_summary["global"]["total_tokens"], 36);
     assert_eq!(admin_summary["hourly"].as_array().unwrap().len(), 1, "the charts are per account");
@@ -1142,6 +1144,7 @@ async fn the_summary_separates_the_callers_own_figures_from_the_platform_total()
     let member_summary = get_json(&router, "/api/stats/summary", &member).await;
     assert_eq!(member_summary["self"]["requests"], 1, "{member_summary}");
     assert_eq!(member_summary["self"]["total_tokens"], 18);
+    assert_eq!(member_summary["self"]["completion_tokens"], 7, "a member sees the generated side of their own usage");
     assert_eq!(member_summary["global"]["requests"], 2, "the platform total is not scoped");
     assert_eq!(member_summary["users"].as_array().unwrap().len(), 0, "a member does not see other accounts");
 

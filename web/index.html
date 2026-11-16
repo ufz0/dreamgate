@@ -86,8 +86,16 @@
         </div>
         <p class="read" id="gate-read">Nothing has crossed the gate yet.</p>
 
-        <p class="readout" id="total-tokens">0</p>
-        <p class="readout-note">tokens counted so far for this account</p>
+        <div class="readout-pair">
+          <div>
+            <p class="readout" id="total-tokens">0</p>
+            <p class="readout-note">tokens counted so far for this account</p>
+          </div>
+          <div>
+            <p class="readout" id="own-generated-tokens">0</p>
+            <p class="readout-note">only what the models generated for this account, so the text sent in is not counted</p>
+          </div>
+        </div>
 
         <dl class="panel" id="support"></dl>
         <p class="note">Times and the today figures count the UTC day, which is when a daily account limit resets.</p>

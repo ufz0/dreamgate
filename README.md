@@ -86,9 +86,11 @@ URL hash (`#/overview`, `#/activity`, `#/keys`, `#/connections`, `#/connect`, `#
 - **Overview** — the gate readout (client → key → upstream, following the key and the
   connection the last request actually used, which is not necessarily the first key), the count of
   every token that has ever crossed the gate from any account beside the count of the tokens the
-  models generated, which leaves the prompt text out, then this account's own totals
-  including today's, a "Right now" panel for who is online and generating, and the token rate per
-  hour and requests per day for this account. Totals across accounts are in the Accounts view.
+  models generated, which leaves the prompt text out. The same pair for this account alone, so the
+  generated figure is what this account produced and not what every account produced, then the rest
+  of its figures including today's, a "Right now" panel for who is online and generating, and the
+  token rate per hour and requests per day for this account. Totals across accounts are in the
+  Accounts view.
 - **Activity** — every recorded request, newest first, plus usage by model.
 - **Keys** — create, copy, disable and delete keys, with per-key usage, and a note when a
   key's binding points at a connection that is turned off. A key that is turned off stays listed and
