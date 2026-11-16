@@ -260,10 +260,11 @@ main {
 
 /* Live traffic */
 
-.feed { list-style: none; margin: 0; padding: 0; max-height: 300px; overflow: auto; }
+/* The head names the columns of the rows under it, so it shares their grid. It scrolls in the same box as
+   the rows and sticks to its top, so it stays in place and a scrollbar narrows both alike. */
+.feed-scroll { max-height: 300px; overflow: auto; }
+.feed { list-style: none; margin: 0; padding: 0; }
 
-/* The head names the columns of the rows under it, so it shares their grid; it sits outside the list so it
-   stays in place while the rows scroll. */
 .feed li, .feed-head {
   display: grid;
   grid-template-columns: 64px 140px minmax(0, 1fr) 44px 64px;
@@ -275,7 +276,7 @@ main {
   font-variant-numeric: tabular-nums;
 }
 
-.feed-head { font: 600 12px/1.5 var(--font-sans); }
+.feed-head { position: sticky; top: 0; background: var(--bg); font: 600 12px/1.5 var(--font-sans); }
 .feed-head .tokens { text-align: right; }
 
 .feed li span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }

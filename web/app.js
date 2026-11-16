@@ -110,6 +110,12 @@ function report(err) {
   console.error(err);
 }
 
+// A copy button says Copied for a moment after it copies; this puts back the label it had before.
+function restoreLabel(button) {
+  clearTimeout(button.copiedTimer);
+  if (button.dataset.label) button.textContent = button.dataset.label;
+}
+
 // The clipboard is only exposed on a secure origin, so this page served over http on a LAN
 // address has no navigator.clipboard. Selecting a temporary textarea still copies there.
 async function copy(text) {
@@ -137,12 +143,14 @@ async function copy(text) {
 // Escape, navigable with the arrow keys. A glyph is for the menu that has to work in a
 // collapsed rail, where the label text is not shown. The button's name carries the choice
 // as well as what is being chosen, because a name on a button replaces the text inside it.
+const menuName = (label, choice) => (choice ? `${label}: ${choice}` : label);
+
 function renderMenu(container, name, options, current, label, glyph) {
   const picked = options.find((o) => o.value === current) || options[0];
   container.dataset.name = name;
   container.dataset.value = picked ? picked.value : '';
   container.innerHTML = `
-    <button type="button" class="menu-button" aria-haspopup="listbox" aria-expanded="false" aria-label="${esc(picked ? `${label}: ${picked.label}` : label)}">
+    <button type="button" class="menu-button" aria-haspopup="listbox" aria-expanded="false" aria-label="${esc(menuName(label, picked?.label))}">
       ${glyph ? `<span class="icon">${icon(glyph)}</span>` : ''}
       <span>${esc(picked ? picked.label : label)}</span>
       <span class="icon">${icon('chevron')}</span>
@@ -185,12 +193,17 @@ function chooseOption(option) {
   // class — the same span the collapsed-rail rule in web/style.css hides. It cannot be taken as the
   // first child, because a menu that has a glyph puts that first.
   wrap.querySelector('.menu-button span:not(.icon)').textContent = option.textContent;
-  wrap.querySelector('.menu-button').setAttribute('aria-label', `${wrap.querySelector('.menu').getAttribute('aria-label')}: ${option.textContent}`);
+  wrap.querySelector('.menu-button').setAttribute('aria-label', menuName(wrap.querySelector('.menu').getAttribute('aria-label'), option.textContent));
   for (const item of wrap.querySelectorAll('[role="option"]')) item.setAttribute('aria-selected', String(item === option));
   closeMenus();
-  if (wrap.dataset.name === 'theme') applyTheme(option.dataset.value);
+  if (wrap.dataset.name === 'theme') {
+    applyTheme(option.dataset.value);
+    labelRail();
+  }
   if (wrap.dataset.name === 'connect-key') {
     state.connectKey = option.dataset.value;
+    // Copied was about the key that was showing, so it does not carry over to the one just picked.
+    restoreLabel($('connect-copy'));
     renderConnect();
   }
   if (wrap.dataset.name === 'sandbox-key') {
@@ -415,7 +428,7 @@ function areaChart(buckets) {
     .filter((_, i) => i % 4 === 0)
     .map((b, i) => `<text class="axis" x="${(10 + i * 4 * step).toFixed(1)}" y="${height - 6}">${b.label}</text>`)
     .join('');
-  return svg(`${grid}<path class="area" d="${area}"/><path class="line" d="${line}"/>${labels}`, height, `Token rate for this account, last 24 hours, peak ${nf.format(max)} tokens in an hour`);
+  return svg(`${grid}<path class="area" d="${area}"/><path class="line" d="${line}"/>${labels}`, height, `Peak ${nf.format(max)} tokens in an hour`);
 }
 
 function barChart(buckets) {
@@ -432,7 +445,7 @@ function barChart(buckets) {
   const labels = buckets
     .map((b, i) => `<text class="axis" text-anchor="middle" x="${(10 + i * slot + slot / 2).toFixed(1)}" y="${height - 6}">${b.label}</text>`)
     .join('');
-  return svg(`<line class="grid" x1="10" x2="894" y1="${height - 24}" y2="${height - 24}"/>${bars}${labels}`, height, `Requests per day for this account, last 14 days, peak ${nf.format(max)} requests in a day`);
+  return svg(`<line class="grid" x1="10" x2="894" y1="${height - 24}" y2="${height - 24}"/>${bars}${labels}`, height, `Peak ${nf.format(max)} requests in a day`);
 }
 
 function empty(message) {
@@ -558,7 +571,10 @@ function renderCharts() {
   $('chart-daily').innerHTML = state.days.some((b) => b.requests > 0) ? barChart(state.days) : empty('No requests in the last 14 days.');
 }
 
+// An admin's stream carries every account's requests, and anyone else's only their own, so the heading
+// says which of the two the feed is.
 function renderFeed(arrived) {
+  $('feed-title').textContent = state.me.role === 'admin' ? 'Live traffic, every account' : 'Live traffic for this account';
   $('feed-head').hidden = !state.events.length;
   $('feed').innerHTML = state.events.length
     ? state.events
@@ -579,8 +595,13 @@ function renderFeed(arrived) {
 
 // Activity
 
+// The recent rows and the models are an admin's for every account and anyone else's for their own, the
+// same scope the live stream keeps, so the lede says which.
 function renderActivity() {
   const admin = state.me.role === 'admin';
+  $('activity-lede').textContent = `${
+    admin ? 'The last 50 requests that crossed the gate from every account' : 'The last 50 requests this account sent through the gate'
+  }, newest first, with what each cost. New rows arrive as they happen. Times are UTC.`;
   const columns = ['Time', 'Key', admin ? 'Account' : null, 'Model', 'Tokens', 'Latency', 'Status'].filter(Boolean);
   $('activity-head').innerHTML = `<tr>${columns.map((c) => `<th>${esc(c)}</th>`).join('')}</tr>`;
 
@@ -617,6 +638,17 @@ function connectionOptions() {
   return [{ value: '', label: 'Any enabled connection' }, ...state.connections.map((c) => ({ value: String(c.id), label: c.name }))];
 }
 
+// The gateway takes a key's own model first, then the default of the connection that serves it, and
+// the model the client asks for only when neither is set. A key that is not bound to one connection can
+// be served by any, so it can only say which of the two it may be.
+function keyModel(key, bound) {
+  if (key.model) return key.model;
+  if (bound && bound.enabled) return bound.default_model || 'the model the client asks for';
+  return state.connections.some((c) => c.enabled && c.default_model)
+    ? "the connection's default, or the model the client asks for"
+    : 'the model the client asks for';
+}
+
 function keyRow(key, showOwner) {
   // A binding to a disabled connection does not hold: the key uses another one.
   const bound = key.connection_id ? state.connections.find((c) => c.id === key.connection_id) : null;
@@ -627,7 +659,7 @@ function keyRow(key, showOwner) {
     ${showOwner ? `<td>${esc(key.owner)}</td>` : ''}
     <td><span class="clamp" title="${esc(key.key)}">${esc(key.name)}</span></td>
     <td>${binding}</td>
-    <td>${esc(key.model || 'the model the client asks for')}</td>
+    <td>${esc(keyModel(key, bound))}</td>
     <td>${key.rpm_limit ? `${key.rpm_limit}/min` : 'no rate limit'}<br>${key.token_cap ? `${nf.format(key.token_cap)} tokens` : 'no token cap'}</td>
     <td class="num">${nf.format(key.requests)}</td>
     <td class="num">${nf.format(key.tokens)}</td>
@@ -1088,10 +1120,11 @@ function toggleRail() {
   labelRail();
 }
 
-// The toggle is a glyph alone, so its name says what a click does now and shows as a tooltip; under
-// 768px it opens a drawer that starts closed, so its state is read rather than assumed. A collapsed
-// rail hides the names of the links and of Sign out, so each one takes its name as a tooltip there,
-// which is also the name a screen reader reads while the text is hidden.
+// The toggle is a glyph alone, so its name says what a click does now and shows as a tooltip. The name
+// carries the state, so the button does not state it a second time with aria-expanded; under 768px it
+// opens a drawer that starts closed, so the state is read rather than assumed. A collapsed rail shows
+// only glyphs for the links, Sign out and the theme menu, so each one takes its name as a tooltip there;
+// for a link or Sign out that is also the name a screen reader reads while the text is hidden.
 function labelRail() {
   const shell = $('shell');
   const toggle = $('toggle-rail');
@@ -1099,10 +1132,10 @@ function labelRail() {
   const action = narrow.matches ? (open ? 'Close sidebar' : 'Open sidebar') : open ? 'Collapse sidebar' : 'Expand sidebar';
   toggle.setAttribute('aria-label', action);
   toggle.title = action;
-  toggle.setAttribute('aria-expanded', String(open));
   const hidden = shell.dataset.collapsed === 'true';
-  for (const el of document.querySelectorAll('.nav a, #sign-out')) {
-    if (hidden) el.title = el.querySelector('span:not(.icon)').textContent;
+  for (const el of document.querySelectorAll('.nav a, #sign-out, #theme-menu .menu-button')) {
+    const name = el.getAttribute('aria-label') || el.querySelector('span:not(.icon)').textContent;
+    if (hidden) el.title = name;
     else el.removeAttribute('title');
   }
 }
@@ -1324,13 +1357,12 @@ document.addEventListener('click', async (event) => {
       notice('Nothing was copied. Select the value and copy it yourself.', 'error');
       return;
     }
-    // Copied is only true of the value that was there at the click, and a button can stay on screen
-    // while its value changes, such as Copy key when another key is picked. The label goes back.
+    // Copied is only true for a moment after the click, so the label goes back on its own; a second click
+    // starts the moment again rather than ending it early.
+    clearTimeout(button.copiedTimer);
     button.dataset.label ??= button.textContent;
     button.textContent = 'Copied';
-    setTimeout(() => {
-      button.textContent = button.dataset.label;
-    }, 1500);
+    button.copiedTimer = setTimeout(() => restoreLabel(button), 1500);
     return;
   }
   if (button.dataset.limit) {

@@ -60,7 +60,7 @@
 
   <div class="content">
     <header class="topbar">
-      <button type="button" class="ghost" id="toggle-rail" aria-label="Collapse sidebar" aria-expanded="true"><span class="icon" data-icon="panel"></span></button>
+      <button type="button" class="ghost" id="toggle-rail" aria-label="Collapse sidebar"><span class="icon" data-icon="panel"></span></button>
       <span class="spacer"></span>
     </header>
     <main>
@@ -112,21 +112,23 @@
         <h2>Requests per day for this account, last 14 days</h2>
         <div class="chart" id="chart-daily"></div>
 
-        <h2>Live traffic</h2>
-        <div class="feed-head" id="feed-head"><span>Time</span><span>Key</span><span>Model</span><span>Status</span><span class="tokens">Tokens</span></div>
-        <ul class="feed" id="feed" aria-live="polite"></ul>
+        <h2 id="feed-title">Live traffic</h2>
+        <div class="feed-scroll">
+          <div class="feed-head" id="feed-head"><span>Time</span><span>Key</span><span>Model</span><span>Status</span><span class="tokens">Tokens</span></div>
+          <ul class="feed" id="feed" aria-live="polite"></ul>
+        </div>
       </section>
 
       <section class="view" data-view="activity" hidden>
         <h1>Activity</h1>
-        <p class="lede">The last 50 requests that crossed the gate, newest first, with what each cost. New rows arrive as they happen. Times are UTC.</p>
+        <p class="lede" id="activity-lede"></p>
         <div class="table">
           <table id="activity">
             <thead id="activity-head"></thead>
             <tbody id="activity-body"></tbody>
           </table>
         </div>
-        <h2>Usage by model</h2>
+        <h2>Usage by model, the eight with the most tokens</h2>
         <div class="table">
           <table id="models">
             <thead><tr><th>Model</th><th>Requests</th><th>Tokens</th></tr></thead>
@@ -151,7 +153,7 @@
             </div>
             <div class="field">
               <label for="key-model">Model</label>
-              <p class="help" id="key-model-help">Leave it empty to use the model the client asks for.</p>
+              <p class="help" id="key-model-help">Leave it empty to use the default model of the connection that serves this key, or the model the client asks for when that connection has none.</p>
               <input id="key-model" name="model" aria-describedby="key-model-help">
             </div>
             <label class="field">Requests per minute<input name="rpm_limit" type="number" min="1"></label>
