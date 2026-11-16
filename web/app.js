@@ -443,16 +443,16 @@ function renderGate() {
 
 // Both pairs ask the same two questions of a different scope: the top one is the whole gate, the
 // one below the gate diagram is this account. Each shows all tokens and the generated side on its
-// own, so the generation figure reads completion tokens rather than the total, as the live
-// counter does.
+// own, so the generation figure reads completion tokens rather than the total, as the live counter
+// does. The support panel below repeats that number as part of its prompt-and-generation breakdown;
+// it is the same figure, not a second one.
 function renderReadout() {
-  const global = state.summary.global;
-  $('global-tokens').textContent = nf.format(global?.total_tokens || 0);
-  $('generated-tokens').textContent = nf.format(global?.completion_tokens || 0);
+  $('global-tokens').textContent = nf.format(state.summary.global?.total_tokens || 0);
+  $('generated-tokens').textContent = nf.format(state.summary.global?.completion_tokens || 0);
 
   const t = state.summary.self;
   $('total-tokens').textContent = nf.format(t.total_tokens || 0);
-  $('own-generated-tokens').textContent = nf.format(t.completion_tokens || 0);
+  $('account-generated-tokens').textContent = nf.format(t.completion_tokens || 0);
 
   const rows = [
     ['Requests', nf.format(t.requests || 0)],
