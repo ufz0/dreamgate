@@ -164,9 +164,9 @@ function openMenu(wrap) {
 function chooseOption(option) {
   const wrap = option.closest('.menu-wrap');
   wrap.dataset.value = option.dataset.value;
-  // The label is the span that is not a glyph. It cannot be taken as the first span, because a menu
-  // with a glyph — the theme control, and any menu in a collapsed rail — has the glyph first, which is
-  // how choosing an option put the chosen text where the icon belongs and left the old label beside it.
+  // In a menu button the glyph and the chevron carry .icon, so the label is the only span without a
+  // class — the same span the collapsed-rail rule in web/style.css hides. It cannot be taken as the
+  // first child, because a menu that has a glyph puts that first.
   wrap.querySelector('.menu-button span:not(.icon)').textContent = option.textContent;
   for (const item of wrap.querySelectorAll('[role="option"]')) item.setAttribute('aria-selected', String(item === option));
   closeMenus();
