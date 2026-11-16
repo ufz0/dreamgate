@@ -216,9 +216,80 @@ fn text_of(part: &Value) -> String {
     pieces.join(" ")
 }
 
+// What an upstream reported about a request. Every field is optional, because not every engine reports
+// all of it: a prompt cache only appears from servers that keep one, and timings only from builds that
+// report them. A field the upstream did not report stays unset, and is stored as unknown.
+#[derive(Default)]
+struct Report {
+    prompt: Option<i64>,
+    completion: Option<i64>,
+    cached: Option<i64>,
+    prompt_ms: Option<i64>,
+    generation_ms: Option<i64>,
+}
+
+impl Report {
+    // A row is an estimate only when no token counts were reported. A cache hit or a timing on its own
+    // does not make the counts figures the upstream gave.
+    fn reported(&self) -> bool {
+        self.prompt.is_some() || self.completion.is_some()
+    }
+}
+
+// OpenAI-shaped servers put the token counts in `usage` and the prompt cache hit in
+// `prompt_tokens_details`; a llama.cpp build reports the same figures in `timings`, where the cache hit
+// is `cache_n`. Either shape is read from wherever it is.
+fn read_report(value: &Value, report: &mut Report) {
+    if let Some(block) = value.get("usage") {
+        keep(
+            &mut report.prompt,
+            block.get("prompt_tokens").and_then(Value::as_i64),
+        );
+        keep(
+            &mut report.completion,
+            block.get("completion_tokens").and_then(Value::as_i64),
+        );
+        keep(
+            &mut report.cached,
+            block
+                .get("prompt_tokens_details")
+                .and_then(|details| details.get("cached_tokens"))
+                .and_then(Value::as_i64),
+        );
+    }
+    if let Some(timings) = value.get("timings") {
+        keep(
+            &mut report.cached,
+            timings.get("cache_n").and_then(Value::as_i64),
+        );
+        keep(
+            &mut report.prompt_ms,
+            whole_millis(timings.get("prompt_ms")),
+        );
+        keep(
+            &mut report.generation_ms,
+            whole_millis(timings.get("predicted_ms")),
+        );
+    }
+}
+
+// A stream that says the same thing twice keeps the last answer, as the counting path did before: the
+// final chunk is the complete report, and a chunk before it may only hold part of one.
+fn keep(field: &mut Option<i64>, value: Option<i64>) {
+    if let Some(number) = value {
+        *field = Some(number);
+    }
+}
+
+// Timings arrive as numbers with decimals and are stored as whole milliseconds. A value that is not a
+// number is not a timing, so it stays unknown rather than being read as zero.
+fn whole_millis(value: Option<&Value>) -> Option<i64> {
+    value.and_then(Value::as_f64).map(|ms| ms.round() as i64)
+}
+
 // Forwarded bytes go to the client unchanged; this only reads complete SSE lines to
 // count tokens, so upstreams with non-standard stream bodies still work.
-fn scan_line(line: &[u8], generated: &mut String, reported: &mut Option<(i64, i64)>) {
+fn scan_line(line: &[u8], generated: &mut String, report: &mut Report) {
     let Ok(text) = std::str::from_utf8(line) else {
         return;
     };
@@ -231,13 +302,7 @@ fn scan_line(line: &[u8], generated: &mut String, reported: &mut Option<(i64, i6
     let Ok(value) = serde_json::from_str::<Value>(data) else {
         return;
     };
-    if let Some(block) = value.get("usage") {
-        let prompt = block.get("prompt_tokens").and_then(Value::as_i64);
-        let completion = block.get("completion_tokens").and_then(Value::as_i64);
-        if prompt.is_some() || completion.is_some() {
-            *reported = Some((prompt.unwrap_or(0), completion.unwrap_or(0)));
-        }
-    }
+    read_report(&value, report);
     for choice in value
         .get("choices")
         .and_then(Value::as_array)
@@ -258,10 +323,10 @@ fn scan_line(line: &[u8], generated: &mut String, reported: &mut Option<(i64, i6
     }
 }
 
-fn drain_buffer(buffer: &mut Vec<u8>, generated: &mut String, reported: &mut Option<(i64, i64)>) {
+fn drain_buffer(buffer: &mut Vec<u8>, generated: &mut String, report: &mut Report) {
     while let Some(index) = buffer.iter().position(|byte| *byte == b'\n') {
         let line: Vec<u8> = buffer.drain(..=index).collect();
-        scan_line(&line[..line.len() - 1], generated, reported);
+        scan_line(&line[..line.len() - 1], generated, report);
     }
 }
 
@@ -291,15 +356,18 @@ fn stream_body(
     tokio::spawn(async move {
         let mut buffer: Vec<u8> = Vec::new();
         let mut generated = String::new();
-        let mut reported: Option<(i64, i64)> = None;
+        let mut report = Report::default();
         let mut incoming = upstream.bytes_stream();
         while let Some(chunk) = incoming.next().await {
             match chunk {
                 Ok(bytes) => {
                     buffer.extend_from_slice(&bytes);
-                    drain_buffer(&mut buffer, &mut generated, &mut reported);
+                    drain_buffer(&mut buffer, &mut generated, &mut report);
                     if tx.send(Ok(bytes)).await.is_err() {
-                        break; // the client disconnected mid-stream
+                        // The client disconnected mid-stream. The row is still written, with whatever
+                        // the upstream had reported up to there; the final usage chunk, which is where a
+                        // cache hit and the timings appear, is not.
+                        break;
                     }
                 }
                 Err(err) => {
@@ -308,9 +376,14 @@ fn stream_body(
                 }
             }
         }
-        let (prompt, completion, estimated) = match reported {
-            Some((p, c)) => (p, c, false),
-            None => (prompt_tokens, tokens::estimate_tokens(&generated), true),
+        let (prompt, completion, estimated) = if report.reported() {
+            (
+                report.prompt.unwrap_or(0),
+                report.completion.unwrap_or(0),
+                false,
+            )
+        } else {
+            (prompt_tokens, tokens::estimate_tokens(&generated), true)
         };
         let row = UsageRow {
             api_key_id: ctx.key.id,
@@ -320,6 +393,9 @@ fn stream_body(
             prompt_tokens: prompt,
             completion_tokens: completion,
             total_tokens: prompt + completion,
+            cached_tokens: report.cached,
+            prompt_ms: report.prompt_ms,
+            generation_ms: report.generation_ms,
             latency_ms: started.elapsed().as_millis() as i64,
             status: 200,
             streamed: true,
@@ -439,7 +515,10 @@ pub async fn chat_completions(
             }
         };
         let parsed = serde_json::from_str::<Value>(&String::from_utf8_lossy(&bytes)).ok();
-        let block = parsed.as_ref().and_then(|value| value.get("usage"));
+        let mut report = Report::default();
+        if let Some(value) = parsed.as_ref() {
+            read_report(value, &mut report);
+        }
         let completion_text = parsed
             .as_ref()
             .and_then(|value| value.get("choices").and_then(Value::as_array))
@@ -449,18 +528,18 @@ pub async fn chat_completions(
             .filter(|text| !text.is_empty())
             .collect::<Vec<_>>()
             .join(" ");
-        let (prompt, completion) = match block {
-            Some(block) => (
-                block
-                    .get("prompt_tokens")
-                    .and_then(Value::as_i64)
-                    .unwrap_or(prompt_tokens),
-                block
-                    .get("completion_tokens")
-                    .and_then(Value::as_i64)
-                    .unwrap_or(0),
-            ),
-            None => (prompt_tokens, tokens::estimate_tokens(&completion_text)),
+        let (prompt, completion, estimated) = if report.reported() {
+            (
+                report.prompt.unwrap_or(prompt_tokens),
+                report.completion.unwrap_or(0),
+                false,
+            )
+        } else {
+            (
+                prompt_tokens,
+                tokens::estimate_tokens(&completion_text),
+                true,
+            )
         };
         record(
             &st,
@@ -472,10 +551,13 @@ pub async fn chat_completions(
                 prompt_tokens: prompt,
                 completion_tokens: completion,
                 total_tokens: prompt + completion,
+                cached_tokens: report.cached,
+                prompt_ms: report.prompt_ms,
+                generation_ms: report.generation_ms,
                 latency_ms: started.elapsed().as_millis() as i64,
                 status: status.as_u16() as i64,
                 streamed: false,
-                estimated: block.is_none(),
+                estimated,
                 created_at: crate::clock::now(),
             },
         )
@@ -505,6 +587,10 @@ pub async fn chat_completions(
             prompt_tokens,
             completion_tokens: 0,
             total_tokens: prompt_tokens,
+            // Nothing reached an engine, so there is nothing it could have reported about the request.
+            cached_tokens: None,
+            prompt_ms: None,
+            generation_ms: None,
             latency_ms: started.elapsed().as_millis() as i64,
             status: 502,
             streamed: wants_stream,

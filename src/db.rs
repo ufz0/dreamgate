@@ -53,6 +53,9 @@ pub const SCHEMA: &[&str] = &[
         prompt_tokens INTEGER NOT NULL,
         completion_tokens INTEGER NOT NULL,
         total_tokens INTEGER NOT NULL,
+        cached_tokens INTEGER,
+        prompt_ms INTEGER,
+        generation_ms INTEGER,
         latency_ms INTEGER NOT NULL,
         status INTEGER NOT NULL,
         streamed INTEGER NOT NULL DEFAULT 0,
@@ -68,11 +71,13 @@ pub const SCHEMA: &[&str] = &[
     "CREATE INDEX IF NOT EXISTS idx_usage_user ON usage (user_id)",
 ];
 
-async fn has_column<'e, E>(db: E, column: &str) -> Result<bool, sqlx::Error>
+async fn has_column<'e, E>(db: E, table: &str, column: &str) -> Result<bool, sqlx::Error>
 where
     E: Executor<'e, Database = Sqlite>,
 {
-    let count = sqlx::query("SELECT COUNT(*) AS n FROM pragma_table_info('users') WHERE name = ?")
+    let statement =
+        format!("SELECT COUNT(*) AS n FROM pragma_table_info('{table}') WHERE name = ?",);
+    let count = sqlx::query(sqlx::AssertSqlSafe(statement.as_str()))
         .bind(column)
         .fetch_one(db)
         .await?
@@ -119,14 +124,14 @@ pub async fn connect(url: &str) -> Result<SqlitePool, sqlx::Error> {
 pub async fn migrate(pool: &SqlitePool) -> Result<(), sqlx::Error> {
     // An email with a UNIQUE constraint cannot be dropped, and a NOT NULL password cannot be
     // relaxed, so a table that is still in either shape is rebuilt.
-    if has_column(pool, "email").await?
+    if has_column(pool, "users", "email").await?
         || column_is_required(pool, "password_hash").await?
-        || !has_column(pool, "pending").await?
+        || !has_column(pool, "users", "pending").await?
     {
         rebuild_accounts(pool).await?;
     } else {
-        if !has_column(pool, "daily_token_cap").await? {
-            let statement = if has_column(pool, "token_cap").await? {
+        if !has_column(pool, "users", "daily_token_cap").await? {
+            let statement = if has_column(pool, "users", "token_cap").await? {
                 "ALTER TABLE users RENAME COLUMN token_cap TO daily_token_cap"
             } else {
                 "ALTER TABLE users ADD COLUMN daily_token_cap INTEGER"
@@ -135,26 +140,48 @@ pub async fn migrate(pool: &SqlitePool) -> Result<(), sqlx::Error> {
         }
         // A database created with a display name keeps it as the username, which keeps the existing
         // accounts and their sessions working; the email address is dropped with it.
-        if !has_column(pool, "username").await? {
-            let statement = if has_column(pool, "name").await? {
+        if !has_column(pool, "users", "username").await? {
+            let statement = if has_column(pool, "users", "name").await? {
                 "ALTER TABLE users RENAME COLUMN name TO username"
             } else {
                 "ALTER TABLE users ADD COLUMN username TEXT NOT NULL DEFAULT ''"
             };
             sqlx::query(statement).execute(pool).await?;
         }
-        if has_column(pool, "email").await? {
+        if has_column(pool, "users", "email").await? {
             sqlx::query("ALTER TABLE users DROP COLUMN email")
                 .execute(pool)
                 .await?;
         }
-        if !has_column(pool, "enabled").await? {
+        if !has_column(pool, "users", "enabled").await? {
             sqlx::query("ALTER TABLE users ADD COLUMN enabled INTEGER NOT NULL DEFAULT 1")
                 .execute(pool)
                 .await?;
         }
     }
+    // The columns are added before the key reference is rebuilt, so the copy that rebuild makes sees the
+    // same columns on both sides and a value an engine already reported for a row is not dropped with the
+    // table.
+    add_usage_columns(pool).await?;
     relax_key_reference(pool).await
+}
+
+// What an engine reported about a request is stored beside the token counts: the part of the prompt
+// served from its cache, and how long the prompt took against how long the answer took. Not every
+// engine reports any of this, so a row that has nothing is stored as null and is left unknown rather
+// than estimated. Columns are added, never rebuilt, so a database written before the change keeps its
+// rows and those rows read as unknown.
+async fn add_usage_columns(pool: &SqlitePool) -> Result<(), sqlx::Error> {
+    for column in ["cached_tokens", "prompt_ms", "generation_ms"] {
+        if has_column(pool, "usage", column).await? {
+            continue;
+        }
+        let statement = format!("ALTER TABLE usage ADD COLUMN {column} INTEGER");
+        sqlx::query(sqlx::AssertSqlSafe(statement.as_str()))
+            .execute(pool)
+            .await?;
+    }
+    Ok(())
 }
 
 // Recorded usage outlives the key it came in on: the counters measure what crossed the gate, so
@@ -188,6 +215,9 @@ async fn relax_key_reference(pool: &SqlitePool) -> Result<(), sqlx::Error> {
             prompt_tokens INTEGER NOT NULL,
             completion_tokens INTEGER NOT NULL,
             total_tokens INTEGER NOT NULL,
+            cached_tokens INTEGER,
+            prompt_ms INTEGER,
+            generation_ms INTEGER,
             latency_ms INTEGER NOT NULL,
             status INTEGER NOT NULL,
             streamed INTEGER NOT NULL DEFAULT 0,
@@ -197,12 +227,15 @@ async fn relax_key_reference(pool: &SqlitePool) -> Result<(), sqlx::Error> {
     )
     .execute(conn.as_mut())
     .await?;
-    // Both shapes have the same columns, so the rows move as they are.
+    // Both shapes have the same columns, so the rows move as they are, including what an engine
+    // reported about a request.
     sqlx::query(
         "INSERT INTO usage_new (id, api_key_id, user_id, connection_id, model, prompt_tokens, \
-                completion_tokens, total_tokens, latency_ms, status, streamed, estimated, created_at) \
+                completion_tokens, total_tokens, cached_tokens, prompt_ms, generation_ms, latency_ms, \
+                status, streamed, estimated, created_at) \
          SELECT id, api_key_id, user_id, connection_id, model, prompt_tokens, completion_tokens, \
-                total_tokens, latency_ms, status, streamed, estimated, created_at FROM usage",
+                total_tokens, cached_tokens, prompt_ms, generation_ms, latency_ms, status, streamed, \
+                estimated, created_at FROM usage",
     )
     .execute(conn.as_mut()).await?;
     sqlx::query("DROP TABLE usage")
@@ -226,23 +259,23 @@ async fn relax_key_reference(pool: &SqlitePool) -> Result<(), sqlx::Error> {
 // still resolve against the rebuilt table.
 async fn rebuild_accounts(pool: &SqlitePool) -> Result<(), sqlx::Error> {
     let mut conn = pool.acquire().await?;
-    let source_name = if has_column(conn.as_mut(), "name").await? {
+    let source_name = if has_column(conn.as_mut(), "users", "name").await? {
         "name"
     } else {
         "username"
     };
-    let source_cap = if has_column(conn.as_mut(), "token_cap").await? {
+    let source_cap = if has_column(conn.as_mut(), "users", "token_cap").await? {
         "token_cap"
     } else {
         "daily_token_cap"
     };
     // A table that never had these gets the defaults; a table that has them keeps what is stored.
-    let source_enabled = if has_column(conn.as_mut(), "enabled").await? {
+    let source_enabled = if has_column(conn.as_mut(), "users", "enabled").await? {
         "enabled"
     } else {
         "1"
     };
-    let source_pending = if has_column(conn.as_mut(), "pending").await? {
+    let source_pending = if has_column(conn.as_mut(), "users", "pending").await? {
         "pending"
     } else {
         "0"

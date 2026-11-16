@@ -59,13 +59,36 @@ fn tool_arguments(model: &str) -> Option<Vec<Value>> {
     }
 }
 
-// An OpenAI-compatible upstream with four behaviours: it reports usage, reports none, answers with a
-// reasoning section beside the answer, or answers with a tool call and nothing else. One of the tool
-// call shapes sends its pieces with a gap between them, so a client can tell a line forwarded as it
-// arrived from a line held until the stream ended.
+// An OpenAI-compatible upstream with several behaviours: it reports usage, reports none, reports a
+// prompt cache, reports a usage block with no token counts in it, reports timings in the llama.cpp
+// shape, answers with a reasoning section beside the answer, or answers with a tool call and nothing
+// else. One of the tool call shapes sends its pieces with a gap between them, so a client can tell a
+// line forwarded as it arrived from a line held until the stream ended.
 async fn mock_chat(Json(body): Json<Value>) -> Response {
     let model = body.get("model").and_then(Value::as_str).unwrap_or("");
-    let reports_usage = model == "reports-usage";
+    // What the upstream says about the request. Only some of the models say anything about the prompt
+    // cache, and only one gives timings, so a test can tell a field an engine reported from one it left
+    // out, and both shapes are read from wherever they appear in the body.
+    let usage = match model {
+        "reports-usage" => Some(json!({"prompt_tokens": 11, "completion_tokens": 7})),
+        "reports-cache" => Some(json!({
+            "prompt_tokens": 11,
+            "completion_tokens": 7,
+            "prompt_tokens_details": { "cached_tokens": 4 }
+        })),
+        "usage-without-counts" => Some(json!({ "prompt_tokens_details": { "cached_tokens": 4 } })),
+        _ => None,
+    };
+    let timings = (model == "llama-timings").then(|| {
+        json!({
+            "cache_n": 3,
+            "prompt_n": 9,
+            "prompt_ms": 120.5,
+            "predicted_n": 5,
+            "predicted_ms": 200.25
+        })
+    });
+    let says_anything = usage.is_some() || timings.is_some();
     if body.get("stream").and_then(Value::as_bool).unwrap_or(false) {
         let mut lines: Vec<String> = Vec::new();
         if model == "reasons" {
@@ -83,10 +106,17 @@ async fn mock_chat(Json(body): Json<Value>) -> Response {
                 "data: {\"choices\":[{\"delta\":{\"content\":\"hello world\"}}]}\n\n".to_string(),
             );
         }
-        if reports_usage {
-            lines.push(
-                "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":11,\"completion_tokens\":7}}\n\n".to_string(),
-            );
+        if says_anything {
+            // The last chunk of a stream is where a cache hit and the timings appear, so the mock puts
+            // them there rather than earlier.
+            let mut chunk = json!({ "choices": [] });
+            if let Some(block) = usage.as_ref() {
+                chunk["usage"] = block.clone();
+            }
+            if let Some(block) = timings.as_ref() {
+                chunk["timings"] = block.clone();
+            }
+            lines.push(format!("data: {chunk}\n\n"));
         }
         lines.push("data: [DONE]\n\n".to_string());
 
@@ -118,11 +148,13 @@ async fn mock_chat(Json(body): Json<Value>) -> Response {
     } else {
         json!({ "content": "hello world" })
     };
-    let payload = if reports_usage {
-        json!({ "choices": [{ "message": message }], "usage": { "prompt_tokens": 11, "completion_tokens": 7 } })
-    } else {
-        json!({ "choices": [{ "message": message }] })
-    };
+    let mut payload = json!({ "choices": [{ "message": message }] });
+    if let Some(block) = usage.as_ref() {
+        payload["usage"] = block.clone();
+    }
+    if let Some(block) = timings.as_ref() {
+        payload["timings"] = block.clone();
+    }
     Json(payload).into_response()
 }
 
@@ -354,7 +386,8 @@ async fn gateway_call(router: &Router, key: &str, body: Value) -> Response {
 async fn recorded_usage(pool: &SqlitePool) -> Vec<Value> {
     for _ in 0..50 {
         let rows = sqlx::query(
-            "SELECT connection_id, model, prompt_tokens, completion_tokens, total_tokens, status, estimated, streamed \
+            "SELECT connection_id, model, prompt_tokens, completion_tokens, total_tokens, \
+             cached_tokens, prompt_ms, generation_ms, status, estimated, streamed \
              FROM usage ORDER BY id",
         )
         .fetch_all(pool)
@@ -370,6 +403,9 @@ async fn recorded_usage(pool: &SqlitePool) -> Vec<Value> {
                         "prompt_tokens": row.get::<i64, _>("prompt_tokens"),
                         "completion_tokens": row.get::<i64, _>("completion_tokens"),
                         "total_tokens": row.get::<i64, _>("total_tokens"),
+                        "cached_tokens": row.get::<Option<i64>, _>("cached_tokens"),
+                        "prompt_ms": row.get::<Option<i64>, _>("prompt_ms"),
+                        "generation_ms": row.get::<Option<i64>, _>("generation_ms"),
                         "status": row.get::<i64, _>("status"),
                         "estimated": row.get::<i64, _>("estimated") != 0,
                         "streamed": row.get::<i64, _>("streamed") != 0,
@@ -504,6 +540,95 @@ async fn records_usage_reported_by_the_upstream() {
         usage[0]["model"], "reports-usage",
         "the key's connection default model is applied"
     );
+}
+
+#[tokio::test]
+async fn records_the_prompt_cache_and_timings_an_engine_reports() {
+    let st = test_state().await;
+    let router = build_router(st.clone());
+    let base_url = mock_upstream().await;
+    let cookie = register(&router, "ada").await;
+
+    post_json(
+        &router,
+        "/api/connections",
+        &cookie,
+        json!({ "name": "test", "base_url": base_url }),
+    )
+    .await;
+    let (_, created) =
+        post_json(&router, "/api/keys", &cookie, json!({ "name": "test key" })).await;
+    let key = created["key"].as_str().unwrap().to_string();
+
+    // Four engines with four shapes: one reports the prompt cache in the OpenAI-shaped usage block,
+    // one reports it and the timings as llama.cpp does, one reports only the token counts, and one
+    // reports a usage block with no counts in it.
+    for model in [
+        "reports-cache",
+        "llama-timings",
+        "reports-usage",
+        "usage-without-counts",
+    ] {
+        let response = gateway_call(
+            &router,
+            &key,
+            json!({ "model": model, "messages": [{ "role": "user", "content": "hi" }] }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    let usage = recorded_usage(&st.pool).await;
+    assert_eq!(usage[0]["cached_tokens"], 4);
+    assert_eq!(usage[0]["estimated"], false);
+    assert_eq!(usage[1]["cached_tokens"], 3);
+    assert_eq!(
+        usage[1]["prompt_ms"], 121,
+        "a timing is stored as whole milliseconds"
+    );
+    assert_eq!(usage[1]["generation_ms"], 200);
+    // A cache hit or a timing on its own does not make the counts figures the upstream gave, so the row
+    // for an engine that reports timings and no counts is still an estimate.
+    assert_eq!(usage[1]["estimated"], true);
+    assert_eq!(usage[2]["cached_tokens"], Value::Null);
+    assert_eq!(usage[2]["prompt_ms"], Value::Null);
+    assert_eq!(
+        usage[2]["generation_ms"],
+        Value::Null,
+        "an engine that reports nothing leaves the fields unknown, not zero"
+    );
+    assert_eq!(
+        usage[3]["estimated"], true,
+        "a usage block with no counts in it is not a report of counts"
+    );
+    assert_eq!(usage[3]["completion_tokens"], 4, "two words in the answer");
+    assert_eq!(
+        usage[3]["cached_tokens"], 4,
+        "the cache it did report is stored"
+    );
+
+    // The last chunk of a stream is where a cache hit and the timings appear, so a streamed request has
+    // to read them there.
+    for model in ["reports-cache", "llama-timings"] {
+        let response = gateway_call(
+            &router,
+            &key,
+            json!({
+                "model": model,
+                "stream": true,
+                "messages": [{ "role": "user", "content": "hi" }],
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        response.into_body().collect().await.unwrap();
+    }
+
+    let usage = recorded_usage(&st.pool).await;
+    assert_eq!(usage[4]["cached_tokens"], 4);
+    assert_eq!(usage[5]["cached_tokens"], 3);
+    assert_eq!(usage[5]["prompt_ms"], 121);
+    assert_eq!(usage[5]["generation_ms"], 200);
 }
 
 #[tokio::test]
@@ -1825,6 +1950,110 @@ async fn user_columns(pool: &SqlitePool) -> Vec<String> {
         .collect()
 }
 
+async fn usage_columns(pool: &SqlitePool) -> Vec<String> {
+    sqlx::query("SELECT name FROM pragma_table_info('usage') ORDER BY name")
+        .fetch_all(pool)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|row| row.get::<String, _>("name"))
+        .collect()
+}
+
+#[tokio::test]
+async fn the_usage_columns_are_added_to_a_database_written_before_them() {
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
+        .unwrap();
+    for statement in db::SCHEMA {
+        sqlx::query(*statement).execute(&pool).await.unwrap();
+    }
+
+    // A usage table as it was before a prompt cache or timings were recorded: no columns for them,
+    // and a row written with that shape.
+    sqlx::query("DROP TABLE usage")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "CREATE TABLE usage (
+            id INTEGER PRIMARY KEY,
+            api_key_id INTEGER REFERENCES api_keys(id) ON DELETE SET NULL,
+            user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            connection_id INTEGER REFERENCES connections(id) ON DELETE SET NULL,
+            model TEXT,
+            prompt_tokens INTEGER NOT NULL,
+            completion_tokens INTEGER NOT NULL,
+            total_tokens INTEGER NOT NULL,
+            latency_ms INTEGER NOT NULL,
+            status INTEGER NOT NULL,
+            streamed INTEGER NOT NULL DEFAULT 0,
+            estimated INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL
+        )",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query("INSERT INTO users (id, username, password_hash, role, created_at) VALUES (1, 'ada', 'hash', 'admin', '2026-01-01T00:00:00Z')")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO api_keys (id, user_id, name, key, created_at) VALUES (1, 1, 'key', 'dreamgate_test', '2026-01-01T00:00:00Z')")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO usage (api_key_id, user_id, model, prompt_tokens, completion_tokens, total_tokens, latency_ms, status, created_at) VALUES (1, 1, 'test-model', 11, 7, 18, 5, 200, '2026-01-01T00:00:00Z')")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    db::migrate(&pool).await.unwrap();
+
+    assert_eq!(
+        usage_columns(&pool).await.join(","),
+        "api_key_id,cached_tokens,completion_tokens,connection_id,created_at,estimated,generation_ms,id,latency_ms,model,prompt_ms,prompt_tokens,status,streamed,total_tokens,user_id"
+    );
+
+    // The row that was already there keeps its numbers and reads as unknown for what no engine
+    // reported for it.
+    let row = sqlx::query(
+        "SELECT model, prompt_tokens, completion_tokens, total_tokens, cached_tokens, prompt_ms, \
+         generation_ms FROM usage",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(row.get::<String, _>("model"), "test-model");
+    assert_eq!(row.get::<i64, _>("prompt_tokens"), 11);
+    assert_eq!(row.get::<i64, _>("completion_tokens"), 7);
+    assert_eq!(row.get::<i64, _>("total_tokens"), 18);
+    assert_eq!(row.get::<Option<i64>, _>("cached_tokens"), None);
+    assert_eq!(row.get::<Option<i64>, _>("prompt_ms"), None);
+    assert_eq!(
+        row.get::<Option<i64>, _>("generation_ms"),
+        None,
+        "a row written before the change reads as unknown"
+    );
+
+    // Running it again on a table that is already current changes nothing.
+    db::migrate(&pool).await.unwrap();
+    assert_eq!(usage_count(&pool, 1).await, 1);
+
+    // A new row can be written with the fields filled.
+    sqlx::query(
+        "INSERT INTO usage (api_key_id, user_id, model, prompt_tokens, completion_tokens, total_tokens, \
+         cached_tokens, prompt_ms, generation_ms, latency_ms, status, created_at) \
+         VALUES (1, 1, 'test-model', 11, 7, 18, 4, 121, 200, 5, 200, '2026-01-01T00:00:00Z')",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    assert_eq!(usage_count(&pool, 1).await, 2);
+}
+
 #[tokio::test]
 async fn a_database_that_takes_usage_with_a_deleted_key_is_moved_to_the_current_shape() {
     let pool = SqlitePoolOptions::new()
@@ -1874,8 +2103,28 @@ async fn a_database_that_takes_usage_with_a_deleted_key_is_moved_to_the_current_
         .execute(&pool)
         .await
         .unwrap();
+    // A value reported for a row on a database that already has the columns has to be carried across the
+    // rebuild, not dropped with the table it was written into.
+    sqlx::query("ALTER TABLE usage ADD COLUMN cached_tokens INTEGER")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE usage SET cached_tokens = 4")
+        .execute(&pool)
+        .await
+        .unwrap();
 
     db::migrate(&pool).await.unwrap();
+
+    assert_eq!(
+        sqlx::query("SELECT cached_tokens FROM usage")
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+            .get::<Option<i64>, _>("cached_tokens"),
+        Some(4),
+        "what an engine reported for a row outlives the rebuild"
+    );
 
     // The rows that were already recorded stand, and the key reference now sets the column null.
     sqlx::query("DELETE FROM api_keys WHERE id = 1")
