@@ -308,6 +308,7 @@ cargo test
 The suite runs the gateway against a mock OpenAI-compatible upstream and covers usage
 recording, estimation when the upstream reports nothing including reasoning text, SSE
 pass-through, that a client's reasoning level reaches the upstream unchanged, upstream failover,
+the round of health checks marking a connection that answers,
 the model recorded for a streamed request when nothing is pinned to a key or a connection,
 per-key limits and their validation, the keys list being the caller's own with the other
 accounts read by an admin alone, per-account daily token limits including the day

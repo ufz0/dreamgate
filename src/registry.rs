@@ -264,7 +264,7 @@ const MAX_HEALTH_CHECKS_AT_ONCE: usize = 8;
 pub async fn health_checker(st: State) {
     loop {
         let rows = sqlx::query(
-            "SELECT id, name, base_url, api_key, default_model, enabled, priority, health, last_checked_at \
+            "SELECT id, name, base_url, api_key, default_model, enabled, priority, health, last_checked_at, \
              max_concurrent FROM connections WHERE enabled = 1",
         )
         .fetch_all(&st.pool)
