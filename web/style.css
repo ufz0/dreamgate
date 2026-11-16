@@ -384,9 +384,10 @@ tr.off td { color: var(--text-muted); }
   box-shadow: var(--shadow-pop);
 }
 
-/* The theme control sits at the bottom of the shell, so its list always opens upward. The height is
-   not set here: app.js caps it to the room above the button when the menu is shown, because that is
-   the only moment the window size is known, and an uncapped list runs past the top on a short screen. */
+/* The theme control sits at the bottom of the shell, so its list always opens upward. The height is not
+   set here: app.js caps it to the room above the button when the menu is shown, because a stylesheet
+   knows the window size but not where the button is, and an uncapped list runs past the top of a short
+   screen. */
 .menu-wrap[data-name="theme"] .menu { top: auto; bottom: calc(100% + 4px); overflow: auto; }
 
 .menu li {
