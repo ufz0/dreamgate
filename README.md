@@ -123,10 +123,11 @@ panel is empty until there is traffic and clears when the gateway restarts, whic
 live reading rather than a figure in the database. Names in that panel are shown to an admin
 only, like the rest of the per-account data.
 
-Self-registration is closed by default as soon as the first account exists, because the first
-account to register is the admin. An admin can open it again from the Accounts view. While it is
-closed the entry screen opens on Sign in and `POST /api/register` answers 403, so an admin either
-opens registration or makes the account themselves from the Accounts view.
+Self-registration is closed by default as soon as the first account exists, because the first account
+to register is the admin. An admin can open it again from the Accounts view. The entry screen opens on
+Sign in whatever that setting says, and offers Register only while registration is open; while it is
+closed `POST /api/register` answers 403, so an admin either opens registration or makes the account
+themselves from the Accounts view.
 
 An account an admin makes has no password. The person who signs in with it for the first time
 chooses the password, and that is what is stored from then on; `POST /api/login` accepts whatever

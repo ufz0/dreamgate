@@ -927,15 +927,14 @@ function showAuth() {
   renderAuth();
 }
 
-// The entry screen offers Register only while registration is open. Once an account exists it
-// is closed by default, so the screen opens on Sign in and says why.
+// The entry screen opens on Sign in, because that is what an account with a password already does.
+// Register is offered only while registration is open, and the note says when it is closed.
 function renderAuth() {
   const open = state.settings.open_registration;
   $('first-account-note').hidden = state.settings.has_accounts;
   $('mode-register').hidden = !open;
   $('register-note').hidden = open;
-  showFirstPasswordNote();
-  if (!open) setMode('login');
+  setMode(mode);
 }
 
 // An account made by an admin has no password until the person signs in for the first time, so
@@ -956,7 +955,7 @@ function showShell() {
   ], state.theme, 'Theme', 'theme');
 }
 
-let mode = 'register';
+let mode = 'login';
 
 function setMode(next) {
   mode = next;
