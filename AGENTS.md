@@ -30,8 +30,8 @@ module that owns its data, not in `api.rs`, which is only the route table.
 ```sh
 cargo run                 # start the server on 0.0.0.0:8787
 cargo test                # all tests
-cargo fmt                 # before committing
 cargo clippy --all-targets -- -D warnings
+cargo fmt --check         # does not pass on the existing code, see Conventions
 ```
 
 The dashboard has no build step. Serving it is just the static file handler, so
@@ -39,13 +39,19 @@ changes to `web/` take effect on reload.
 
 ## Conventions
 
-- Rust 2024 edition. Formatted with `cargo fmt`; keep imports grouped the way the
-  existing files do.
+- Rust 2024 edition. Clippy is clean and the tests pass, but the existing code does
+  not pass `cargo fmt --check`: lines are wrapped by hand. Write in the style of the
+  file you are in, and do not run `cargo fmt` over a file just to satisfy a check —
+  it produces a diff that has nothing to do with the change. Adopting rustfmt is its
+  own branch, not part of a change.
 - Comments are full sentences that explain *why*, not what. A comment that restates
   the code is noise; one that records a constraint the code cannot express is worth
   keeping. Match the style already in `src/db.rs` and `src/auth.rs`.
-- Naming is plain and British-leaning in the prose: "connection", "key", "account".
-  Do not introduce synonyms for things that already have a name.
+- Naming follows what the repository already uses, even where code and prose do not
+  agree: the table is `users` and the columns are `user_id`, while the README and the
+  dashboard say account. An upstream is called a connection. Use the word the file you
+  are editing already uses, do not invent a third for something that has a name, and
+  do not rename a stored column to match prose.
 - Schema changes go through `src/db.rs` as migrations applied on start, not by editing
   a fresh table only. Existing databases must survive the change, and the values
   already stored keep their meaning.
@@ -71,16 +77,17 @@ changes to `web/` take effect on reload.
 - Commit messages are descriptive sentences in the style of the existing history
   ("Recorded usage outlives its key, and a key that is off reads dimmer"), not
   labels like `feat: update`.
-- Before opening the pull request: `cargo fmt`, `cargo test`, and
-  `cargo clippy --all-targets -- -D warnings` must pass.
+- Before opening the pull request: `cargo test` and
+  `cargo clippy --all-targets -- -D warnings` must pass. `cargo fmt --check` is not
+  expected to pass on files you did not write.
 - The pull request description says what the change does and why, at the level of
   behaviour rather than of files.
 
 ## Reviewing new features
 
-A new feature is reviewed by an independent sub-agent before it is pushed. The
-reviewer works from the diff and the specification in `README.md`, not from the
-author's summary, and checks:
+A change that adds behaviour is reviewed by an independent reviewer before it is
+pushed, and that reviewer is not the author. It works from the diff and the
+specification in `README.md`, not from the author's summary, and checks:
 
 - the feature does what it claims, including the edge cases (empty values, deleted
   keys, accounts that are not approved yet);
@@ -92,25 +99,39 @@ author's summary, and checks:
 The author implements what the review finds, and the review result is recorded in
 the pull request. Fixes from a review go on the same branch, not on a new one.
 
+A change that does not add behaviour — documentation, a comment, a rename — does not
+need a review, and says so in the checklist instead of pretending to have had one.
+
+Nothing here is enforced by CI or branch protection, so the review and the checklist
+are the only control. A pull request may be merged once the checklist is filled in
+honestly, and a change that adds behaviour only after its review is recorded.
+
 ## Pull request checklist
 
 Every pull request ends with this checklist, checked against the rules as they
 stand in this file at the time of the pull request, not as they were when the
-branch was cut. The form is `.github/PULL_REQUEST_TEMPLATE.md`; fill it in as
-part of the description, and mark an item `n/a` only when it genuinely does not
-apply, saying why.
+branch was cut. This section is the only copy of the list:
+`.github/PULL_REQUEST_TEMPLATE.md` points here instead of keeping its own, which is
+how the two would drift.
+
+The author fills it in. There is no CI and no branch protection, so an item is an
+assertion in the description rather than something the repository can verify on its
+own. Mark an item `n/a` only when it genuinely does not apply, with the reason, and
+leave an item unchecked rather than quietly dropping it.
 
 - [ ] One branch, one change, opened against `main`; nothing pushed to `main`
-- [ ] `cargo fmt`, `cargo test`, and `cargo clippy --all-targets -- -D warnings` pass
-- [ ] New behaviour reviewed by an independent sub-agent, and the result recorded in the description
+- [ ] `cargo test` and `cargo clippy --all-targets -- -D warnings` pass; `cargo fmt --check` is allowed to fail on code this change did not write, saying so
+- [ ] If the change adds behaviour: reviewed by a reviewer who is not the author, and the result recorded in the description
 - [ ] Edge cases considered: empty values, deleted keys, accounts that are not approved yet
 - [ ] No existing behaviour changed silently; migrations hold for a database written before the change
 - [ ] Tests cover the new behaviour, or the reason they do not is stated
 - [ ] `README.md` matches the behaviour the code now has
-- [ ] Comments and naming follow the conventions above; no dependency added without a reason
+- [ ] Naming follows what the files being changed already use; no dependency added without a reason; no file reformatted that this change did not touch
 
 ## A few things to leave alone
 
 - `data/` and `target/` are gitignored and are runtime state; do not commit them.
-- Streaming is a pass-through on purpose. Do not transform request bodies.
+- Streaming is a pass-through on purpose, apart from the `stream_options` field the
+  gateway adds so upstreams that can report usage will. Nothing else in a request body
+  is changed.
 - An estimate must not be presented as a number the upstream reported.
