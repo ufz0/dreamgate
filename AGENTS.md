@@ -30,8 +30,8 @@ module that owns its data, not in `api.rs`, which is only the route table.
 ```sh
 cargo run                 # start the server on 0.0.0.0:8787
 cargo test                # all tests
+cargo fmt                 # before committing; CI checks cargo fmt --check
 cargo clippy --all-targets -- -D warnings
-cargo fmt --check         # does not pass on the existing code, see Conventions
 ```
 
 The dashboard has no build step. Serving it is just the static file handler, so
@@ -39,11 +39,9 @@ changes to `web/` take effect on reload.
 
 ## Conventions
 
-- Rust 2024 edition. Clippy is clean and the tests pass, but the existing code does
-  not pass `cargo fmt --check`: lines are wrapped by hand. Write in the style of the
-  file you are in, and do not run `cargo fmt` over a file just to satisfy a check —
-  it produces a diff that has nothing to do with the change. Adopting rustfmt is its
-  own branch, not part of a change.
+- Rust 2024 edition. The code is formatted with rustfmt and CI checks `cargo fmt --check`, so run
+  `cargo fmt` before committing and leave the files as rustfmt writes them. Comments are wrapped by
+  hand, because rustfmt does not reflow them.
 - Comments are full sentences that explain *why*, not what. A comment that restates
   the code is noise; one that records a constraint the code cannot express is worth
   keeping. Match the style already in `src/db.rs` and `src/auth.rs`.
@@ -77,13 +75,13 @@ changes to `web/` take effect on reload.
 - Commit messages are descriptive sentences in the style of the existing history
   ("Recorded usage outlives its key, and a key that is off reads dimmer"), not
   labels like `feat: update`.
-- Before opening the pull request: `cargo test` and
-  `cargo clippy --all-targets -- -D warnings` must pass. `cargo fmt --check` is not
-  expected to pass on files you did not write.
-- CI runs clippy and the tests on every pull request, so a change that does not pass
-  them is visible before it is merged. `.github/workflows/ci.yml` is deliberately small:
-  no `cargo fmt --check`, because the existing code does not pass it, and nothing else
-  that could fail for a reason unrelated to the change.
+- Before opening the pull request: `cargo fmt`, `cargo test`, and
+  `cargo clippy --all-targets -- -D warnings` must pass.
+- CI runs on every pull request, and each rule it can check appears there as its own check: the
+  base branch, `cargo fmt --check`, clippy, the tests, and the description — that the checklist is
+  present and filled in, and that a review is recorded or the change says it adds no behaviour. The
+  toolchain is pinned to the minimum rustc that edition 2024 needs, so the build does not move on
+  its own, and nothing else is in CI: a failure always says something about the change.
 - The pull request description says what the change does and why, at the level of
   behaviour rather than of files.
 
@@ -106,10 +104,9 @@ the pull request. Fixes from a review go on the same branch, not on a new one.
 A change that does not add behaviour — documentation, a comment, a rename — does not
 need a review, and says so in the checklist instead of pretending to have had one.
 
-CI enforces the tests and clippy. The review and the checklist are the only control for
-everything else, and there is no branch protection. A pull request may be merged once CI
-is green and the checklist is filled in honestly, and a change that adds behaviour only
-after its review is recorded.
+CI reports checks; it cannot block a merge by itself, because this repository has no branch
+protection. A pull request may be merged once its checks are green and the checklist is filled in
+honestly, and a change that adds behaviour only after its review is recorded.
 
 ## Pull request checklist
 
@@ -119,15 +116,15 @@ branch was cut. This section is the only copy of the list:
 `.github/PULL_REQUEST_TEMPLATE.md` points here instead of keeping its own, which is
 how the two would drift.
 
-The author fills it in. CI runs clippy and the tests on every pull request, so those
-two items are checked by the build rather than by the author's word; everything else in
-the list is still an assertion in the description, because nothing else can verify it.
-Mark an item `n/a` only when it genuinely does not apply, with the reason, and
-leave an item unchecked rather than quietly dropping it.
+The author fills it in. CI cannot tick a box, so the list stays the author's. What CI can check,
+it fails on: the base branch, formatting, clippy, the tests, and whether the description carries this
+list filled in and a recorded review. Everything else in the list is an assertion in the description,
+because nothing else can verify it. Mark an item `n/a` only when it genuinely does not apply, with
+the reason, and leave an item unchecked rather than quietly dropping it.
 
-- [ ] One branch, one change, opened against `main`; nothing pushed to `main`
-- [ ] `cargo test` and `cargo clippy --all-targets -- -D warnings` pass — CI runs them on every pull request; `cargo fmt --check` is not in CI, because the existing code does not pass it
-- [ ] If the change adds behaviour: reviewed by a reviewer who is not the author, and the result recorded in the description
+- [ ] One branch, one change, opened against `main`; nothing pushed to `main` — CI checks the base branch
+- [ ] `cargo fmt --check`, clippy and the tests pass — CI runs them, with `--locked` so the committed dependency set is checked rather than resolved
+- [ ] If the change adds behaviour: reviewed by a reviewer who is not the author, and the result recorded in the description — CI can only see that the description says one or the other
 - [ ] Edge cases considered: empty values, deleted keys, accounts that are not approved yet
 - [ ] No existing behaviour changed silently; migrations hold for a database written before the change
 - [ ] Tests cover the new behaviour, or the reason they do not is stated

@@ -2,31 +2,77 @@ name: ci
 
 on:
   pull_request:
-  push:
-    branches: [main]
 
+# The description check reads the pull request itself, so it needs pull: read as well as the code.
 permissions:
   contents: read
+  pull: read
 
 jobs:
-  clippy-and-tests:
-    name: clippy and tests
+  format:
+    name: format
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
+      # Pinned to the minimum rustc that edition 2024 needs, so the build does not move on its own.
+      - uses: dtolnay/rust-toolchain@1.85
+      - run: cargo fmt --check
 
-      - uses: dtolnay/rust-toolchain@stable
+  clippy:
+    name: clippy
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.85
+      - run: cargo clippy --all-targets --locked -D warnings
 
-      - name: Cache the build
-        uses: actions/cache@v4
-        with:
-          path: target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
+  tests:
+    name: tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.85
+      - run: cargo test --locked
 
-      # Every step below is expected to exit non-zero when it finds something, so a failing
-      # check is what stops the pull request.
-      - name: Clippy
-        run: cargo clippy --all-targets -- -D warnings
+  description:
+    name: checklist
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - run: |
+          set -eu
 
-      - name: Tests
-        run: cargo test
+          pr=$(gh api "repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }}")
+          base=$(printf '%s' "$pr" | jq -r .base.ref)
+          body=$(printf '%s' "$pr" | jq -r .body)
+
+          if [ "$base" != "main" ]; then
+            echo "opened against $base, but a change reaches main through a pull request to main"
+            exit 1
+          fi
+
+          if ! printf '%s' "$body" | grep -q '^## Checklist'; then
+            echo "no checklist section in the description"
+            exit 1
+          fi
+
+          items=$(grep -c '^- \[' AGENTS.md || true)
+          filled=$(printf '%s' "$body" | grep -c '^- \[x\]' || true)
+          if [ "$filled" -lt "$items" ]; then
+            echo "$filled of $items items are filled in; leave an item unchecked rather than dropping it"
+            exit 1
+          fi
+
+          if printf '%s' "$body" | grep -q '^- \[ \]'; then
+            echo "an item is left unchecked without a reason"
+            exit 1
+          fi
+
+          if ! printf '%s' "$body" | grep -q '^## Review'; then
+            echo "the description does not say whether the change was reviewed, or that it adds no behaviour"
+            exit 1
+          fi
