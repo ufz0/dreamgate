@@ -41,7 +41,9 @@ changes to `web/` take effect on reload.
 
 - Rust 2024 edition. The code is formatted with rustfmt and CI checks `cargo fmt --check`, so run
   `cargo fmt` before committing and leave the files as rustfmt writes them. Comments are wrapped by
-  hand, because rustfmt does not reflow them.
+  hand, because rustfmt does not reflow them. CI checks formatting with the rustfmt of the toolchain
+  it pins (1.85); a newer rustfmt can wrap differently, so a version difference can make CI disagree
+  with your editor — format with the pinned one rather than arguing about the style.
 - Comments are full sentences that explain *why*, not what. A comment that restates
   the code is noise; one that records a constraint the code cannot express is worth
   keeping. Match the style already in `src/db.rs` and `src/auth.rs`.
@@ -77,11 +79,11 @@ changes to `web/` take effect on reload.
   labels like `feat: update`.
 - Before opening the pull request: `cargo fmt`, `cargo test`, and
   `cargo clippy --all-targets -- -D warnings` must pass.
-- CI runs on every pull request, and each rule it can check appears there as its own check: the
-  base branch, `cargo fmt --check`, clippy, the tests, and the description — that the checklist is
-  present and filled in, and that a review is recorded or the change says it adds no behaviour. The
-  toolchain is pinned to the minimum rustc that edition 2024 needs, so the build does not move on
-  its own, and nothing else is in CI: a failure always says something about the change.
+- CI runs on every pull request, and each rule it can check appears there as its own check: the base
+  branch, `cargo fmt --check`, clippy, the tests, and the description — that every checklist item is
+  answered and the Review section says the findings or that the change adds no behaviour. The toolchain
+  is pinned to the minimum rustc that edition 2024 needs, so the build does not move on its own, and
+  nothing else is in CI: a failure always says something about the change.
 - The pull request description says what the change does and why, at the level of
   behaviour rather than of files.
 
@@ -116,11 +118,13 @@ branch was cut. This section is the only copy of the list:
 `.github/PULL_REQUEST_TEMPLATE.md` points here instead of keeping its own, which is
 how the two would drift.
 
-The author fills it in. CI cannot tick a box, so the list stays the author's. What CI can check,
-it fails on: the base branch, formatting, clippy, the tests, and whether the description carries this
-list filled in and a recorded review. Everything else in the list is an assertion in the description,
-because nothing else can verify it. Mark an item `n/a` only when it genuinely does not apply, with
-the reason, and leave an item unchecked rather than quietly dropping it.
+The author fills it in. Every item is answered: ticked, or marked `n/a` with the reason when it
+genuinely does not apply. CI cannot tick a box, so the list stays the author's, but it counts the
+answers and fails when the description has fewer answered items than the list, or an item that is
+neither ticked nor marked `n/a` — which is what dropping an item quietly used to mean. Everything the
+checklist asks that CI cannot check (a judgement, a review, whether the README matches) stays an
+assertion in the description, and the description is read from the copy of this file that the pull
+request itself carries, so a pull request that changes the list is held to its own version of it.
 
 - [ ] One branch, one change, opened against `main`; nothing pushed to `main` — CI checks the base branch
 - [ ] `cargo fmt --check`, clippy and the tests pass — CI runs them, with `--locked` so the committed dependency set is checked rather than resolved
