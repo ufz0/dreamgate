@@ -314,11 +314,16 @@ function namedPresence(presence) {
 }
 
 // One lookup at a time, and only the names are taken from it: the counts on the page stay the ones the
-// latest event carried, which a slower answer to an older lookup would otherwise overwrite.
+// latest event carried, which a slower answer to an older lookup would otherwise overwrite. An account
+// that started while a lookup was out is looked up when it returns, and an answer that arrives after
+// sign out is dropped, because the names belong to the admin who asked.
+const unnamed = () => state.me?.role === 'admin' && state.presence.users.length < (state.presence.generating_ids || []).length;
+
 function nameUnknown() {
   if (naming) return;
   naming = api('/api/presence')
     .then((presence) => {
+      if (!state.me) return;
       for (const user of presence.users || []) names.set(user.id, user.username);
       state.presence = namedPresence(state.presence);
       render(false);
@@ -326,6 +331,7 @@ function nameUnknown() {
     .catch(() => {})
     .finally(() => {
       naming = null;
+      if (unnamed()) nameUnknown();
     });
 }
 
@@ -370,6 +376,13 @@ function countTotals(totals, event) {
 function subscribe() {
   if (state.live) state.live.close();
   state.live = new EventSource('/api/live');
+  // A live stream that is refused rather than dropped, as an expired session's is, is not tried again, so
+  // what it last said about the streams in flight would stand for good; it is taken off the page instead.
+  state.live.onerror = () => {
+    if (state.live?.readyState !== EventSource.CLOSED) return;
+    state.progress = { shares: [], streams: [] };
+    renderProgress();
+  };
   state.live.onmessage = (message) => {
     const payload = JSON.parse(message.data);
     if (payload.type === 'snapshot') {
@@ -383,7 +396,7 @@ function subscribe() {
     }
     if (payload.type === 'presence') {
       state.presence = namedPresence(payload.presence);
-      if (state.me.role === 'admin' && state.presence.users.length < (payload.presence.generating_ids || []).length) nameUnknown();
+      if (unnamed()) nameUnknown();
       render(false);
       return;
     }

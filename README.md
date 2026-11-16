@@ -122,8 +122,9 @@ the reading of a stream and the writing of the usage row are all async, and noth
 request behind another: no lock is held across an upstream request or across a stream. The three locks in the
 process — the presence counts and the streams in flight, the sign-in windows, and the map of per-connection
 limits — are held for a few instructions and released before anything is awaited, so they are plain mutexes
-rather than async ones: there is nothing to hold across an await, and the presence count and a stream's place
-on the list are released from a `Drop`, which cannot await. A
+rather than async ones: there is nothing to hold across an await, the presence count is released from a `Drop`,
+which cannot await, and a stream's place on the list is released in the step that sends its row or, for a
+stream that ends without one, from a `Drop`, neither of which awaits. A
 stream runs on its own task, and the slots its request was given are returned when the stream ends, not when
 the handler returned, so a long stream is counted as being in flight for as long as it is, and a request that
 arrives while a single-slot stream is running is answered as full rather than made to wait.
