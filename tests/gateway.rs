@@ -457,6 +457,68 @@ async fn first_registered_account_is_admin() {
 }
 
 #[tokio::test]
+async fn a_taken_username_is_named_when_registering() {
+    let st = test_state().await;
+    let router = build_router(st.clone());
+
+    let admin = register(&router, "ada").await;
+    open_registration(&router, &admin).await;
+
+    // Approval is on, so this account is held, and a held account's name is taken all the same.
+    let (status, body) = post_json(
+        &router,
+        "/api/register",
+        "",
+        json!({ "username": "ben", "password": "test-password" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["pending"], true);
+
+    // The entry screen shows the response's message when it is a short sentence, so this is what a
+    // person reads rather than the driver's text. The name is trimmed before it is stored, and the
+    // trimmed name is the one reported.
+    for attempt in ["ben", " ben "] {
+        let (status, body) = post_json(
+            &router,
+            "/api/register",
+            "",
+            json!({ "username": attempt, "password": "test-password" }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(
+            body["error"]["message"],
+            "the username ben is already taken"
+        );
+    }
+
+    // An insert that fails for another reason is a server error, not a taken name. A trigger that
+    // refuses every insert stands in for a database that cannot take the row.
+    sqlx::query(
+        "CREATE TRIGGER refuse_accounts BEFORE INSERT ON users BEGIN SELECT RAISE(ABORT, 'refused'); END",
+    )
+    .execute(&st.pool)
+    .await
+    .unwrap();
+    let (status, body) = post_json(
+        &router,
+        "/api/register",
+        "",
+        json!({ "username": "cy", "password": "test-password" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(body["error"]["type"], "server_error");
+    assert!(
+        !body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("already taken")
+    );
+}
+
+#[tokio::test]
 async fn registration_setting_is_read_before_sign_in_and_only_an_admin_can_change_it() {
     let st = test_state().await;
     let router = build_router(st.clone());

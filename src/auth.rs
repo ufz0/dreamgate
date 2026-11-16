@@ -254,7 +254,23 @@ pub async fn register(
     .await
     {
         Ok(row) => row,
-        Err(err) => return error(StatusCode::CONFLICT, "invalid_request", err.to_string()),
+        // A name that is taken is named rather than answered with the driver text. The username is the
+        // only unique column on users, so a unique violation here can only mean that; a failure for any
+        // other reason is not dressed up as a taken name.
+        Err(sqlx::Error::Database(db)) if db.is_unique_violation() => {
+            return error(
+                StatusCode::CONFLICT,
+                "invalid_request",
+                format!("the username {username} is already taken"),
+            );
+        }
+        Err(err) => {
+            return error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "server_error",
+                err.to_string(),
+            );
+        }
     };
     let id = row.get::<i64, _>("id");
     if pending {
