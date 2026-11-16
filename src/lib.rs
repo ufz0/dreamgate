@@ -14,7 +14,7 @@ pub mod tokens;
 pub mod usage;
 pub mod users;
 
-use axum::{middleware, routing, Router};
+use axum::{Router, middleware, routing};
 use tower_http::services::ServeDir;
 
 use crate::state::State;
@@ -37,18 +37,36 @@ pub fn build_router(st: State) -> Router {
         .route("/live", routing::get(live::stream_events))
         .route("/keys", routing::get(keys::list).post(keys::create))
         .route("/keys/others", routing::get(keys::other_accounts))
-        .route("/keys/{id}", routing::patch(keys::update).delete(keys::delete))
+        .route(
+            "/keys/{id}",
+            routing::patch(keys::update).delete(keys::delete),
+        )
         .route("/users", routing::post(users::create))
-        .route("/users/{id}", routing::patch(users::update).delete(users::remove))
-        .route("/connections", routing::get(registry::list).post(registry::create))
+        .route(
+            "/users/{id}",
+            routing::patch(users::update).delete(users::remove),
+        )
+        .route(
+            "/connections",
+            routing::get(registry::list).post(registry::create),
+        )
         .route("/connections/{id}", routing::delete(registry::remove))
-        .route("/connections/{id}/check", routing::post(registry::health_check))
-        .layer(middleware::from_fn_with_state(st.clone(), auth::require_session));
+        .route(
+            "/connections/{id}/check",
+            routing::post(registry::health_check),
+        )
+        .layer(middleware::from_fn_with_state(
+            st.clone(),
+            auth::require_session,
+        ));
 
     Router::new()
         .route("/health", routing::get(|| async { "ok" }))
         .route("/v1/models", routing::get(gateway::list_models))
-        .route("/v1/chat/completions", routing::post(gateway::chat_completions))
+        .route(
+            "/v1/chat/completions",
+            routing::post(gateway::chat_completions),
+        )
         .nest("/api", public.merge(private))
         .fallback_service(ServeDir::new("web"))
         .with_state(st)

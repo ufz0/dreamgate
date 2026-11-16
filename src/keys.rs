@@ -38,9 +38,16 @@ const KEY_SQL: &str = "SELECT k.id, k.name, k.key, k.model, k.connection_id, k.e
  LEFT JOIN connections c ON c.id = k.connection_id \
  JOIN users u ON u.id = k.user_id {scope} GROUP BY k.id ORDER BY tokens DESC";
 
-async fn key_rows(st: &State, scope: &str, user_id: i64) -> Result<Vec<serde_json::Value>, sqlx::Error> {
+async fn key_rows(
+    st: &State,
+    scope: &str,
+    user_id: i64,
+) -> Result<Vec<serde_json::Value>, sqlx::Error> {
     let sql = KEY_SQL.replace("{scope}", scope);
-    let rows = sqlx::query(sqlx::AssertSqlSafe(sql.as_str())).bind(user_id).fetch_all(&st.pool).await?;
+    let rows = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
+        .bind(user_id)
+        .fetch_all(&st.pool)
+        .await?;
     Ok(rows
         .iter()
         .map(|row| {
@@ -66,29 +73,55 @@ async fn key_rows(st: &State, scope: &str, user_id: i64) -> Result<Vec<serde_jso
 pub async fn list(AxumState(st): AxumState<State>, caller: Caller) -> Response {
     match key_rows(&st, "WHERE k.user_id = ?", caller.id).await {
         Ok(keys) => Json(json!({ "keys": keys })).into_response(),
-        Err(err) => error(StatusCode::INTERNAL_SERVER_ERROR, "server_error", err.to_string()),
+        Err(err) => error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "server_error",
+            err.to_string(),
+        ),
     }
 }
 
 // Keys that belong to someone else, for an admin.
 pub async fn other_accounts(AxumState(st): AxumState<State>, caller: Caller) -> Response {
     if caller.role != "admin" {
-        return error(StatusCode::FORBIDDEN, "forbidden", "only an admin can see keys from other accounts");
+        return error(
+            StatusCode::FORBIDDEN,
+            "forbidden",
+            "only an admin can see keys from other accounts",
+        );
     }
     match key_rows(&st, "WHERE k.user_id != ?", caller.id).await {
         Ok(keys) => Json(json!({ "keys": keys })).into_response(),
-        Err(err) => error(StatusCode::INTERNAL_SERVER_ERROR, "server_error", err.to_string()),
+        Err(err) => error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "server_error",
+            err.to_string(),
+        ),
     }
 }
 
-pub async fn create(AxumState(st): AxumState<State>, caller: Caller, Json(body): Json<CreateKey>) -> Response {
+pub async fn create(
+    AxumState(st): AxumState<State>,
+    caller: Caller,
+    Json(body): Json<CreateKey>,
+) -> Response {
     let name = body.name.trim().to_string();
     if name.is_empty() {
-        return error(StatusCode::BAD_REQUEST, "invalid_request", "name is required");
+        return error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "name is required",
+        );
     }
     // A limit of 0 would refuse every request, so a limit is a positive number or absent.
-    if body.rpm_limit.is_some_and(|value| value < 1) || body.token_cap.is_some_and(|value| value < 1) {
-        return error(StatusCode::BAD_REQUEST, "invalid_request", "limits must be a positive number, or left unset");
+    if body.rpm_limit.is_some_and(|value| value < 1)
+        || body.token_cap.is_some_and(|value| value < 1)
+    {
+        return error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "limits must be a positive number, or left unset",
+        );
     }
     let key = format!("dreamgate_{}", Uuid::new_v4().simple());
     let result = sqlx::query(
@@ -107,11 +140,20 @@ pub async fn create(AxumState(st): AxumState<State>, caller: Caller, Json(body):
     .await;
     match result {
         Ok(row) => Json(json!({ "id": row.get::<i64, _>("id"), "key": key })).into_response(),
-        Err(err) => error(StatusCode::INTERNAL_SERVER_ERROR, "server_error", err.to_string()),
+        Err(err) => error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "server_error",
+            err.to_string(),
+        ),
     }
 }
 
-pub async fn update(AxumState(st): AxumState<State>, Path(id): Path<i64>, caller: Caller, Json(body): Json<UpdateKey>) -> Response {
+pub async fn update(
+    AxumState(st): AxumState<State>,
+    Path(id): Path<i64>,
+    caller: Caller,
+    Json(body): Json<UpdateKey>,
+) -> Response {
     if caller.role != "admin" {
         let owns = sqlx::query("SELECT user_id FROM api_keys WHERE id = ?")
             .bind(id)
@@ -121,7 +163,13 @@ pub async fn update(AxumState(st): AxumState<State>, Path(id): Path<i64>, caller
             .flatten();
         match owns {
             Some(row) if row.get::<i64, _>("user_id") == caller.id => {}
-            Some(_) => return error(StatusCode::FORBIDDEN, "forbidden", "you can only change your own key"),
+            Some(_) => {
+                return error(
+                    StatusCode::FORBIDDEN,
+                    "forbidden",
+                    "you can only change your own key",
+                );
+            }
             None => return error(StatusCode::NOT_FOUND, "not_found", "key not found"),
         }
     }
@@ -142,11 +190,19 @@ pub async fn update(AxumState(st): AxumState<State>, Path(id): Path<i64>, caller
     .await;
     match result {
         Ok(_) => Json(json!({ "ok": true })).into_response(),
-        Err(err) => error(StatusCode::INTERNAL_SERVER_ERROR, "server_error", err.to_string()),
+        Err(err) => error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "server_error",
+            err.to_string(),
+        ),
     }
 }
 
-pub async fn delete(AxumState(st): AxumState<State>, Path(id): Path<i64>, caller: Caller) -> Response {
+pub async fn delete(
+    AxumState(st): AxumState<State>,
+    Path(id): Path<i64>,
+    caller: Caller,
+) -> Response {
     if caller.role != "admin" {
         let owns = sqlx::query("SELECT user_id FROM api_keys WHERE id = ?")
             .bind(id)
@@ -156,13 +212,26 @@ pub async fn delete(AxumState(st): AxumState<State>, Path(id): Path<i64>, caller
             .flatten();
         match owns {
             Some(row) if row.get::<i64, _>("user_id") == caller.id => {}
-            Some(_) => return error(StatusCode::FORBIDDEN, "forbidden", "you can only delete your own key"),
+            Some(_) => {
+                return error(
+                    StatusCode::FORBIDDEN,
+                    "forbidden",
+                    "you can only delete your own key",
+                );
+            }
             None => return error(StatusCode::NOT_FOUND, "not_found", "key not found"),
         }
     }
-    let result = sqlx::query("DELETE FROM api_keys WHERE id = ?").bind(id).execute(&st.pool).await;
+    let result = sqlx::query("DELETE FROM api_keys WHERE id = ?")
+        .bind(id)
+        .execute(&st.pool)
+        .await;
     match result {
         Ok(_) => Json(json!({ "ok": true })).into_response(),
-        Err(err) => error(StatusCode::INTERNAL_SERVER_ERROR, "server_error", err.to_string()),
+        Err(err) => error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "server_error",
+            err.to_string(),
+        ),
     }
 }

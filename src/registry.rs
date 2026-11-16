@@ -72,7 +72,10 @@ pub async fn check(st: &State, connection: &Connection) -> StatusCode {
     let result = st
         .http
         .get(&url)
-        .header("Authorization", format!("Bearer {}", connection.api_key.clone().unwrap_or_default()))
+        .header(
+            "Authorization",
+            format!("Bearer {}", connection.api_key.clone().unwrap_or_default()),
+        )
         .timeout(Duration::from_secs(10))
         .send()
         .await;
@@ -131,17 +134,33 @@ pub async fn list(AxumState(st): AxumState<State>, caller: Caller) -> Response {
     Json(json!({ "connections": out })).into_response()
 }
 
-pub async fn create(AxumState(st): AxumState<State>, caller: Caller, Json(body): Json<CreateConnection>) -> Response {
+pub async fn create(
+    AxumState(st): AxumState<State>,
+    caller: Caller,
+    Json(body): Json<CreateConnection>,
+) -> Response {
     if caller.role != "admin" {
-        return error(StatusCode::FORBIDDEN, "forbidden", "only an admin can add a connection");
+        return error(
+            StatusCode::FORBIDDEN,
+            "forbidden",
+            "only an admin can add a connection",
+        );
     }
     let name = body.name.trim().to_string();
     let base_url = body.base_url.trim().to_string();
     if name.is_empty() || base_url.is_empty() {
-        return error(StatusCode::BAD_REQUEST, "invalid_request", "name and base_url are required");
+        return error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "name and base_url are required",
+        );
     }
     if !base_url.starts_with("http://") && !base_url.starts_with("https://") {
-        return error(StatusCode::BAD_REQUEST, "invalid_request", "base_url must start with http:// or https://");
+        return error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "base_url must start with http:// or https://",
+        );
     }
     let row = sqlx::query(
         "INSERT INTO connections (name, base_url, api_key, default_model, priority, created_at) \
@@ -161,20 +180,43 @@ pub async fn create(AxumState(st): AxumState<State>, caller: Caller, Json(body):
     }
 }
 
-pub async fn remove(AxumState(st): AxumState<State>, Path(id): Path<i64>, caller: Caller) -> Response {
+pub async fn remove(
+    AxumState(st): AxumState<State>,
+    Path(id): Path<i64>,
+    caller: Caller,
+) -> Response {
     if caller.role != "admin" {
-        return error(StatusCode::FORBIDDEN, "forbidden", "only an admin can remove a connection");
+        return error(
+            StatusCode::FORBIDDEN,
+            "forbidden",
+            "only an admin can remove a connection",
+        );
     }
-    let result = sqlx::query("DELETE FROM connections WHERE id = ?").bind(id).execute(&st.pool).await;
+    let result = sqlx::query("DELETE FROM connections WHERE id = ?")
+        .bind(id)
+        .execute(&st.pool)
+        .await;
     match result {
         Ok(_) => Json(json!({ "ok": true })).into_response(),
-        Err(err) => error(StatusCode::INTERNAL_SERVER_ERROR, "server_error", err.to_string()),
+        Err(err) => error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "server_error",
+            err.to_string(),
+        ),
     }
 }
 
-pub async fn health_check(AxumState(st): AxumState<State>, Path(id): Path<i64>, caller: Caller) -> Response {
+pub async fn health_check(
+    AxumState(st): AxumState<State>,
+    Path(id): Path<i64>,
+    caller: Caller,
+) -> Response {
     if caller.role != "admin" {
-        return error(StatusCode::FORBIDDEN, "forbidden", "only an admin can check a connection");
+        return error(
+            StatusCode::FORBIDDEN,
+            "forbidden",
+            "only an admin can check a connection",
+        );
     }
     let row = sqlx::query(
         "SELECT id, name, base_url, api_key, default_model, enabled, priority, health, last_checked_at \
@@ -188,7 +230,8 @@ pub async fn health_check(AxumState(st): AxumState<State>, Path(id): Path<i64>, 
     };
     let connection = row_to_connection(&row);
     let status = check(&st, &connection).await;
-    Json(json!({ "id": connection.id, "health": if status.is_success() { "ok" } else { "down" } })).into_response()
+    Json(json!({ "id": connection.id, "health": if status.is_success() { "ok" } else { "down" } }))
+        .into_response()
 }
 
 pub async fn health_checker(st: State) {

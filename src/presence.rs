@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::time::Instant;
 
-use axum::extract::{State as AxumState};
+use axum::extract::State as AxumState;
 use axum::response::{IntoResponse, Json, Response};
 use serde::Serialize;
 use serde_json::json;
@@ -32,9 +32,18 @@ pub struct Presence {
 impl Presence {
     fn snapshot(&self) -> PresenceEvent {
         let now = Instant::now();
-        let generating = self.generating.iter().filter(|(_, count)| **count > 0).map(|(id, _)| *id).collect::<Vec<_>>();
+        let generating = self
+            .generating
+            .iter()
+            .filter(|(_, count)| **count > 0)
+            .map(|(id, _)| *id)
+            .collect::<Vec<_>>();
         PresenceEvent {
-            online: self.last_seen.values().filter(|seen| now.duration_since(**seen).as_secs() < ONLINE_WINDOW_SECS).count(),
+            online: self
+                .last_seen
+                .values()
+                .filter(|seen| now.duration_since(**seen).as_secs() < ONLINE_WINDOW_SECS)
+                .count(),
             generating: generating.len(),
             generating_ids: generating,
         }
@@ -49,7 +58,10 @@ pub struct Active {
 
 pub fn track(st: &State, user: i64) -> Active {
     count(st, user, 1);
-    Active { st: st.clone(), user }
+    Active {
+        st: st.clone(),
+        user,
+    }
 }
 
 impl Drop for Active {

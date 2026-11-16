@@ -1,16 +1,16 @@
 use std::time::Duration;
 
 use axum::{
+    Router,
     body::Body,
     extract::Json,
-    http::{self, header, HeaderValue, Request, StatusCode},
+    http::{self, HeaderValue, Request, StatusCode, header},
     response::{IntoResponse, Response},
     routing::{get, post},
-    Router,
 };
 use dreamgate::{build_router, db, live, presence, state::State};
 use http_body_util::BodyExt;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use sqlx::{Row, sqlite::SqlitePool, sqlite::SqlitePoolOptions};
 use tower::ServiceExt;
 
@@ -41,7 +41,9 @@ async fn mock_chat(Json(body): Json<Value>) -> Response {
     if body.get("stream").and_then(Value::as_bool).unwrap_or(false) {
         let mut chunks = String::new();
         if model == "reasons" {
-            chunks.push_str("data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"think hard\"}}]}\n\n");
+            chunks.push_str(
+                "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"think hard\"}}]}\n\n",
+            );
         }
         chunks.push_str("data: {\"choices\":[{\"delta\":{\"content\":\"hello world\"}}]}\n\n");
         if reports_usage {
@@ -49,7 +51,10 @@ async fn mock_chat(Json(body): Json<Value>) -> Response {
         }
         chunks.push_str("data: [DONE]\n\n");
         let mut out = Response::new(Body::empty());
-        out.headers_mut().insert(header::CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
+        out.headers_mut().insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("text/event-stream"),
+        );
         *out.body_mut() = Body::from(chunks);
         return out;
     }
@@ -95,7 +100,13 @@ async fn json_body(response: Response) -> Value {
     serde_json::from_slice(&bytes).unwrap()
 }
 
-async fn send_json(router: &Router, method: http::Method, path: &str, cookie: &str, body: Value) -> (StatusCode, Value) {
+async fn send_json(
+    router: &Router,
+    method: http::Method,
+    path: &str,
+    cookie: &str,
+    body: Value,
+) -> (StatusCode, Value) {
     let response = call(
         router,
         Request::builder()
@@ -116,7 +127,14 @@ async fn post_json(router: &Router, path: &str, cookie: &str, body: Value) -> (S
 }
 
 async fn get_json(router: &Router, path: &str, cookie: &str) -> Value {
-    let response = call(router, Request::get(path).header("cookie", cookie).body(Body::empty()).unwrap()).await;
+    let response = call(
+        router,
+        Request::get(path)
+            .header("cookie", cookie)
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
     json_body(response).await
 }
 
@@ -125,7 +143,9 @@ async fn register(router: &Router, username: &str) -> String {
         router,
         Request::post("/api/register")
             .header("content-type", "application/json")
-            .body(Body::from(json!({ "username": username, "password": "test-password" }).to_string()))
+            .body(Body::from(
+                json!({ "username": username, "password": "test-password" }).to_string(),
+            ))
             .unwrap(),
     )
     .await;
@@ -149,7 +169,14 @@ fn cookie_of(response: &Response) -> String {
 // Self-registration is closed by default once an account exists, so tests that need a second
 // account open it first.
 async fn open_registration(router: &Router, admin: &str) {
-    let (status, _) = send_json(router, http::Method::PATCH, "/api/settings", admin, json!({ "open_registration": true })).await;
+    let (status, _) = send_json(
+        router,
+        http::Method::PATCH,
+        "/api/settings",
+        admin,
+        json!({ "open_registration": true }),
+    )
+    .await;
     assert_eq!(status, StatusCode::OK);
 }
 
@@ -157,7 +184,14 @@ async fn open_registration(router: &Router, admin: &str) {
 // tests that are not about approval turn it off before registering. What approval itself does is
 // tested on its own.
 async fn no_approval(router: &Router, admin: &str) {
-    let (status, _) = send_json(router, http::Method::PATCH, "/api/settings", admin, json!({ "require_approval": false })).await;
+    let (status, _) = send_json(
+        router,
+        http::Method::PATCH,
+        "/api/settings",
+        admin,
+        json!({ "require_approval": false }),
+    )
+    .await;
     assert_eq!(status, StatusCode::OK);
 }
 
@@ -166,7 +200,9 @@ async fn sign_in(router: &Router, username: &str, password: &str) -> String {
         router,
         Request::post("/api/login")
             .header("content-type", "application/json")
-            .body(Body::from(json!({ "username": username, "password": password }).to_string()))
+            .body(Body::from(
+                json!({ "username": username, "password": password }).to_string(),
+            ))
             .unwrap(),
     )
     .await;
@@ -179,23 +215,55 @@ async fn a_new_account_waits_for_approval_before_it_can_sign_in() {
     let st = test_state().await;
     let router = build_router(st.clone());
     let admin = register(&router, "ada").await;
-    assert_eq!(get_json(&router, "/api/settings", &admin).await["require_approval"], true);
+    assert_eq!(
+        get_json(&router, "/api/settings", &admin).await["require_approval"],
+        true
+    );
 
     open_registration(&router, &admin).await;
-    let (status, body) = post_json(&router, "/api/register", "", json!({ "username": "ben", "password": "test-password" })).await;
+    let (status, body) = post_json(
+        &router,
+        "/api/register",
+        "",
+        json!({ "username": "ben", "password": "test-password" }),
+    )
+    .await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(body["pending"], true, "the second account is held, the first is not");
+    assert_eq!(
+        body["pending"], true,
+        "the second account is held, the first is not"
+    );
 
     // Nothing is signed in yet, and signing in says why.
-    assert_eq!(post_json(&router, "/api/login", "", json!({ "username": "ben", "password": "test-password"})).await.0, StatusCode::FORBIDDEN);
+    assert_eq!(
+        post_json(
+            &router,
+            "/api/login",
+            "",
+            json!({ "username": "ben", "password": "test-password"})
+        )
+        .await
+        .0,
+        StatusCode::FORBIDDEN
+    );
 
     let id = body["id"].as_i64().unwrap();
-    let (status, changed) = send_json(&router, http::Method::PATCH, &format!("/api/users/{id}"), &admin, json!({ "pending": false })).await;
+    let (status, changed) = send_json(
+        &router,
+        http::Method::PATCH,
+        &format!("/api/users/{id}"),
+        &admin,
+        json!({ "pending": false }),
+    )
+    .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(changed["changed"], json!(["pending"]));
 
     let member = sign_in(&router, "ben", "test-password").await;
-    assert_eq!(get_json(&router, "/api/me", &member).await["username"], "ben");
+    assert_eq!(
+        get_json(&router, "/api/me", &member).await["username"],
+        "ben"
+    );
 }
 
 #[tokio::test]
@@ -209,7 +277,10 @@ async fn turning_approval_off_lets_an_account_register_and_sign_in_at_once() {
     // The helper asserts a session comes back with the registration, which is what an account
     // that is not held gets.
     let member = register(&router, "ben").await;
-    assert_eq!(get_json(&router, "/api/me", &member).await["username"], "ben");
+    assert_eq!(
+        get_json(&router, "/api/me", &member).await["username"],
+        "ben"
+    );
 }
 
 async fn gateway_call(router: &Router, key: &str, body: Value) -> Response {
@@ -265,7 +336,13 @@ async fn first_registered_account_is_admin() {
     assert_eq!(get_json(&router, "/api/me", &admin).await["role"], "admin");
 
     // Self-registration is closed by default once an account exists, so the next one needs the admin.
-    let closed = post_json(&router, "/api/register", "", json!({ "username": "ben", "password": "test-password" })).await;
+    let closed = post_json(
+        &router,
+        "/api/register",
+        "",
+        json!({ "username": "ben", "password": "test-password" }),
+    )
+    .await;
     assert_eq!(closed.0, StatusCode::FORBIDDEN);
 
     open_registration(&router, &admin).await;
@@ -287,19 +364,50 @@ async fn registration_setting_is_read_before_sign_in_and_only_an_admin_can_chang
 
     let admin = register(&router, "ada").await;
     let after = get_json(&router, "/api/settings", "").await;
-    assert_eq!(after["open_registration"], false, "closed by default after the first account");
+    assert_eq!(
+        after["open_registration"], false,
+        "closed by default after the first account"
+    );
     assert_eq!(after["has_accounts"], true);
-    assert_eq!(after["require_approval"], true, "approval is on by default once there is an admin to give it");
+    assert_eq!(
+        after["require_approval"], true,
+        "approval is on by default once there is an admin to give it"
+    );
 
-    let (status, _) = send_json(&router, http::Method::PATCH, "/api/settings", &admin, json!({ "open_registration": true })).await;
+    let (status, _) = send_json(
+        &router,
+        http::Method::PATCH,
+        "/api/settings",
+        &admin,
+        json!({ "open_registration": true }),
+    )
+    .await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(get_json(&router, "/api/settings", &admin).await["open_registration"], true);
+    assert_eq!(
+        get_json(&router, "/api/settings", &admin).await["open_registration"],
+        true
+    );
 
     no_approval(&router, &admin).await;
     let member = register(&router, "ben").await;
-    let (status, _) = send_json(&router, http::Method::PATCH, "/api/settings", &member, json!({ "require_approval": true })).await;
-    assert_eq!(status, StatusCode::FORBIDDEN, "only an admin can change approval");
-    assert_eq!(get_json(&router, "/api/settings", &member).await["require_approval"], false, "the admin's setting stands");
+    let (status, _) = send_json(
+        &router,
+        http::Method::PATCH,
+        "/api/settings",
+        &member,
+        json!({ "require_approval": true }),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "only an admin can change approval"
+    );
+    assert_eq!(
+        get_json(&router, "/api/settings", &member).await["require_approval"],
+        false,
+        "the admin's setting stands"
+    );
 }
 
 #[tokio::test]
@@ -318,11 +426,17 @@ async fn records_usage_reported_by_the_upstream() {
     .await;
     assert_eq!(status, StatusCode::OK);
 
-    let (status, created) = post_json(&router, "/api/keys", &cookie, json!({ "name": "test key" })).await;
+    let (status, created) =
+        post_json(&router, "/api/keys", &cookie, json!({ "name": "test key" })).await;
     assert_eq!(status, StatusCode::OK);
     let key = created["key"].as_str().unwrap().to_string();
 
-    let response = gateway_call(&router, &key, json!({ "messages": [{ "role": "user", "content": "hi" }] })).await;
+    let response = gateway_call(
+        &router,
+        &key,
+        json!({ "messages": [{ "role": "user", "content": "hi" }] }),
+    )
+    .await;
     assert_eq!(response.status(), StatusCode::OK);
 
     let usage = recorded_usage(&st.pool).await;
@@ -331,7 +445,10 @@ async fn records_usage_reported_by_the_upstream() {
     assert_eq!(usage[0]["total_tokens"], 18);
     assert_eq!(usage[0]["estimated"], false);
     assert_eq!(usage[0]["connection_id"], connection["id"]);
-    assert_eq!(usage[0]["model"], "reports-usage", "the key's connection default model is applied");
+    assert_eq!(
+        usage[0]["model"], "reports-usage",
+        "the key's connection default model is applied"
+    );
 }
 
 #[tokio::test]
@@ -348,16 +465,25 @@ async fn estimates_tokens_when_the_upstream_reports_none() {
         json!({ "name": "test", "base_url": base_url, "default_model": "silent" }),
     )
     .await;
-    let (_, created) = post_json(&router, "/api/keys", &cookie, json!({ "name": "test key" })).await;
+    let (_, created) =
+        post_json(&router, "/api/keys", &cookie, json!({ "name": "test key" })).await;
     let key = created["key"].as_str().unwrap().to_string();
 
-    let response = gateway_call(&router, &key, json!({ "messages": [{ "role": "user", "content": "hi" }] })).await;
+    let response = gateway_call(
+        &router,
+        &key,
+        json!({ "messages": [{ "role": "user", "content": "hi" }] }),
+    )
+    .await;
     assert_eq!(response.status(), StatusCode::OK);
 
     let usage = recorded_usage(&st.pool).await;
     assert_eq!(usage[0]["estimated"], true);
     assert!(usage[0]["prompt_tokens"].as_i64().unwrap() > 0);
-    assert_eq!(usage[0]["completion_tokens"], 4, "two words in the answer, two subword pieces each");
+    assert_eq!(
+        usage[0]["completion_tokens"], 4,
+        "two words in the answer, two subword pieces each"
+    );
 }
 
 #[tokio::test]
@@ -374,7 +500,8 @@ async fn streams_sse_through_unchanged_and_records_at_the_end() {
         json!({ "name": "test", "base_url": base_url, "default_model": "reports-usage" }),
     )
     .await;
-    let (_, created) = post_json(&router, "/api/keys", &cookie, json!({ "name": "test key" })).await;
+    let (_, created) =
+        post_json(&router, "/api/keys", &cookie, json!({ "name": "test key" })).await;
     let key = created["key"].as_str().unwrap().to_string();
 
     let response = gateway_call(
@@ -384,7 +511,10 @@ async fn streams_sse_through_unchanged_and_records_at_the_end() {
     )
     .await;
     assert_eq!(response.status(), StatusCode::OK);
-    assert_eq!(response.headers().get("content-type").unwrap(), "text/event-stream");
+    assert_eq!(
+        response.headers().get("content-type").unwrap(),
+        "text/event-stream"
+    );
 
     let body = response.into_body().collect().await.unwrap().to_bytes();
     let text = String::from_utf8(body.to_vec()).unwrap();
@@ -412,7 +542,8 @@ async fn counts_streamed_reasoning_as_generated_text_in_the_estimate() {
         json!({ "name": "test", "base_url": base_url, "default_model": "reasons" }),
     )
     .await;
-    let (_, created) = post_json(&router, "/api/keys", &cookie, json!({ "name": "test key" })).await;
+    let (_, created) =
+        post_json(&router, "/api/keys", &cookie, json!({ "name": "test key" })).await;
     let key = created["key"].as_str().unwrap().to_string();
 
     let response = gateway_call(
@@ -451,15 +582,24 @@ async fn counts_reasoning_in_the_estimate_when_the_upstream_reports_none() {
         json!({ "name": "test", "base_url": base_url, "default_model": "reasons" }),
     )
     .await;
-    let (_, created) = post_json(&router, "/api/keys", &cookie, json!({ "name": "test key" })).await;
+    let (_, created) =
+        post_json(&router, "/api/keys", &cookie, json!({ "name": "test key" })).await;
     let key = created["key"].as_str().unwrap().to_string();
 
-    let response = gateway_call(&router, &key, json!({ "messages": [{ "role": "user", "content": "hi" }] })).await;
+    let response = gateway_call(
+        &router,
+        &key,
+        json!({ "messages": [{ "role": "user", "content": "hi" }] }),
+    )
+    .await;
     assert_eq!(response.status(), StatusCode::OK);
 
     let usage = recorded_usage(&st.pool).await;
     assert_eq!(usage[0]["estimated"], true);
-    assert_eq!(usage[0]["completion_tokens"], 7, "the answer and the reasoning together");
+    assert_eq!(
+        usage[0]["completion_tokens"], 7,
+        "the answer and the reasoning together"
+    );
 }
 
 #[tokio::test]
@@ -472,8 +612,15 @@ async fn reasoning_effort_is_forwarded_to_the_upstream_unchanged() {
     let st = test_state().await;
     let router = build_router(st.clone());
     let cookie = register(&router, "ada").await;
-    post_json(&router, "/api/connections", &cookie, json!({ "name": "test", "base_url": base_url })).await;
-    let (_, created) = post_json(&router, "/api/keys", &cookie, json!({ "name": "test key" })).await;
+    post_json(
+        &router,
+        "/api/connections",
+        &cookie,
+        json!({ "name": "test", "base_url": base_url }),
+    )
+    .await;
+    let (_, created) =
+        post_json(&router, "/api/keys", &cookie, json!({ "name": "test key" })).await;
     let key = created["key"].as_str().unwrap().to_string();
 
     // DreamGate does not interpret reasoning levels, it forwards the request body as it is, so a
@@ -504,8 +651,15 @@ async fn records_the_model_the_client_asked_for_when_streaming() {
 
     // Nothing is pinned on the connection or the key, so the recorded model has to come
     // from the request itself.
-    post_json(&router, "/api/connections", &cookie, json!({ "name": "test", "base_url": base_url })).await;
-    let (_, created) = post_json(&router, "/api/keys", &cookie, json!({ "name": "test key" })).await;
+    post_json(
+        &router,
+        "/api/connections",
+        &cookie,
+        json!({ "name": "test", "base_url": base_url }),
+    )
+    .await;
+    let (_, created) =
+        post_json(&router, "/api/keys", &cookie, json!({ "name": "test key" })).await;
     let key = created["key"].as_str().unwrap().to_string();
 
     let response = gateway_call(
@@ -529,7 +683,13 @@ async fn fails_over_to_a_healthy_connection() {
     let cookie = register(&router, "ada").await;
 
     // Nothing listens on port 1, so the first attempt fails at the transport level.
-    post_json(&router, "/api/connections", &cookie, json!({ "name": "dead", "base_url": "http://127.0.0.1:1", "priority": 0 })).await;
+    post_json(
+        &router,
+        "/api/connections",
+        &cookie,
+        json!({ "name": "dead", "base_url": "http://127.0.0.1:1", "priority": 0 }),
+    )
+    .await;
     let (_, healthy) = post_json(
         &router,
         "/api/connections",
@@ -538,10 +698,16 @@ async fn fails_over_to_a_healthy_connection() {
     )
     .await;
 
-    let (_, created) = post_json(&router, "/api/keys", &cookie, json!({ "name": "test key" })).await;
+    let (_, created) =
+        post_json(&router, "/api/keys", &cookie, json!({ "name": "test key" })).await;
     let key = created["key"].as_str().unwrap().to_string();
 
-    let response = gateway_call(&router, &key, json!({ "messages": [{ "role": "user", "content": "hi" }] })).await;
+    let response = gateway_call(
+        &router,
+        &key,
+        json!({ "messages": [{ "role": "user", "content": "hi" }] }),
+    )
+    .await;
     assert_eq!(response.status(), StatusCode::OK);
 
     let usage = recorded_usage(&st.pool).await;
@@ -555,16 +721,38 @@ async fn per_key_rate_limit_blocks_the_third_request() {
     let router = build_router(st.clone());
     let base_url = mock_upstream().await;
     let cookie = register(&router, "ada").await;
-    post_json(&router, "/api/connections", &cookie, json!({ "name": "test", "base_url": base_url, "default_model": "reports-usage" })).await;
+    post_json(
+        &router,
+        "/api/connections",
+        &cookie,
+        json!({ "name": "test", "base_url": base_url, "default_model": "reports-usage" }),
+    )
+    .await;
 
-    let (_, created) = post_json(&router, "/api/keys", &cookie, json!({ "name": "limited", "rpm_limit": 2 })).await;
+    let (_, created) = post_json(
+        &router,
+        "/api/keys",
+        &cookie,
+        json!({ "name": "limited", "rpm_limit": 2 }),
+    )
+    .await;
     let key = created["key"].as_str().unwrap().to_string();
 
     for _ in 0..2 {
-        let response = gateway_call(&router, &key, json!({ "messages": [{ "role": "user", "content": "hi" }] })).await;
+        let response = gateway_call(
+            &router,
+            &key,
+            json!({ "messages": [{ "role": "user", "content": "hi" }] }),
+        )
+        .await;
         assert_eq!(response.status(), StatusCode::OK);
     }
-    let response = gateway_call(&router, &key, json!({ "messages": [{ "role": "user", "content": "hi" }] })).await;
+    let response = gateway_call(
+        &router,
+        &key,
+        json!({ "messages": [{ "role": "user", "content": "hi" }] }),
+    )
+    .await;
     assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
 }
 
@@ -575,11 +763,29 @@ async fn key_limits_must_be_positive() {
     let cookie = register(&router, "ada").await;
 
     // A limit of 0 would refuse every request, so it is rejected rather than stored.
-    let (status, _) = post_json(&router, "/api/keys", &cookie, json!({ "name": "zero", "token_cap": 0 })).await;
+    let (status, _) = post_json(
+        &router,
+        "/api/keys",
+        &cookie,
+        json!({ "name": "zero", "token_cap": 0 }),
+    )
+    .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
-    let (status, _) = post_json(&router, "/api/keys", &cookie, json!({ "name": "negative", "rpm_limit": -1 })).await;
+    let (status, _) = post_json(
+        &router,
+        "/api/keys",
+        &cookie,
+        json!({ "name": "negative", "rpm_limit": -1 }),
+    )
+    .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
-    let (status, _) = post_json(&router, "/api/keys", &cookie, json!({ "name": "unset limits" })).await;
+    let (status, _) = post_json(
+        &router,
+        "/api/keys",
+        &cookie,
+        json!({ "name": "unset limits" }),
+    )
+    .await;
     assert_eq!(status, StatusCode::OK);
 }
 
@@ -593,20 +799,36 @@ async fn the_keys_list_is_the_callers_own_and_only_an_admin_can_read_the_others(
     let member = register(&router, "ben").await;
 
     post_json(&router, "/api/keys", &admin, json!({ "name": "admin key" })).await;
-    post_json(&router, "/api/keys", &member, json!({ "name": "member key" })).await;
+    post_json(
+        &router,
+        "/api/keys",
+        &member,
+        json!({ "name": "member key" }),
+    )
+    .await;
 
     // The Keys page shows one table, so the main list is always the caller's own and another
     // account's keys come from a read an admin can make on their own.
     let own = get_json(&router, "/api/keys", &admin).await;
-    assert_eq!(own["keys"].as_array().unwrap().len(), 1, "an admin's own list is their own");
+    assert_eq!(
+        own["keys"].as_array().unwrap().len(),
+        1,
+        "an admin's own list is their own"
+    );
     assert_eq!(own["keys"][0]["name"], "admin key");
 
     let others = get_json(&router, "/api/keys/others", &admin).await;
     assert_eq!(others["keys"].as_array().unwrap().len(), 1);
-    assert_eq!(others["keys"][0]["owner"], "ben", "the other list names who a key belongs to");
+    assert_eq!(
+        others["keys"][0]["owner"], "ben",
+        "the other list names who a key belongs to"
+    );
 
     let denied = get_json(&router, "/api/keys/others", &member).await;
-    assert_eq!(denied["error"]["message"], "only an admin can see keys from other accounts");
+    assert_eq!(
+        denied["error"]["message"],
+        "only an admin can see keys from other accounts"
+    );
 }
 
 #[tokio::test]
@@ -615,27 +837,62 @@ async fn deleting_a_key_leaves_the_usage_recorded_for_it() {
     let router = build_router(st.clone());
     let base_url = mock_upstream().await;
     let admin = register(&router, "ada").await;
-    post_json(&router, "/api/connections", &admin, json!({ "name": "test", "base_url": base_url, "default_model": "reports-usage" })).await;
+    post_json(
+        &router,
+        "/api/connections",
+        &admin,
+        json!({ "name": "test", "base_url": base_url, "default_model": "reports-usage" }),
+    )
+    .await;
 
     let (_, created) = post_json(&router, "/api/keys", &admin, json!({ "name": "test key" })).await;
-    gateway_call(&router, created["key"].as_str().unwrap(), json!({ "messages": [{ "role": "user", "content": "hi" }] })).await;
+    gateway_call(
+        &router,
+        created["key"].as_str().unwrap(),
+        json!({ "messages": [{ "role": "user", "content": "hi" }] }),
+    )
+    .await;
     let before = get_json(&router, "/api/stats/summary", &admin).await;
     assert_eq!(before["self"]["total_tokens"], 18);
 
     let key_id = created["id"].as_i64().unwrap();
-    let (status, _) = send_json(&router, http::Method::DELETE, &format!("/api/keys/{key_id}"), &admin, json!({})).await;
+    let (status, _) = send_json(
+        &router,
+        http::Method::DELETE,
+        &format!("/api/keys/{key_id}"),
+        &admin,
+        json!({}),
+    )
+    .await;
     assert_eq!(status, StatusCode::OK);
 
     // The counters are what crossed the gate, so removing the key cannot make them smaller.
     let after = get_json(&router, "/api/stats/summary", &admin).await;
-    assert_eq!(after["self"]["total_tokens"], 18, "the account total stands");
-    assert_eq!(after["global"]["total_tokens"], 18, "the platform total stands");
+    assert_eq!(
+        after["self"]["total_tokens"], 18,
+        "the account total stands"
+    );
+    assert_eq!(
+        after["global"]["total_tokens"], 18,
+        "the platform total stands"
+    );
 
-    let row = sqlx::query("SELECT api_key_id FROM usage").fetch_one(&st.pool).await.unwrap();
-    assert_eq!(row.get::<Option<i64>, _>("api_key_id"), None, "the row is left without its key");
+    let row = sqlx::query("SELECT api_key_id FROM usage")
+        .fetch_one(&st.pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        row.get::<Option<i64>, _>("api_key_id"),
+        None,
+        "the row is left without its key"
+    );
 
     let recent = get_json(&router, "/api/stats/recent", &admin).await;
-    assert_eq!(recent["events"][0]["key"], Value::Null, "the activity row has no key name left");
+    assert_eq!(
+        recent["events"][0]["key"],
+        Value::Null,
+        "the activity row has no key name left"
+    );
 }
 
 #[tokio::test]
@@ -644,20 +901,49 @@ async fn per_key_token_cap_blocks_the_next_request() {
     let router = build_router(st.clone());
     let base_url = mock_upstream().await;
     let cookie = register(&router, "ada").await;
-    post_json(&router, "/api/connections", &cookie, json!({ "name": "test", "base_url": base_url, "default_model": "reports-usage" })).await;
+    post_json(
+        &router,
+        "/api/connections",
+        &cookie,
+        json!({ "name": "test", "base_url": base_url, "default_model": "reports-usage" }),
+    )
+    .await;
 
-    let (_, created) = post_json(&router, "/api/keys", &cookie, json!({ "name": "capped", "token_cap": 20 })).await;
+    let (_, created) = post_json(
+        &router,
+        "/api/keys",
+        &cookie,
+        json!({ "name": "capped", "token_cap": 20 }),
+    )
+    .await;
     let key = created["key"].as_str().unwrap().to_string();
 
-    let response = gateway_call(&router, &key, json!({ "messages": [{ "role": "user", "content": "hi" }] })).await;
+    let response = gateway_call(
+        &router,
+        &key,
+        json!({ "messages": [{ "role": "user", "content": "hi" }] }),
+    )
+    .await;
     assert_eq!(response.status(), StatusCode::OK);
     let usage = recorded_usage(&st.pool).await;
     assert_eq!(usage[0]["total_tokens"], 18);
 
     // Lower the cap below what the first call already used, so the next call is refused.
-    let (status, _) = send_json(&router, http::Method::PATCH, &format!("/api/keys/{}", created["id"]), &cookie, json!({ "token_cap": 10 })).await;
+    let (status, _) = send_json(
+        &router,
+        http::Method::PATCH,
+        &format!("/api/keys/{}", created["id"]),
+        &cookie,
+        json!({ "token_cap": 10 }),
+    )
+    .await;
     assert_eq!(status, StatusCode::OK);
-    let response = gateway_call(&router, &key, json!({ "messages": [{ "role": "user", "content": "hi" }] })).await;
+    let response = gateway_call(
+        &router,
+        &key,
+        json!({ "messages": [{ "role": "user", "content": "hi" }] }),
+    )
+    .await;
     assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
 }
 
@@ -667,23 +953,46 @@ async fn account_daily_limit_blocks_the_next_request() {
     let router = build_router(st.clone());
     let base_url = mock_upstream().await;
     let admin = register(&router, "ada").await;
-    post_json(&router, "/api/connections", &admin, json!({ "name": "test", "base_url": base_url, "default_model": "reports-usage" })).await;
+    post_json(
+        &router,
+        "/api/connections",
+        &admin,
+        json!({ "name": "test", "base_url": base_url, "default_model": "reports-usage" }),
+    )
+    .await;
 
     // The key has no cap of its own, so only the account limit can stop it.
     let (_, created) = post_json(&router, "/api/keys", &admin, json!({ "name": "uncapped" })).await;
     let key = created["key"].as_str().unwrap().to_string();
-    gateway_call(&router, &key, json!({ "messages": [{ "role": "user", "content": "hi" }] })).await;
+    gateway_call(
+        &router,
+        &key,
+        json!({ "messages": [{ "role": "user", "content": "hi" }] }),
+    )
+    .await;
     let usage = recorded_usage(&st.pool).await;
     assert_eq!(usage[0]["total_tokens"], 18);
 
     let me = get_json(&router, "/api/me", &admin).await;
     // The limit has to sit below what the first call already used, otherwise the account is still under it.
-    let (status, body) = send_json(&router, http::Method::PATCH, &format!("/api/users/{}", me["id"]), &admin, json!({ "daily_token_cap": 15 })).await;
+    let (status, body) = send_json(
+        &router,
+        http::Method::PATCH,
+        &format!("/api/users/{}", me["id"]),
+        &admin,
+        json!({ "daily_token_cap": 15 }),
+    )
+    .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["changed"], json!(["daily_token_cap"]));
 
     // 18 tokens are already counted for today, so the next request is refused.
-    let response = gateway_call(&router, &key, json!({ "messages": [{ "role": "user", "content": "hi" }] })).await;
+    let response = gateway_call(
+        &router,
+        &key,
+        json!({ "messages": [{ "role": "user", "content": "hi" }] }),
+    )
+    .await;
     assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
 }
 
@@ -693,14 +1002,32 @@ async fn account_daily_limit_counts_only_the_current_day() {
     let router = build_router(st.clone());
     let base_url = mock_upstream().await;
     let admin = register(&router, "ada").await;
-    post_json(&router, "/api/connections", &admin, json!({ "name": "test", "base_url": base_url, "default_model": "reports-usage" })).await;
+    post_json(
+        &router,
+        "/api/connections",
+        &admin,
+        json!({ "name": "test", "base_url": base_url, "default_model": "reports-usage" }),
+    )
+    .await;
 
     let (_, created) = post_json(&router, "/api/keys", &admin, json!({ "name": "uncapped" })).await;
     let key = created["key"].as_str().unwrap().to_string();
-    gateway_call(&router, &key, json!({ "messages": [{ "role": "user", "content": "hi" }] })).await;
+    gateway_call(
+        &router,
+        &key,
+        json!({ "messages": [{ "role": "user", "content": "hi" }] }),
+    )
+    .await;
 
     let me = get_json(&router, "/api/me", &admin).await;
-    let (status, _) = send_json(&router, http::Method::PATCH, &format!("/api/users/{}", me["id"]), &admin, json!({ "daily_token_cap": 15 })).await;
+    let (status, _) = send_json(
+        &router,
+        http::Method::PATCH,
+        &format!("/api/users/{}", me["id"]),
+        &admin,
+        json!({ "daily_token_cap": 15 }),
+    )
+    .await;
     assert_eq!(status, StatusCode::OK);
 
     // The same tokens dated to an earlier day are outside the window the limit counts.
@@ -709,7 +1036,12 @@ async fn account_daily_limit_counts_only_the_current_day() {
         .execute(&st.pool)
         .await
         .unwrap();
-    let response = gateway_call(&router, &key, json!({ "messages": [{ "role": "user", "content": "hi" }] })).await;
+    let response = gateway_call(
+        &router,
+        &key,
+        json!({ "messages": [{ "role": "user", "content": "hi" }] }),
+    )
+    .await;
     assert_eq!(response.status(), StatusCode::OK);
 
     let summary = get_json(&router, "/api/stats/summary", &admin).await;
@@ -728,22 +1060,58 @@ async fn only_an_admin_can_set_an_account_cap() {
     let member_id = get_json(&router, "/api/me", &member).await;
     let path = format!("/api/users/{}", member_id["id"]);
 
-    let (status, _) = send_json(&router, http::Method::PATCH, &path, &member, json!({ "daily_token_cap": 100 })).await;
+    let (status, _) = send_json(
+        &router,
+        http::Method::PATCH,
+        &path,
+        &member,
+        json!({ "daily_token_cap": 100 }),
+    )
+    .await;
     assert_eq!(status, StatusCode::FORBIDDEN);
 
-    let (status, body) = send_json(&router, http::Method::PATCH, &path, &admin, json!({ "daily_token_cap": 100 })).await;
+    let (status, body) = send_json(
+        &router,
+        http::Method::PATCH,
+        &path,
+        &admin,
+        json!({ "daily_token_cap": 100 }),
+    )
+    .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["changed"], json!(["daily_token_cap"]));
 
     // An empty value clears the limit, which COALESCE would not allow.
-    let (status, body) = send_json(&router, http::Method::PATCH, &path, &admin, json!({ "daily_token_cap": null })).await;
+    let (status, body) = send_json(
+        &router,
+        http::Method::PATCH,
+        &path,
+        &admin,
+        json!({ "daily_token_cap": null }),
+    )
+    .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["changed"], json!(["daily_token_cap"]));
     let summary = get_json(&router, "/api/stats/summary", &admin).await;
-    let ben = summary["users"].as_array().unwrap().iter().find(|user| user["username"] == "ben").unwrap();
-    assert!(ben["daily_token_cap"].is_null(), "the limit was cleared, not left at 100");
+    let ben = summary["users"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|user| user["username"] == "ben")
+        .unwrap();
+    assert!(
+        ben["daily_token_cap"].is_null(),
+        "the limit was cleared, not left at 100"
+    );
 
-    let (status, _) = send_json(&router, http::Method::PATCH, &path, &admin, json!({ "daily_token_cap": 0 })).await;
+    let (status, _) = send_json(
+        &router,
+        http::Method::PATCH,
+        &path,
+        &admin,
+        json!({ "daily_token_cap": 0 }),
+    )
+    .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
 
     // Accounts without any usage are listed too, so a limit can be set before the first request.
@@ -758,33 +1126,73 @@ async fn an_admin_can_make_an_account_whose_password_is_chosen_on_the_first_sign
     let admin = register(&router, "ada").await;
 
     // Self-registration is closed by default, so this is the only way in for the next account.
-    let (status, created) = post_json(&router, "/api/users", &admin, json!({ "username": "ben", "daily_token_cap": 200 })).await;
+    let (status, created) = post_json(
+        &router,
+        "/api/users",
+        &admin,
+        json!({ "username": "ben", "daily_token_cap": 200 }),
+    )
+    .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(created["role"], "user");
 
     // The first sign-in is where the password is chosen, because there was none to check.
     let member = sign_in(&router, "ben", "their-own-password").await;
-    assert_eq!(get_json(&router, "/api/me", &member).await["username"], "ben");
+    assert_eq!(
+        get_json(&router, "/api/me", &member).await["username"],
+        "ben"
+    );
     // From then on the password is checked, not taken as whatever is typed.
-    let (status, _) = post_json(&router, "/api/login", "", json!({ "username": "ben", "password": "something else" })).await;
+    let (status, _) = post_json(
+        &router,
+        "/api/login",
+        "",
+        json!({ "username": "ben", "password": "something else" }),
+    )
+    .await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
 
     let summary = get_json(&router, "/api/stats/summary", &admin).await;
-    let ben = summary["users"].as_array().unwrap().iter().find(|user| user["username"] == "ben").unwrap();
-    assert_eq!(ben["daily_token_cap"], 200, "the limit set on the form is the account's limit");
-    assert_eq!(ben["pending"], false, "an account the admin made is not waiting for approval");
+    let ben = summary["users"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|user| user["username"] == "ben")
+        .unwrap();
+    assert_eq!(
+        ben["daily_token_cap"], 200,
+        "the limit set on the form is the account's limit"
+    );
+    assert_eq!(
+        ben["pending"], false,
+        "an account the admin made is not waiting for approval"
+    );
 
     // A member cannot make an account, a name that is taken is named rather than passed through
     // as a database error, and a limit below 1 is refused.
-    let (status, body) = post_json(&router, "/api/users", &member, json!({ "username": "dee" })).await;
+    let (status, body) =
+        post_json(&router, "/api/users", &member, json!({ "username": "dee" })).await;
     assert_eq!(status, StatusCode::FORBIDDEN);
-    assert_eq!(body["error"]["message"], "only an admin can make an account");
-    let (status, body) = post_json(&router, "/api/users", &admin, json!({ "username": "ben" })).await;
+    assert_eq!(
+        body["error"]["message"],
+        "only an admin can make an account"
+    );
+    let (status, body) =
+        post_json(&router, "/api/users", &admin, json!({ "username": "ben" })).await;
     assert_eq!(status, StatusCode::CONFLICT);
-    assert_eq!(body["error"]["message"], "the username ben is already taken");
+    assert_eq!(
+        body["error"]["message"],
+        "the username ben is already taken"
+    );
     let (status, _) = post_json(&router, "/api/users", &admin, json!({ "username": " " })).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
-    let (status, _) = post_json(&router, "/api/users", &admin, json!({ "username": "cy", "daily_token_cap": 0 })).await;
+    let (status, _) = post_json(
+        &router,
+        "/api/users",
+        &admin,
+        json!({ "username": "cy", "daily_token_cap": 0 }),
+    )
+    .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
 }
 
@@ -806,31 +1214,84 @@ async fn a_disabled_account_cannot_sign_in_or_use_its_key() {
     open_registration(&router, &admin).await;
     no_approval(&router, &admin).await;
     let member = register(&router, "ben").await;
-    let member_id = get_json(&router, "/api/me", &member).await["id"].as_i64().unwrap();
+    let member_id = get_json(&router, "/api/me", &member).await["id"]
+        .as_i64()
+        .unwrap();
 
-    post_json(&router, "/api/connections", &admin, json!({ "name": "test", "base_url": base_url, "default_model": "reports-usage" })).await;
-    let (_, created) = post_json(&router, "/api/keys", &member, json!({ "name": "member key" })).await;
+    post_json(
+        &router,
+        "/api/connections",
+        &admin,
+        json!({ "name": "test", "base_url": base_url, "default_model": "reports-usage" }),
+    )
+    .await;
+    let (_, created) = post_json(
+        &router,
+        "/api/keys",
+        &member,
+        json!({ "name": "member key" }),
+    )
+    .await;
     let key = created["key"].as_str().unwrap().to_string();
 
-    let (status, body) = send_json(&router, http::Method::PATCH, &format!("/api/users/{member_id}"), &admin, json!({ "enabled": false })).await;
+    let (status, body) = send_json(
+        &router,
+        http::Method::PATCH,
+        &format!("/api/users/{member_id}"),
+        &admin,
+        json!({ "enabled": false }),
+    )
+    .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["changed"], json!(["enabled"]));
 
     // Disabling signs the account out, so the session it was already using stops working.
-    let response = call(&router, Request::get("/api/me").header("cookie", &member).body(Body::empty()).unwrap()).await;
+    let response = call(
+        &router,
+        Request::get("/api/me")
+            .header("cookie", &member)
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
 
-    let (status, _) = post_json(&router, "/api/login", "", json!({ "username": "ben", "password": "test-password" })).await;
+    let (status, _) = post_json(
+        &router,
+        "/api/login",
+        "",
+        json!({ "username": "ben", "password": "test-password" }),
+    )
+    .await;
     assert_eq!(status, StatusCode::FORBIDDEN);
 
     // The key is refused too, before any limit is looked at.
-    let response = gateway_call(&router, &key, json!({ "messages": [{ "role": "user", "content": "hi" }] })).await;
+    let response = gateway_call(
+        &router,
+        &key,
+        json!({ "messages": [{ "role": "user", "content": "hi" }] }),
+    )
+    .await;
     assert_eq!(response.status(), StatusCode::FORBIDDEN);
-    assert_eq!(json_body(response).await["error"]["type"], "account_disabled");
+    assert_eq!(
+        json_body(response).await["error"]["type"],
+        "account_disabled"
+    );
 
     // The model list is the same gateway path with the same key, so it is refused the same way.
-    let response = call(&router, Request::get("/v1/models").header("authorization", format!("Bearer {key}")).body(Body::empty()).unwrap()).await;
-    assert_eq!(response.status(), StatusCode::FORBIDDEN, "a key alone does not reach an upstream for an account that is off");
+    let response = call(
+        &router,
+        Request::get("/v1/models")
+            .header("authorization", format!("Bearer {key}"))
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(
+        response.status(),
+        StatusCode::FORBIDDEN,
+        "a key alone does not reach an upstream for an account that is off"
+    );
 }
 
 #[tokio::test]
@@ -841,32 +1302,83 @@ async fn an_admin_can_rename_an_account_and_set_a_new_password() {
     open_registration(&router, &admin).await;
     no_approval(&router, &admin).await;
     let member = register(&router, "ben").await;
-    let member_id = get_json(&router, "/api/me", &member).await["id"].as_i64().unwrap();
+    let member_id = get_json(&router, "/api/me", &member).await["id"]
+        .as_i64()
+        .unwrap();
     let path = format!("/api/users/{member_id}");
 
-    let (status, body) = send_json(&router, http::Method::PATCH, &path, &admin, json!({ "username": "bob" })).await;
+    let (status, body) = send_json(
+        &router,
+        http::Method::PATCH,
+        &path,
+        &admin,
+        json!({ "username": "bob" }),
+    )
+    .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["changed"], json!(["username"]));
 
     // A username that is taken is refused rather than silently overwritten, and an empty one
     // is refused before anything is written.
-    let (status, _) = send_json(&router, http::Method::PATCH, &path, &admin, json!({ "username": "ada" })).await;
+    let (status, _) = send_json(
+        &router,
+        http::Method::PATCH,
+        &path,
+        &admin,
+        json!({ "username": "ada" }),
+    )
+    .await;
     assert_eq!(status, StatusCode::CONFLICT);
-    let (status, _) = send_json(&router, http::Method::PATCH, &path, &admin, json!({ "username": " " })).await;
+    let (status, _) = send_json(
+        &router,
+        http::Method::PATCH,
+        &path,
+        &admin,
+        json!({ "username": " " }),
+    )
+    .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
 
     // Only the field in the body is applied, so setting a password leaves the limit alone.
-    send_json(&router, http::Method::PATCH, &path, &admin, json!({ "daily_token_cap": 100 })).await;
-    let (status, body) = send_json(&router, http::Method::PATCH, &path, &admin, json!({ "password": "another-password" })).await;
+    send_json(
+        &router,
+        http::Method::PATCH,
+        &path,
+        &admin,
+        json!({ "daily_token_cap": 100 }),
+    )
+    .await;
+    let (status, body) = send_json(
+        &router,
+        http::Method::PATCH,
+        &path,
+        &admin,
+        json!({ "password": "another-password" }),
+    )
+    .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["changed"], json!(["password"]));
 
-    let (status, _) = post_json(&router, "/api/login", "", json!({ "username": "bob", "password": "another-password" })).await;
+    let (status, _) = post_json(
+        &router,
+        "/api/login",
+        "",
+        json!({ "username": "bob", "password": "another-password" }),
+    )
+    .await;
     assert_eq!(status, StatusCode::OK);
 
     let summary = get_json(&router, "/api/stats/summary", &admin).await;
-    let bob = summary["users"].as_array().unwrap().iter().find(|user| user["username"] == "bob").unwrap();
-    assert_eq!(bob["daily_token_cap"], 100, "the password change did not clear the limit");
+    let bob = summary["users"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|user| user["username"] == "bob")
+        .unwrap();
+    assert_eq!(
+        bob["daily_token_cap"], 100,
+        "the password change did not clear the limit"
+    );
 }
 
 #[tokio::test]
@@ -875,22 +1387,50 @@ async fn deleting_an_account_takes_its_keys_and_its_usage_with_it() {
     let router = build_router(st.clone());
     let base_url = mock_upstream().await;
     let admin = register(&router, "ada").await;
-    let admin_id = get_json(&router, "/api/me", &admin).await["id"].as_i64().unwrap();
+    let admin_id = get_json(&router, "/api/me", &admin).await["id"]
+        .as_i64()
+        .unwrap();
     open_registration(&router, &admin).await;
     no_approval(&router, &admin).await;
     let member = register(&router, "ben").await;
-    let member_id = get_json(&router, "/api/me", &member).await["id"].as_i64().unwrap();
+    let member_id = get_json(&router, "/api/me", &member).await["id"]
+        .as_i64()
+        .unwrap();
     let path = format!("/api/users/{member_id}");
 
-    post_json(&router, "/api/connections", &admin, json!({ "name": "test", "base_url": base_url, "default_model": "reports-usage" })).await;
-    let (_, created) = post_json(&router, "/api/keys", &member, json!({ "name": "member key" })).await;
-    gateway_call(&router, created["key"].as_str().unwrap(), json!({ "messages": [{ "role": "user", "content": "hi" }] })).await;
+    post_json(
+        &router,
+        "/api/connections",
+        &admin,
+        json!({ "name": "test", "base_url": base_url, "default_model": "reports-usage" }),
+    )
+    .await;
+    let (_, created) = post_json(
+        &router,
+        "/api/keys",
+        &member,
+        json!({ "name": "member key" }),
+    )
+    .await;
+    gateway_call(
+        &router,
+        created["key"].as_str().unwrap(),
+        json!({ "messages": [{ "role": "user", "content": "hi" }] }),
+    )
+    .await;
     assert_eq!(usage_count(&st.pool, member_id).await, 1);
 
     // A member is not an admin, and an admin cannot remove the account they are signed in with.
     let (status, _) = send_json(&router, http::Method::DELETE, &path, &member, json!({})).await;
     assert_eq!(status, StatusCode::FORBIDDEN);
-    let (status, _) = send_json(&router, http::Method::DELETE, &format!("/api/users/{admin_id}"), &admin, json!({})).await;
+    let (status, _) = send_json(
+        &router,
+        http::Method::DELETE,
+        &format!("/api/users/{admin_id}"),
+        &admin,
+        json!({}),
+    )
+    .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
 
     let (status, _) = send_json(&router, http::Method::DELETE, &path, &admin, json!({})).await;
@@ -956,10 +1496,21 @@ async fn an_existing_database_with_the_old_columns_is_moved_to_the_current_shape
 
     // The account keeps its name and its limit; only the column names changed, and the email is
     // gone with no place left for it.
-    let row = sqlx::query("SELECT username, role, daily_token_cap, enabled FROM users").fetch_one(&pool).await.unwrap();
+    let row = sqlx::query("SELECT username, role, daily_token_cap, enabled FROM users")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
     assert_eq!(row.get::<String, _>("username"), "ada");
-    assert_eq!(row.get::<i64, _>("daily_token_cap"), 500, "the stored limit still applies");
-    assert_eq!(row.get::<i64, _>("enabled"), 1, "an existing account is enabled by default");
+    assert_eq!(
+        row.get::<i64, _>("daily_token_cap"),
+        500,
+        "the stored limit still applies"
+    );
+    assert_eq!(
+        row.get::<i64, _>("enabled"),
+        1,
+        "an existing account is enabled by default"
+    );
 
     // Running it again on a database that is already current changes nothing.
     db::migrate(&pool).await.unwrap();
@@ -974,7 +1525,10 @@ async fn an_existing_database_with_the_old_columns_is_moved_to_the_current_shape
     assert_eq!(count(&pool, "sessions").await, 1);
 
     // Foreign keys are left on, so removing an account still takes its keys, usage and sessions.
-    sqlx::query("DELETE FROM users WHERE id = 1").execute(&pool).await.unwrap();
+    sqlx::query("DELETE FROM users WHERE id = 1")
+        .execute(&pool)
+        .await
+        .unwrap();
     assert_eq!(usage_count(&pool, 1).await, 0);
     assert_eq!(count(&pool, "api_keys").await, 0);
     assert_eq!(count(&pool, "sessions").await, 0);
@@ -1032,11 +1586,22 @@ async fn an_account_table_with_a_unique_email_and_a_current_limit_is_rebuilt() {
         user_columns(&pool).await.join(","),
         "created_at,daily_token_cap,enabled,id,password_hash,pending,role,username"
     );
-    let row = sqlx::query("SELECT username, daily_token_cap, enabled, pending FROM users").fetch_one(&pool).await.unwrap();
+    let row = sqlx::query("SELECT username, daily_token_cap, enabled, pending FROM users")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
     assert_eq!(row.get::<String, _>("username"), "ada");
     assert_eq!(row.get::<i64, _>("daily_token_cap"), 500);
-    assert_eq!(row.get::<i64, _>("pending"), 0, "an account that was already there is not held for approval");
-    assert_eq!(count(&pool, "sessions").await, 1, "the sign-in for this account is still there");
+    assert_eq!(
+        row.get::<i64, _>("pending"),
+        0,
+        "an account that was already there is not held for approval"
+    );
+    assert_eq!(
+        count(&pool, "sessions").await,
+        1,
+        "the sign-in for this account is still there"
+    );
 }
 
 async fn user_columns(pool: &SqlitePool) -> Vec<String> {
@@ -1062,7 +1627,10 @@ async fn a_database_that_takes_usage_with_a_deleted_key_is_moved_to_the_current_
 
     // A usage table as it was written before a recorded request outlived its key: the column
     // could not be null and the row went with the key.
-    sqlx::query("DROP TABLE usage").execute(&pool).await.unwrap();
+    sqlx::query("DROP TABLE usage")
+        .execute(&pool)
+        .await
+        .unwrap();
     sqlx::query(
         "CREATE TABLE usage (
             id INTEGER PRIMARY KEY,
@@ -1099,15 +1667,25 @@ async fn a_database_that_takes_usage_with_a_deleted_key_is_moved_to_the_current_
     db::migrate(&pool).await.unwrap();
 
     // The rows that were already recorded stand, and the key reference now sets the column null.
-    sqlx::query("DELETE FROM api_keys WHERE id = 1").execute(&pool).await.unwrap();
-    assert_eq!(usage_count(&pool, 1).await, 1, "the recorded usage outlives the key");
+    sqlx::query("DELETE FROM api_keys WHERE id = 1")
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        usage_count(&pool, 1).await,
+        1,
+        "the recorded usage outlives the key"
+    );
 
     // Running it again on a table that is already current changes nothing.
     db::migrate(&pool).await.unwrap();
     assert_eq!(usage_count(&pool, 1).await, 1);
 
     // An account still takes the rows that belong to it.
-    sqlx::query("DELETE FROM users WHERE id = 1").execute(&pool).await.unwrap();
+    sqlx::query("DELETE FROM users WHERE id = 1")
+        .execute(&pool)
+        .await
+        .unwrap();
     assert_eq!(usage_count(&pool, 1).await, 0);
 }
 
@@ -1118,35 +1696,78 @@ async fn the_summary_separates_the_callers_own_figures_from_the_platform_total()
     let base_url = mock_upstream().await;
 
     let admin = register(&router, "ada").await;
-    post_json(&router, "/api/connections", &admin, json!({ "name": "test", "base_url": base_url, "default_model": "reports-usage" })).await;
-    let (_, admin_key) = post_json(&router, "/api/keys", &admin, json!({ "name": "admin key" })).await;
-    gateway_call(&router, admin_key["key"].as_str().unwrap(), json!({ "messages": [{ "role": "user", "content": "hi" }] })).await;
+    post_json(
+        &router,
+        "/api/connections",
+        &admin,
+        json!({ "name": "test", "base_url": base_url, "default_model": "reports-usage" }),
+    )
+    .await;
+    let (_, admin_key) =
+        post_json(&router, "/api/keys", &admin, json!({ "name": "admin key" })).await;
+    gateway_call(
+        &router,
+        admin_key["key"].as_str().unwrap(),
+        json!({ "messages": [{ "role": "user", "content": "hi" }] }),
+    )
+    .await;
 
     open_registration(&router, &admin).await;
     no_approval(&router, &admin).await;
     let member = register(&router, "ben").await;
-    let (_, member_key) = post_json(&router, "/api/keys", &member, json!({ "name": "member key" })).await;
-    gateway_call(&router, member_key["key"].as_str().unwrap(), json!({ "messages": [{ "role": "user", "content": "hi" }] })).await;
+    let (_, member_key) = post_json(
+        &router,
+        "/api/keys",
+        &member,
+        json!({ "name": "member key" }),
+    )
+    .await;
+    gateway_call(
+        &router,
+        member_key["key"].as_str().unwrap(),
+        json!({ "messages": [{ "role": "user", "content": "hi" }] }),
+    )
+    .await;
 
     // The summary reports the caller's own figures and the platform total separately, so the
     // page does not have to infer which one it is showing. The generated side is reported for
     // both scopes, because the overview shows it for both.
     let admin_summary = get_json(&router, "/api/stats/summary", &admin).await;
-    assert_eq!(admin_summary["self"]["requests"], 1, "an admin's own figures are their own");
+    assert_eq!(
+        admin_summary["self"]["requests"], 1,
+        "an admin's own figures are their own"
+    );
     assert_eq!(admin_summary["self"]["total_tokens"], 18);
-    assert_eq!(admin_summary["self"]["completion_tokens"], 7, "the own figures carry the generated side, not only the total");
+    assert_eq!(
+        admin_summary["self"]["completion_tokens"], 7,
+        "the own figures carry the generated side, not only the total"
+    );
     assert_eq!(admin_summary["global"]["requests"], 2);
     assert_eq!(admin_summary["global"]["total_tokens"], 36);
-    assert_eq!(admin_summary["hourly"].as_array().unwrap().len(), 1, "the charts are per account");
+    assert_eq!(
+        admin_summary["hourly"].as_array().unwrap().len(),
+        1,
+        "the charts are per account"
+    );
     assert_eq!(admin_summary["models"].as_array().unwrap().len(), 1);
     assert_eq!(admin_summary["users"].as_array().unwrap().len(), 2);
 
     let member_summary = get_json(&router, "/api/stats/summary", &member).await;
     assert_eq!(member_summary["self"]["requests"], 1, "{member_summary}");
     assert_eq!(member_summary["self"]["total_tokens"], 18);
-    assert_eq!(member_summary["self"]["completion_tokens"], 7, "a member sees the generated side of their own usage");
-    assert_eq!(member_summary["global"]["requests"], 2, "the platform total is not scoped");
-    assert_eq!(member_summary["users"].as_array().unwrap().len(), 0, "a member does not see other accounts");
+    assert_eq!(
+        member_summary["self"]["completion_tokens"], 7,
+        "a member sees the generated side of their own usage"
+    );
+    assert_eq!(
+        member_summary["global"]["requests"], 2,
+        "the platform total is not scoped"
+    );
+    assert_eq!(
+        member_summary["users"].as_array().unwrap().len(),
+        0,
+        "a member does not see other accounts"
+    );
 
     let recent = get_json(&router, "/api/stats/recent", &member).await;
     assert_eq!(recent["events"].as_array().unwrap().len(), 1);
@@ -1158,7 +1779,9 @@ async fn presence_counts_an_account_while_its_request_is_running() {
     let st = test_state().await;
     let router = build_router(st.clone());
     let admin = register(&router, "ada").await;
-    let admin_id = get_json(&router, "/api/me", &admin).await["id"].as_i64().unwrap();
+    let admin_id = get_json(&router, "/api/me", &admin).await["id"]
+        .as_i64()
+        .unwrap();
 
     // The gateway holds the same guard for the length of a request, so holding it here is what
     // a running request looks like: generating and online at the same time.
@@ -1170,7 +1793,10 @@ async fn presence_counts_an_account_while_its_request_is_running() {
 
     drop(active);
     let after = get_json(&router, "/api/presence", &admin).await;
-    assert_eq!(after["generating"], 0, "the guard is released when the request ends");
+    assert_eq!(
+        after["generating"], 0,
+        "the guard is released when the request ends"
+    );
     assert_eq!(after["online"], 1, "still inside the five minute window");
 
     // Names are scoped like the rest of the stats: a member sees the counts, not the accounts.
@@ -1183,8 +1809,14 @@ async fn presence_counts_an_account_while_its_request_is_running() {
 
 #[tokio::test]
 async fn endpoint_urls_follow_the_openai_convention() {
-    assert_eq!(dreamgate::registry::endpoint("http://localhost:11434", "models"), "http://localhost:11434/v1/models");
-    assert_eq!(dreamgate::registry::endpoint("https://api.example.com/v1/", "models"), "https://api.example.com/v1/models");
+    assert_eq!(
+        dreamgate::registry::endpoint("http://localhost:11434", "models"),
+        "http://localhost:11434/v1/models"
+    );
+    assert_eq!(
+        dreamgate::registry::endpoint("https://api.example.com/v1/", "models"),
+        "https://api.example.com/v1/models"
+    );
 }
 
 #[tokio::test]
@@ -1209,24 +1841,59 @@ async fn only_an_admin_can_change_a_connection_and_read_the_key_it_carries() {
     // The page shows a connection to every account, because the gate readout and the model list
     // need it. The key it carries is a secret, so that part goes to an admin alone.
     let member_view = get_json(&router, "/api/connections", &member).await;
-    assert_eq!(member_view["connections"][0]["name"], "test", "the connection itself is still readable");
+    assert_eq!(
+        member_view["connections"][0]["name"], "test",
+        "the connection itself is still readable"
+    );
     assert!(member_view["connections"][0]["api_key"].is_null());
     let admin_view = get_json(&router, "/api/connections", &admin).await;
     assert_eq!(admin_view["connections"][0]["api_key"], "upstream-secret");
 
     // Adding, removing and checking a connection is admin-only in the page, so the rule has to be
     // on the routes as well rather than only on the view.
-    let (status, _) = post_json(&router, "/api/connections", &member, json!({ "name": "another", "base_url": "http://127.0.0.1:2" })).await;
+    let (status, _) = post_json(
+        &router,
+        "/api/connections",
+        &member,
+        json!({ "name": "another", "base_url": "http://127.0.0.1:2" }),
+    )
+    .await;
     assert_eq!(status, StatusCode::FORBIDDEN);
-    let (status, _) = post_json(&router, &format!("/api/connections/{id}/check"), &member, json!({})).await;
+    let (status, _) = post_json(
+        &router,
+        &format!("/api/connections/{id}/check"),
+        &member,
+        json!({}),
+    )
+    .await;
     assert_eq!(status, StatusCode::FORBIDDEN);
-    let (status, _) = send_json(&router, http::Method::DELETE, &format!("/api/connections/{id}"), &member, json!({})).await;
+    let (status, _) = send_json(
+        &router,
+        http::Method::DELETE,
+        &format!("/api/connections/{id}"),
+        &member,
+        json!({}),
+    )
+    .await;
     assert_eq!(status, StatusCode::FORBIDDEN);
 
     // For an admin the same routes work as they always did.
-    let (status, _) = post_json(&router, &format!("/api/connections/{id}/check"), &admin, json!({})).await;
+    let (status, _) = post_json(
+        &router,
+        &format!("/api/connections/{id}/check"),
+        &admin,
+        json!({}),
+    )
+    .await;
     assert_eq!(status, StatusCode::OK);
-    let (status, _) = send_json(&router, http::Method::DELETE, &format!("/api/connections/{id}"), &admin, json!({})).await;
+    let (status, _) = send_json(
+        &router,
+        http::Method::DELETE,
+        &format!("/api/connections/{id}"),
+        &admin,
+        json!({}),
+    )
+    .await;
     assert_eq!(status, StatusCode::OK);
 }
 
@@ -1236,10 +1903,28 @@ async fn a_sign_in_does_not_say_which_part_was_wrong() {
     let router = build_router(st.clone());
     register(&router, "ada").await;
 
-    let (_, unknown) = post_json(&router, "/api/login", "", json!({ "username": "ben", "password": "test-password" })).await;
-    let (_, mismatch) = post_json(&router, "/api/login", "", json!({ "username": "ada", "password": "wrong-password" })).await;
-    assert_eq!(unknown["error"]["message"], "username or password is not correct");
-    assert_eq!(mismatch["error"]["message"], unknown["error"]["message"], "an attempt cannot list the accounts");
+    let (_, unknown) = post_json(
+        &router,
+        "/api/login",
+        "",
+        json!({ "username": "ben", "password": "test-password" }),
+    )
+    .await;
+    let (_, mismatch) = post_json(
+        &router,
+        "/api/login",
+        "",
+        json!({ "username": "ada", "password": "wrong-password" }),
+    )
+    .await;
+    assert_eq!(
+        unknown["error"]["message"],
+        "username or password is not correct"
+    );
+    assert_eq!(
+        mismatch["error"]["message"], unknown["error"]["message"],
+        "an attempt cannot list the accounts"
+    );
 }
 
 #[tokio::test]
@@ -1249,18 +1934,36 @@ async fn sign_in_attempts_for_one_account_are_bounded() {
     register(&router, "ada").await;
 
     for _ in 0..10 {
-        let (status, _) = post_json(&router, "/api/login", "", json!({ "username": "ada", "password": "wrong-password" })).await;
+        let (status, _) = post_json(
+            &router,
+            "/api/login",
+            "",
+            json!({ "username": "ada", "password": "wrong-password" }),
+        )
+        .await;
         assert_eq!(status, StatusCode::UNAUTHORIZED);
     }
     // The eleventh attempt is refused even with the right password, so the loop is bounded rather
     // than paid for with a bcrypt hash per call.
-    let (status, body) = post_json(&router, "/api/login", "", json!({ "username": "ada", "password": "test-password" })).await;
+    let (status, body) = post_json(
+        &router,
+        "/api/login",
+        "",
+        json!({ "username": "ada", "password": "test-password" }),
+    )
+    .await;
     assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
     assert_eq!(body["error"]["type"], "too_many_attempts");
 
     // The window is per account, so another account is not limited by what was tried against the
     // first one.
-    let (status, _) = post_json(&router, "/api/login", "", json!({ "username": "nobody", "password": "wrong-password" })).await;
+    let (status, _) = post_json(
+        &router,
+        "/api/login",
+        "",
+        json!({ "username": "nobody", "password": "wrong-password" }),
+    )
+    .await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
 }
 
@@ -1269,7 +1972,9 @@ async fn a_session_older_than_the_window_the_cookie_last_is_refused() {
     let st = test_state().await;
     let router = build_router(st.clone());
     let admin = register(&router, "ada").await;
-    let admin_id = get_json(&router, "/api/me", &admin).await["id"].as_i64().unwrap();
+    let admin_id = get_json(&router, "/api/me", &admin).await["id"]
+        .as_i64()
+        .unwrap();
 
     sqlx::query("INSERT INTO sessions (token, user_id, created_at) VALUES (?, ?, datetime('now', '-31 days'))")
         .bind("kept-token")
@@ -1278,11 +1983,29 @@ async fn a_session_older_than_the_window_the_cookie_last_is_refused() {
         .await
         .unwrap();
 
-    let response = call(&router, Request::get("/api/me").header("cookie", "dg_session=kept-token").body(Body::empty()).unwrap()).await;
-    assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "a token that is kept and replayed does not work forever");
+    let response = call(
+        &router,
+        Request::get("/api/me")
+            .header("cookie", "dg_session=kept-token")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(
+        response.status(),
+        StatusCode::UNAUTHORIZED,
+        "a token that is kept and replayed does not work forever"
+    );
 
     // The account itself is still signed in with its own session.
-    let response = call(&router, Request::get("/api/me").header("cookie", &admin).body(Body::empty()).unwrap()).await;
+    let response = call(
+        &router,
+        Request::get("/api/me")
+            .header("cookie", &admin)
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
     assert_eq!(response.status(), StatusCode::OK);
 }
 
@@ -1294,13 +2017,19 @@ async fn the_session_cookie_is_marked_secure_only_when_the_request_arrived_over_
 
     let plain = call(
         &router,
-        Request::post("/api/register").header("content-type", "application/json").body(Body::from(body.clone())).unwrap(),
+        Request::post("/api/register")
+            .header("content-type", "application/json")
+            .body(Body::from(body.clone()))
+            .unwrap(),
     )
     .await;
     assert_eq!(plain.status(), StatusCode::OK);
     let plain_cookie = plain.headers().get("set-cookie").unwrap().to_str().unwrap();
     assert!(plain_cookie.contains("HttpOnly") && plain_cookie.contains("SameSite=Lax"));
-    assert!(!plain_cookie.contains("Secure"), "plain HTTP cannot promise a secure cookie");
+    assert!(
+        !plain_cookie.contains("Secure"),
+        "plain HTTP cannot promise a secure cookie"
+    );
 
     // Behind a TLS-terminating proxy the same response can promise it, and the proxy header is
     // what says so.
@@ -1315,6 +2044,12 @@ async fn the_session_cookie_is_marked_secure_only_when_the_request_arrived_over_
     .await;
     assert_eq!(tls.status(), StatusCode::OK);
     let cookie = tls.headers().get("set-cookie").unwrap().to_str().unwrap();
-    assert!(cookie.contains("Secure"), "the cookie is marked Secure when the request came over TLS");
-    assert!(cookie.contains("Max-Age=2592000"), "the cookie and the stored session last the same window");
+    assert!(
+        cookie.contains("Secure"),
+        "the cookie is marked Secure when the request came over TLS"
+    );
+    assert!(
+        cookie.contains("Max-Age=2592000"),
+        "the cookie and the stored session last the same window"
+    );
 }

@@ -1,4 +1,4 @@
-use axum::extract::{State as AxumState};
+use axum::extract::State as AxumState;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Json, Response};
 use serde_json::json;
@@ -19,7 +19,11 @@ fn scope_clause(scoped: bool, column: &str) -> String {
     }
 }
 
-pub async fn totals(st: &State, scoped: bool, user_id: i64) -> Result<serde_json::Value, sqlx::Error> {
+pub async fn totals(
+    st: &State,
+    scoped: bool,
+    user_id: i64,
+) -> Result<serde_json::Value, sqlx::Error> {
     let sql = format!(
         "SELECT COUNT(*) AS requests, \
                 COALESCE(SUM(prompt_tokens), 0) AS prompt_tokens, \
@@ -50,7 +54,13 @@ pub async fn totals(st: &State, scoped: bool, user_id: i64) -> Result<serde_json
     }))
 }
 
-async fn buckets(st: &State, scoped: bool, user_id: i64, expr: &str, window: &str) -> Result<Vec<serde_json::Value>, sqlx::Error> {
+async fn buckets(
+    st: &State,
+    scoped: bool,
+    user_id: i64,
+    expr: &str,
+    window: &str,
+) -> Result<Vec<serde_json::Value>, sqlx::Error> {
     let sql = format!(
         "SELECT {expr} AS bucket, COUNT(*) AS requests, COALESCE(SUM(total_tokens), 0) AS tokens, \
                 SUM(CASE WHEN status >= 400 THEN 1 ELSE 0 END) AS errors \
@@ -80,7 +90,12 @@ async fn buckets(st: &State, scoped: bool, user_id: i64, expr: &str, window: &st
         .collect())
 }
 
-async fn grouped(st: &State, scoped: bool, user_id: i64, sql: &str) -> Result<Vec<serde_json::Value>, sqlx::Error> {
+async fn grouped(
+    st: &State,
+    scoped: bool,
+    user_id: i64,
+    sql: &str,
+) -> Result<Vec<serde_json::Value>, sqlx::Error> {
     let query = if scoped {
         sqlx::query(sqlx::AssertSqlSafe(sql)).bind(user_id)
     } else {
@@ -93,9 +108,14 @@ async fn grouped(st: &State, scoped: bool, user_id: i64, sql: &str) -> Result<Ve
             let mut out = serde_json::Map::new();
             for column in row.columns() {
                 let name = column.name();
-                let value = row.try_get::<i64, _>(name)
+                let value = row
+                    .try_get::<i64, _>(name)
                     .map(serde_json::Value::from)
-                    .unwrap_or_else(|_| serde_json::Value::String(row.try_get::<String, _>(name).unwrap_or_default()));
+                    .unwrap_or_else(|_| {
+                        serde_json::Value::String(
+                            row.try_get::<String, _>(name).unwrap_or_default(),
+                        )
+                    });
                 out.insert(name.to_string(), value);
             }
             serde_json::Value::Object(out)
@@ -140,8 +160,22 @@ async fn build_summary(st: &State, caller: &Caller) -> Result<serde_json::Value,
 
     let self_totals = totals(st, true, caller.id).await?;
     let global = totals(st, false, caller.id).await?;
-    let hourly = buckets(st, true, caller.id, "strftime('%Y-%m-%dT%H:00:00Z', created_at)", "-24 hours").await?;
-    let daily = buckets(st, true, caller.id, "strftime('%Y-%m-%d', created_at)", "-14 days").await?;
+    let hourly = buckets(
+        st,
+        true,
+        caller.id,
+        "strftime('%Y-%m-%dT%H:00:00Z', created_at)",
+        "-24 hours",
+    )
+    .await?;
+    let daily = buckets(
+        st,
+        true,
+        caller.id,
+        "strftime('%Y-%m-%d', created_at)",
+        "-14 days",
+    )
+    .await?;
     let models = grouped(
         st,
         !admin,
@@ -153,7 +187,11 @@ async fn build_summary(st: &State, caller: &Caller) -> Result<serde_json::Value,
         ),
     )
     .await?;
-    let users = if admin { accounts(st).await? } else { Vec::new() };
+    let users = if admin {
+        accounts(st).await?
+    } else {
+        Vec::new()
+    };
 
     Ok(json!({
         "self": self_totals,
@@ -168,7 +206,11 @@ async fn build_summary(st: &State, caller: &Caller) -> Result<serde_json::Value,
 pub async fn summary(AxumState(st): AxumState<State>, caller: Caller) -> Response {
     match build_summary(&st, &caller).await {
         Ok(summary) => Json(summary).into_response(),
-        Err(err) => error(StatusCode::INTERNAL_SERVER_ERROR, "server_error", err.to_string()),
+        Err(err) => error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "server_error",
+            err.to_string(),
+        ),
     }
 }
 
@@ -190,7 +232,13 @@ pub async fn recent(AxumState(st): AxumState<State>, caller: Caller) -> Response
     };
     let rows = match query.fetch_all(&st.pool).await {
         Ok(rows) => rows,
-        Err(err) => return error(StatusCode::INTERNAL_SERVER_ERROR, "server_error", err.to_string()),
+        Err(err) => {
+            return error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "server_error",
+                err.to_string(),
+            );
+        }
     };
     let events: Vec<serde_json::Value> = rows
         .iter()
