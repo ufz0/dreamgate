@@ -29,7 +29,8 @@ the default applies to it, which is not the same as a capability of one.
 
 Environment variables:
 
-- `DREAMGATE_ADDR` — listen address, default `0.0.0.0:8787`
+- `DREAMGATE_ADDR` — listen address, default `0.0.0.0:8787`. The dashboard address printed at start is this
+  address, or loopback of the same family when it binds every interface
 - `DREAMGATE_DB` — SQLite path, default `data/dreamgate.db`
 - `DREAMGATE_DB_POOL` — how many requests can be at the database at once, default 16
 - `DREAMGATE_MAX_CONCURRENT` — how many requests the gateway takes at once in total, default 32
@@ -366,7 +367,8 @@ single-threaded runtime would measure one worker rather than the gateway. There 
 Rust, so what stands in its place is that shared state is only reachable through types the compiler requires to
 be `Send` and `Sync`, plus running the concurrency tests repeatedly. The environment variables themselves are
 read in `src/main.rs`, which is the composition root and nothing in the suite reaches it, so the pool size is not
-exercised by a test. The two time bounds are exercised, because the tests build the client and the state through
+exercised by a test; the one thing tested there is the dashboard address the startup line names, a unit test
+beside the function that picks it. The two time bounds are exercised, because the tests build the client and the state through
 the same functions the gateway uses; the connect timeout and the number of connections kept idle are read through
 that builder but no test asserts what they do. The pool and the busy timeout are exercised through `db::connect`
 against a shared-cache in-memory database, which is not the same mechanism as writer contention on a file.

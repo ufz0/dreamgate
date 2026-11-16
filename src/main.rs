@@ -41,20 +41,48 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let bound = listener.local_addr()?;
     println!("DreamGate listening on {bound}");
     println!("  gateway:   POST /v1/chat/completions (OpenAI compatible)");
-    // An address that binds every interface is not one a browser can open, so the line names loopback of
-    // the same family for it. A specific address is the only one that answers, so it is named as it is.
-    let dashboard = if bound.ip().is_unspecified() {
-        let loopback: IpAddr = if bound.is_ipv4() {
-            Ipv4Addr::LOCALHOST.into()
-        } else {
-            Ipv6Addr::LOCALHOST.into()
-        };
-        SocketAddr::new(loopback, bound.port())
-    } else {
-        bound
-    };
-    println!("  dashboard: http://{dashboard}/");
+    println!("  dashboard: http://{}/", dashboard_address(bound));
 
     axum::serve(listener, build_router(st)).await?;
     Ok(())
+}
+
+// A bind to every interface names no host to connect to: Windows refuses that address, and browsers block
+// it even where the system would connect, so the line names loopback, which the bind includes. Loopback is
+// taken from the bound family because a [::] bind can be IPv6 only (the default on Windows, and on Linux
+// with bindv6only set), where 127.0.0.1 would not answer. A specific address is the only one that answers,
+// so it is named as it is.
+fn dashboard_address(bound: SocketAddr) -> SocketAddr {
+    if !bound.ip().is_unspecified() {
+        return bound;
+    }
+    let loopback: IpAddr = if bound.is_ipv4() {
+        Ipv4Addr::LOCALHOST.into()
+    } else {
+        Ipv6Addr::LOCALHOST.into()
+    };
+    SocketAddr::new(loopback, bound.port())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_dashboard_address_is_one_that_answers() {
+        for (bound, named) in [
+            ("0.0.0.0:8787", "127.0.0.1:8787"),
+            ("[::]:8787", "[::1]:8787"),
+            ("127.0.0.1:8787", "127.0.0.1:8787"),
+            ("[::1]:8787", "[::1]:8787"),
+            ("10.0.0.22:8787", "10.0.0.22:8787"),
+        ] {
+            let bound: SocketAddr = bound.parse().unwrap();
+            assert_eq!(
+                dashboard_address(bound).to_string(),
+                named,
+                "bound to {bound}"
+            );
+        }
+    }
 }
