@@ -343,7 +343,11 @@ tr.off td { color: var(--text-muted); }
   padding: 3px 8px;
   font-size: 13px;
   color: var(--text-muted);
+  white-space: nowrap;
 }
+
+/* A chip's text is smaller than the body's, so its glyph is drawn at the size a menu button uses. */
+.chip .icon svg { width: 14px; height: 14px; }
 
 .chip.ok { color: var(--success); }
 .chip.down { color: var(--danger); }
@@ -369,6 +373,10 @@ tr.off td { color: var(--text-muted); }
 
 .menu-button .icon svg { width: 14px; height: 14px; }
 
+/* The last glyph in a menu button is the chevron, and it points the way the list opens. The expand
+   buttons use the same glyph pointing right, so a menu turns it rather than reading as one of those. */
+.menu-button .icon:last-child svg { transform: rotate(90deg); }
+
 .menu {
   position: absolute;
   z-index: 3;
@@ -384,11 +392,12 @@ tr.off td { color: var(--text-muted); }
   box-shadow: var(--shadow-pop);
 }
 
-/* The theme control sits at the bottom of the shell, so its list always opens upward. The height is not
-   set here: app.js caps it to the room above the button when the menu is shown, because a stylesheet
-   knows the window size but not where the button is, and an uncapped list runs past the top of a short
-   screen. */
+/* The theme control sits at the bottom of the shell, so its list always opens upward, and its chevron
+   points up with it. The height is not set here: app.js caps it to the room above the button when the
+   menu is shown, because a stylesheet knows the window size but not where the button is, and an uncapped
+   list runs past the top of a short screen. */
 .menu-wrap[data-name="theme"] .menu { top: auto; bottom: calc(100% + 4px); overflow: auto; }
+.menu-wrap[data-name="theme"] .menu-button .icon:last-child svg { transform: rotate(-90deg); }
 
 .menu li {
   display: flex;
@@ -460,7 +469,11 @@ button[type="submit"] {
 
 button[type="submit"]:hover { background: var(--accent-hover); border-color: var(--accent-hover); }
 
+/* A row, so a glyph sits beside its label on the same centre line instead of on the text baseline. */
 button.ghost {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
   background: none;
   border: 0;
   padding: 6px;

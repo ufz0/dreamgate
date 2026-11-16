@@ -217,10 +217,12 @@ URL hash (`#/overview`, `#/activity`, `#/keys`, `#/connections`, `#/connect`, `#
   reads dimmer than the keys that work. The table is this account's own keys for anyone; under it an
   admin can pick another account, or all of them, and see those keys with the account each one
   belongs to.
-- **Connections** — add and health-check upstreams. Admin-only, like the per-account figures, and
-  that rule is on the routes as well as on the page. The key a connection carries is returned to an
-  admin alone; every signed-in account still sees the connection itself, because the gate readout and
-  the model list need it.
+- **Connections** — add and health-check upstreams. A connection that no check has reached yet reads
+  "not checked yet" rather than down, here and in the gate readout on the Overview, because the gateway
+  only skips one whose check failed. Admin-only, like the per-account figures, and that rule is on the
+  routes as well as on the page. The key a connection carries is returned to an admin alone; every
+  signed-in account still sees the connection itself, because the gate readout and the model list need
+  it.
 - **Connect a client** — the base URL, a key picker, a copyable curl request.
 - **Sandbox** — chat with any model a connection serves, through the same gateway the clients
   use, so the request is recorded like any other. Pick a key and a model from the connection's

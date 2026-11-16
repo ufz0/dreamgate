@@ -12,18 +12,20 @@ const keyLabel = (event) => event.key || 'key removed';
 
 const ICONS = {
   overview: '<path d="M4 17a8 8 0 0 1 16 0"/><path d="M12 14l4-3"/>',
-  activity: '<path d="M4 6h16M4 12h12M4 18h8"/>',
+  activity: '<path d="M3 12h4l3-8 4 16 3-8h4"/>',
   keys: '<circle cx="8.5" cy="12" r="3.5"/><path d="M12 12h9M18 12v4M21 12v-3"/>',
   connections: '<path d="M9 3v5M15 3v5M8 8h8v6a4 4 0 0 1-8 0z"/>',
   client: '<path d="M9 7l-5 5 5 5M15 7l5 5-5 5"/>',
   accounts: '<circle cx="12" cy="9" r="4"/><path d="M4 20a8 8 0 0 1 16 0"/>',
   sandbox: '<path d="M4 5h16v11H9l-5 4z"/><path d="M8 10h8"/>',
   check: '<circle cx="12" cy="12" r="9"/><path d="M8.5 12.5l2.5 2.5 5-5"/>',
-  alert: '<path d="M12 4l8 14H4z"/><path d="M12 9v4"/>',
+  alert: '<path d="M12 3l9 17H3z"/><path d="M12 9v4M12 16.5h.01"/>',
+  pending: '<circle cx="12" cy="12" r="9"/><path d="M12 7.5V12l3 2"/>',
   chevron: '<path d="M9 6l6 6-6 6"/>',
   panel: '<rect x="3" y="4" width="18" height="16" rx="2"/><path d="M9 4v16"/>',
   exit: '<path d="M15 4H6a2 2 0 0 0-2 2v12a2 2 0 0 0 2 2h9"/><path d="M16 12h5M19 9l3 3-3 3"/>',
-  theme: '<circle cx="12" cy="12" r="8"/><path d="M12 4v16"/>',
+  // Half of the circle is filled, which is what reads as light and dark; the rest of the set is outline only.
+  theme: '<circle cx="12" cy="12" r="8"/><path d="M12 4a8 8 0 0 1 0 16z" fill="currentColor"/>',
 };
 
 function icon(name) {
@@ -32,6 +34,20 @@ function icon(name) {
 
 function paintIcons(root) {
   for (const el of root.querySelectorAll('[data-icon]')) el.innerHTML = icon(el.dataset.icon);
+}
+
+// The stored health is unknown until a check has run on a connection, which is not the same as down: the
+// gateway only skips a connection whose check failed, so one that was never checked does not get the
+// warning. A value this page does not know is shown as it is stored rather than read as one of these.
+const HEALTH = {
+  ok: ['ok', 'check', 'ok'],
+  down: ['down', 'alert', 'down'],
+  unknown: ['', 'pending', 'not checked yet'],
+};
+
+function healthChip(health) {
+  const [kind, glyph, label] = Object.hasOwn(HEALTH, health) ? HEALTH[health] : ['', null, health];
+  return `<span class="chip ${kind}">${glyph ? `<span class="icon">${icon(glyph)}</span>` : ''}<span>${esc(label)}</span></span>`;
 }
 
 const state = {
@@ -446,9 +462,10 @@ function renderGate() {
   const bound = key && key.connection_id ? state.connections.find((c) => c.id === key.connection_id && c.enabled) : null;
   const conn = bound || topConnection();
   $('gate-key').textContent = last ? last.key : (state.keys.length ? state.keys[0].name : 'no key yet');
-  $('gate-upstream').innerHTML = conn
-    ? `${esc(conn.name)} <span class="chip ${conn.health === 'ok' ? 'ok' : 'down'}">${icon(conn.health === 'ok' ? 'check' : 'alert')}<span>${esc(conn.health)}</span></span>`
-    : 'no connection yet';
+  // The name is clamped to the width of a leg, and the chip sits beside it rather than inside it, so a
+  // long name is cut short and the health still shows.
+  $('gate-upstream').textContent = conn ? conn.name : 'no connection yet';
+  $('gate-health').innerHTML = conn ? healthChip(conn.health) : '';
 
   if (!last) {
     $('gate-read').textContent = 'Nothing has crossed the gate yet.';
@@ -663,7 +680,7 @@ function renderConnections() {
             <td><span class="clamp">${esc(connection.base_url)}</span></td>
             <td>${esc(connection.default_model || 'the model the client asks for')}</td>
             <td class="num">${esc(connection.priority)}</td>
-            <td><span class="chip ${connection.health === 'ok' ? 'ok' : 'down'}">${icon(connection.health === 'ok' ? 'check' : 'alert')}<span>${esc(connection.health)}</span></span></td>
+            <td>${healthChip(connection.health)}</td>
             <td class="num">
               <button class="link" data-check="${connection.id}">Check health</button>
               <button class="link danger" data-drop="${connection.id}">Remove</button>
