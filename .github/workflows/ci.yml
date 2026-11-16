@@ -3,10 +3,11 @@ name: ci
 on:
   pull_request:
 
-# The description check reads the pull request itself, so it needs pull: read as well as the code.
+# The description check reads the pull request itself, so it needs read on pull requests as well as
+# on the code. The scope is named pull-requests, not pull.
 permissions:
   contents: read
-  pull: read
+  pull-requests: read
 
 jobs:
   format:
@@ -26,7 +27,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.85
-      - run: cargo clippy --all-targets --locked -D warnings
+      - run: cargo clippy --all-targets --locked -- -D warnings
 
   tests:
     name: tests
@@ -37,7 +38,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.85
       - run: cargo test --locked
 
-  description:
+  checklist:
     name: checklist
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -60,19 +61,17 @@ jobs:
             exit 1
           fi
 
+          # The list is read from the copy of AGENTS.md in the pull request, because the checklist is
+          # checked against the rules as they stand at the time of the pull request.
           items=$(grep -c '^- \[' AGENTS.md || true)
-          filled=$(printf '%s' "$body" | grep -c '^- \[x\]' || true)
-          if [ "$filled" -lt "$items" ]; then
-            echo "$filled of $items items are filled in; leave an item unchecked rather than dropping it"
+          answered=$(printf '%s' "$body" | grep '^- \[' | grep -cE '^- \[[xX]\]|n/a' || true)
+          if [ "$answered" -lt "$items" ]; then
+            echo "$answered of $items items answered; an item is ticked or marked n/a with a reason"
             exit 1
           fi
 
-          if printf '%s' "$body" | grep -q '^- \[ \]'; then
-            echo "an item is left unchecked without a reason"
-            exit 1
-          fi
-
-          if ! printf '%s' "$body" | grep -q '^## Review'; then
-            echo "the description does not say whether the change was reviewed, or that it adds no behaviour"
+          review=$(printf '%s' "$body" | sed -n '/^## Review/,$p' | tail -n +2 | grep -v '^[[:space:]]*$' || true)
+          if [ -z "$review" ]; then
+            echo "the Review section is empty; state the findings, or that the change adds no behaviour"
             exit 1
           fi
