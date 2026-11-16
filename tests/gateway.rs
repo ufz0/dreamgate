@@ -457,6 +457,32 @@ async fn first_registered_account_is_admin() {
 }
 
 #[tokio::test]
+async fn a_taken_username_is_named_when_registering() {
+    let st = test_state().await;
+    let router = build_router(st.clone());
+
+    let admin = register(&router, "ada").await;
+    open_registration(&router, &admin).await;
+    no_approval(&router, &admin).await;
+    register(&router, "ben").await;
+
+    // The entry screen shows whatever the response says, so this is the sentence a person reads rather
+    // than the driver's text.
+    let (status, body) = post_json(
+        &router,
+        "/api/register",
+        "",
+        json!({ "username": "ben", "password": "test-password" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(
+        body["error"]["message"],
+        "the username ben is already taken"
+    );
+}
+
+#[tokio::test]
 async fn registration_setting_is_read_before_sign_in_and_only_an_admin_can_change_it() {
     let st = test_state().await;
     let router = build_router(st.clone());

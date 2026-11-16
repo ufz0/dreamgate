@@ -254,7 +254,18 @@ pub async fn register(
     .await
     {
         Ok(row) => row,
-        Err(err) => return error(StatusCode::CONFLICT, "invalid_request", err.to_string()),
+        // A name that is taken is named, as the Accounts view already does, rather than answered with
+        // the driver text. A failure for any other reason is not dressed up as a taken name.
+        Err(err) => {
+            if let sqlx::Error::Database(db) = &err && db.is_unique_violation() {
+                return error(
+                    StatusCode::CONFLICT,
+                    "invalid_request",
+                    format!("the username {username} is already taken"),
+                );
+            }
+            return error(StatusCode::INTERNAL_SERVER_ERROR, "server_error", err.to_string());
+        }
     };
     let id = row.get::<i64, _>("id");
     if pending {
