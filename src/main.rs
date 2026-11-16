@@ -1,3 +1,4 @@
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::Path;
 
 use dreamgate::{build_router, db, limits, live, registry, state};
@@ -40,7 +41,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let bound = listener.local_addr()?;
     println!("DreamGate listening on {bound}");
     println!("  gateway:   POST /v1/chat/completions (OpenAI compatible)");
-    println!("  dashboard: http://127.0.0.1:{}/", bound.port());
+    // An address that binds every interface is not one a browser can open, so the line names loopback of
+    // the same family for it. A specific address is the only one that answers, so it is named as it is.
+    let dashboard = if bound.ip().is_unspecified() {
+        let loopback: IpAddr = if bound.is_ipv4() {
+            Ipv4Addr::LOCALHOST.into()
+        } else {
+            Ipv6Addr::LOCALHOST.into()
+        };
+        SocketAddr::new(loopback, bound.port())
+    } else {
+        bound
+    };
+    println!("  dashboard: http://{dashboard}/");
 
     axum::serve(listener, build_router(st)).await?;
     Ok(())
