@@ -66,7 +66,9 @@ not pick a level itself; it only routes and counts.
 
 An estimate counts everything the model produced, not only the answer. Reasoning models put their
 working in `reasoning_content` (or `reasoning`) beside the reply, and that text is counted as
-generated. The Sandbox shows it as its own section above the answer when an upstream sends it.
+generated. So are the arguments of a tool call, because the model wrote them; the tool name it picked
+from the list the client sent is not. The Sandbox shows reasoning as its own section above the answer
+when an upstream sends it.
 
 Requests are recorded with the key, user, model, token counts, latency and status, and
 connections are health-checked every 30 seconds. A key with no connection routes to any

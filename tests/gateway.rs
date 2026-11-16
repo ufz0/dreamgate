@@ -33,8 +33,8 @@ async fn test_state() -> State {
     }
 }
 
-// An OpenAI-compatible upstream with three behaviours: it reports usage, reports none, or answers
-// with a reasoning section beside the answer.
+// An OpenAI-compatible upstream with four behaviours: it reports usage, reports none, answers with a
+// reasoning section beside the answer, or answers with a tool call and nothing else.
 async fn mock_chat(Json(body): Json<Value>) -> Response {
     let model = body.get("model").and_then(Value::as_str).unwrap_or("");
     let reports_usage = model == "reports-usage";
@@ -44,6 +44,17 @@ async fn mock_chat(Json(body): Json<Value>) -> Response {
             chunks.push_str(
                 "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"think hard\"}}]}\n\n",
             );
+        }
+        if model == "calls-tool" {
+            chunks.push_str("data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"name\":\"shell\",\"arguments\":\"echo hello\"}}]}}]}\n\n");
+            chunks.push_str("data: [DONE]\n\n");
+            let mut out = Response::new(Body::empty());
+            out.headers_mut().insert(
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("text/event-stream"),
+            );
+            *out.body_mut() = Body::from(chunks);
+            return out;
         }
         chunks.push_str("data: {\"choices\":[{\"delta\":{\"content\":\"hello world\"}}]}\n\n");
         if reports_usage {
@@ -60,6 +71,8 @@ async fn mock_chat(Json(body): Json<Value>) -> Response {
     }
     let message = if model == "reasons" {
         json!({ "content": "hello world", "reasoning_content": "think hard" })
+    } else if model == "calls-tool" {
+        json!({ "tool_calls": [{ "function": { "name": "shell", "arguments": "echo hello" } }] })
     } else {
         json!({ "content": "hello world" })
     };
@@ -484,6 +497,47 @@ async fn estimates_tokens_when_the_upstream_reports_none() {
         usage[0]["completion_tokens"], 4,
         "two words in the answer, two subword pieces each"
     );
+}
+
+#[tokio::test]
+async fn estimates_the_arguments_of_a_tool_call_when_the_upstream_reports_none() {
+    let st = test_state().await;
+    let router = build_router(st.clone());
+    let base_url = mock_upstream().await;
+    let cookie = register(&router, "ada").await;
+
+    post_json(
+        &router,
+        "/api/connections",
+        &cookie,
+        json!({ "name": "test", "base_url": base_url, "default_model": "calls-tool" }),
+    )
+    .await;
+    let (_, created) =
+        post_json(&router, "/api/keys", &cookie, json!({ "name": "test key" })).await;
+    let key = created["key"].as_str().unwrap().to_string();
+
+    // A turn that is only a tool call is still text the model produced, so the estimate for it is not
+    // zero: "echo hello" is one piece for the first word and two for the second. A tool name is not
+    // counted, because it is chosen from the list the client sent rather than written.
+    for stream in [true, false] {
+        let response = gateway_call(
+            &router,
+            &key,
+            json!({ "messages": [{ "role": "user", "content": "hi" }], "stream": stream }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let usage = recorded_usage(&st.pool).await;
+        let row = usage.last().unwrap();
+        assert_eq!(row["estimated"], true, "{row}");
+        assert_eq!(
+            row["completion_tokens"], 3,
+            "the arguments of the tool call"
+        );
+        assert_eq!(row["streamed"], stream);
+    }
 }
 
 #[tokio::test]

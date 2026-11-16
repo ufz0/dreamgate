@@ -184,12 +184,30 @@ fn build_payload(body: &Value, model: &str) -> Value {
 // generated text when the upstream reports no usage.
 const TEXT_PARTS: [&str; 3] = ["content", "reasoning_content", "reasoning"];
 
+// An estimate counts everything the model produced, not only the answer: the reasoning text beside the
+// reply, and the arguments of a tool call. A tool name is not counted, because it is picked from the
+// list the client sent rather than written by the model.
 fn text_of(part: &Value) -> String {
-    TEXT_PARTS
+    let mut pieces = TEXT_PARTS
         .iter()
         .filter_map(|key| part.get(key).and_then(Value::as_str))
-        .collect::<Vec<_>>()
-        .join(" ")
+        .collect::<Vec<_>>();
+    for call in part
+        .get("tool_calls")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        if let Some(arguments) = call
+            .get("function")
+            .and_then(Value::as_object)
+            .and_then(|function| function.get("arguments"))
+            .and_then(Value::as_str)
+        {
+            pieces.push(arguments);
+        }
+    }
+    pieces.join(" ")
 }
 
 // Forwarded bytes go to the client unchanged; this only reads complete SSE lines to
