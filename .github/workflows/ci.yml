@@ -60,10 +60,13 @@ jobs:
 
           pr=$(gh api "repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }}")
           base=$(printf '%s' "$pr" | jq -r .base.ref)
+          head=$(printf '%s' "$pr" | jq -r .head.ref)
           body=$(printf '%s' "$pr" | jq -r .body)
 
-          if [ "$base" != "main" ]; then
-            echo "opened against $base, but a change reaches main through a pull request to main"
+          # A change reaches dev through a pull request opened against dev. The only pull request that may
+          # target main is the dev to main merge, which is the one a person makes by hand.
+          if [ "$base" != "dev" ] && { [ "$base" != "main" ] || [ "$head" != "dev" ]; }; then
+            echo "opened against $base, but a change reaches dev through a pull request and main only from dev"
             exit 1
           fi
 
