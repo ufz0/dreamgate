@@ -2743,10 +2743,13 @@ async fn the_session_cookie_is_marked_secure_only_when_the_request_arrived_over_
 
 // An upstream that streams one word every `delay_ms`, `words` times, and reports usage in its last chunk as
 // an OpenAI-shaped server does, so a stream is still running for long enough to be watched from the page.
+// It holds the stream open for a second after the usage chunk, four progress ticks, as an upstream that
+// sends its end separately can, so the counts it reported are seen in flight before the row.
 async fn slow_upstream(words: usize, delay_ms: u64) -> String {
     let chat = move || async move {
         let body = stream::unfold(0usize, move |sent| async move {
             if sent > words {
+                tokio::time::sleep(Duration::from_millis(1000)).await;
                 return None;
             }
             tokio::time::sleep(Duration::from_millis(delay_ms)).await;
@@ -2819,9 +2822,11 @@ impl Live {
 }
 
 // A stream that is still running is on the live stream, and its count moves while it runs rather than
-// arriving with the row. The count is the gateway's estimate until the upstream reports one, and the row
-// that settles the stream names it, so the page can put one in the other's place. The stream is two seconds
-// of words against a progress tick of a quarter of a second, so it is seen moving with room to spare.
+// arriving with the row. The count is the gateway's estimate until the upstream reports one and then what
+// the upstream reported, and the row that settles the stream names it, so the page can put one in the
+// other's place. The stream leaves the list in the same step that sends the row, so a page never reads it
+// gone before the row has arrived. The stream is two seconds of words against a progress tick of a quarter
+// of a second, so it is seen moving with room to spare.
 #[tokio::test]
 async fn a_stream_in_flight_is_on_the_live_stream_and_its_row_takes_its_place() {
     let st = test_state().await;
@@ -2854,7 +2859,8 @@ async fn a_stream_in_flight_is_on_the_live_stream_and_its_row_takes_its_place() 
         })
     };
 
-    let mut counts = Vec::new();
+    let mut estimates = Vec::new();
+    let mut reported = false;
     let mut stream = None;
     let mut usage = None;
     let mut cleared = false;
@@ -2869,14 +2875,34 @@ async fn a_stream_in_flight_is_on_the_live_stream_and_its_row_takes_its_place() 
                     );
                     assert_eq!(progress["key"], "watched");
                     assert_eq!(progress["model"], "slow-model");
-                    assert_eq!(progress["estimated"], true);
-                    assert_eq!(event["generating"], progress["completion_tokens"]);
+                    assert_eq!(
+                        event["shares"],
+                        json!([{
+                            "stream": progress["stream"],
+                            "completion_tokens": progress["completion_tokens"],
+                            "estimated": progress["estimated"],
+                        }])
+                    );
                     stream = Some(progress["stream"].clone());
-                    counts.push(progress["completion_tokens"].as_i64().unwrap());
+                    if progress["estimated"] == true {
+                        assert!(
+                            !reported,
+                            "the count went back to an estimate after the upstream reported one"
+                        );
+                        estimates.push(progress["completion_tokens"].as_i64().unwrap());
+                    } else {
+                        assert_eq!(progress["prompt_tokens"], 11);
+                        assert_eq!(progress["completion_tokens"], 42);
+                        reported = true;
+                    }
                     cleared = false;
                 }
                 None if stream.is_some() => {
-                    assert_eq!(event["generating"], 0);
+                    assert!(
+                        usage.is_some(),
+                        "the stream left the list before its row arrived, so the figure dipped"
+                    );
+                    assert_eq!(event["shares"], json!([]));
                     cleared = true;
                 }
                 None => {}
@@ -2888,15 +2914,19 @@ async fn a_stream_in_flight_is_on_the_live_stream_and_its_row_takes_its_place() 
     answer.await.unwrap();
 
     assert!(
-        counts.windows(2).all(|pair| pair[0] <= pair[1]),
-        "the count only goes up while the stream runs: {counts:?}"
+        estimates.windows(2).all(|pair| pair[0] <= pair[1]),
+        "the estimate only goes up while the stream runs: {estimates:?}"
     );
-    let mut moving = counts.clone();
+    let mut moving = estimates.clone();
     moving.retain(|count| *count > 0);
     moving.dedup();
     assert!(
         moving.len() >= 2,
-        "the count was seen moving while the stream ran, not only at its end: {counts:?}"
+        "the count was seen moving while the stream ran, not only at its end: {estimates:?}"
+    );
+    assert!(
+        reported,
+        "the counts the upstream reported were seen in flight before the row"
     );
     let usage = usage.unwrap();
     assert_eq!(
@@ -2904,23 +2934,24 @@ async fn a_stream_in_flight_is_on_the_live_stream_and_its_row_takes_its_place() 
         stream.unwrap(),
         "the row names the stream it settles"
     );
-    assert_eq!(
-        usage["event"]["completion_tokens"], 42,
-        "the row has what the upstream reported, not the estimate"
-    );
+    assert_eq!(usage["event"]["completion_tokens"], 42);
 }
 
-// Another account's stream moves the total across every account, which anyone signed in sees, but the
-// stream itself, its key and its model, is only listed for an admin, as the rest of the usage is.
+// Another account's stream is part of the platform total, which anyone signed in sees, but the stream
+// itself, its key and its model, is listed for an admin alone, as the rest of the usage is. A member is
+// told the stream's share of what is being generated and, when it ends, the row's figures and nothing else,
+// naming the stream so its share leaves the total as the figures arrive.
 #[tokio::test]
-async fn another_accounts_stream_counts_toward_the_total_without_being_listed() {
+async fn another_accounts_stream_is_listed_for_an_admin_and_only_counted_for_a_member() {
     let st = test_state().await;
     let router = build_router(st.clone());
     let base_url = slow_upstream(40, 50).await;
     let admin = register(&router, "ada").await;
     open_registration(&router, &admin).await;
     no_approval(&router, &admin).await;
-    let member = register(&router, "ben").await;
+    let streaming = register(&router, "ben").await;
+    let watching = register(&router, "cy").await;
+    let ben = get_json(&router, "/api/me", &streaming).await["id"].clone();
     post_json(
         &router,
         "/api/connections",
@@ -2928,11 +2959,14 @@ async fn another_accounts_stream_counts_toward_the_total_without_being_listed() 
         json!({ "name": "slow", "base_url": base_url }),
     )
     .await;
-    let (_, created) = post_json(&router, "/api/keys", &admin, json!({ "name": "ada's" })).await;
+    let (_, created) =
+        post_json(&router, "/api/keys", &streaming, json!({ "name": "ben's" })).await;
     let key = created["key"].as_str().unwrap().to_string();
 
-    let mut live = Live::open(&router, &member).await;
-    assert_eq!(live.next().await["type"], "snapshot");
+    let mut admin_live = Live::open(&router, &admin).await;
+    assert_eq!(admin_live.next().await["type"], "snapshot");
+    let mut member_live = Live::open(&router, &watching).await;
+    assert_eq!(member_live.next().await["type"], "snapshot");
 
     let answer = {
         let router = router.clone();
@@ -2948,19 +2982,49 @@ async fn another_accounts_stream_counts_toward_the_total_without_being_listed() 
     };
 
     loop {
-        let event = live.next().await;
-        if event["type"] == "progress" && event["generating"].as_i64().unwrap() > 0 {
-            assert_eq!(
-                event["streams"],
-                json!([]),
-                "another account's stream is not listed for a member"
-            );
+        let event = admin_live.next().await;
+        if let Some(progress) = event["streams"]
+            .as_array()
+            .and_then(|streams| streams.first())
+        {
+            assert_eq!(progress["key"], "ben's");
+            assert_eq!(progress["user_id"], ben);
             break;
         }
-        assert_ne!(
-            event["type"], "usage",
-            "another account's row is not sent to a member"
+    }
+
+    let mut share = None;
+    let total = loop {
+        let event = member_live.next().await;
+        match event["type"].as_str() {
+            Some("progress") => {
+                assert_eq!(
+                    event["streams"],
+                    json!([]),
+                    "another account's stream is not listed for a member"
+                );
+                if let Some(first) = event["shares"].as_array().unwrap().first() {
+                    share = Some(first["stream"].clone());
+                }
+            }
+            Some("total") => break event,
+            Some("usage") => panic!("another account's row is not sent to a member"),
+            _ => {}
+        }
+    };
+    answer.await.unwrap();
+
+    let share = share.expect("the stream's share reached the member while it ran");
+    assert_eq!(
+        total["event"]["stream"], share,
+        "the figures name the stream whose share they replace"
+    );
+    assert_eq!(total["event"]["completion_tokens"], 42);
+    assert_eq!(total["event"]["total_tokens"], 53);
+    for field in ["id", "key", "user", "user_id", "model"] {
+        assert!(
+            total["event"].get(field).is_none(),
+            "a member is not sent the row's {field}"
         );
     }
-    answer.await.unwrap();
 }

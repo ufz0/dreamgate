@@ -69,9 +69,9 @@ const state = {
   // first account is never blocked by a failed request.
   settings: { open_registration: true, require_approval: true, has_accounts: false },
   presence: { online: 0, generating: 0, users: [] },
-  // The streams in flight, as the gateway last said: what every account has generated in them so far,
+  // The streams in flight, as the gateway last said: every stream's share of what is being generated,
   // and the streams themselves as far as this account may see them.
-  progress: { generating: 0, estimated: false, streams: [] },
+  progress: { shares: [], streams: [] },
   chat: [],
   models: [],
   modelNote: '',
@@ -277,6 +277,8 @@ function renderNav() {
 // Data
 
 async function load() {
+  // What was in flight belongs to the session that was open before; this one is told its own.
+  state.progress = { shares: [], streams: [] };
   state.settings = await api('/api/settings');
   state.summary = await api('/api/stats/summary');
   state.keys = (await api('/api/keys')).keys;
@@ -295,8 +297,36 @@ async function loadOtherKeys() {
   state.otherKeys = state.me?.role === 'admin' ? (await api('/api/keys/others')).keys : [];
 }
 
+// Names of the accounts this page has seen generating. A live presence event carries ids but no names,
+// which only /api/presence gives, and only to an admin; the names are kept for as long as the page is
+// open, so an account is only looked up the first time it is seen rather than every time it starts.
+const names = new Map();
+let naming = null;
+
 async function refreshPresence() {
   state.presence = await api('/api/presence');
+  for (const user of state.presence.users || []) names.set(user.id, user.username);
+}
+
+function namedPresence(presence) {
+  const ids = presence.generating_ids || [];
+  return { ...presence, users: ids.filter((id) => names.has(id)).map((id) => ({ id, username: names.get(id) })) };
+}
+
+// One lookup at a time, and only the names are taken from it: the counts on the page stay the ones the
+// latest event carried, which a slower answer to an older lookup would otherwise overwrite.
+function nameUnknown() {
+  if (naming) return;
+  naming = api('/api/presence')
+    .then((presence) => {
+      for (const user of presence.users || []) names.set(user.id, user.username);
+      state.presence = namedPresence(state.presence);
+      render(false);
+    })
+    .catch(() => {})
+    .finally(() => {
+      naming = null;
+    });
 }
 
 async function refresh(path) {
@@ -310,7 +340,8 @@ async function refresh(path) {
 }
 
 // A counter moves with the same event the feed does. The top counter covers every account, so
-// any event counts; an account's own figures only move for the event that belongs to it.
+// any event counts, including the figures a member is sent for another account's row; an account's
+// own figures only move for the event that belongs to it.
 // Averages are not updated here: they are the mean of the stored rows, and one event cannot move a
 // mean that was computed over all of them.
 const isToday = (value) => String(value).slice(0, 10) === new Date().toISOString().slice(0, 10);
@@ -344,24 +375,28 @@ function subscribe() {
     if (payload.type === 'snapshot') {
       state.summary.self = payload.self;
       state.summary.global = payload.global;
+      // The snapshot is what was recorded when the stream opened, so progress from before it, such as a
+      // stream that ended while the page was reconnecting, no longer applies; the next tick says what does.
+      state.progress = { shares: [], streams: [] };
       render(false);
       return;
     }
     if (payload.type === 'presence') {
-      // The live event carries the counts and the ids of the accounts generating, not their names, which
-      // only /api/presence gives, and only to an admin. The names already known are kept for the ids still
-      // generating, and the list is read again only when an account the page cannot name has started.
-      const known = new Map((state.presence.users || []).map((user) => [user.id, user]));
-      const ids = payload.presence.generating_ids || [];
-      state.presence = { ...payload.presence, users: ids.filter((id) => known.has(id)).map((id) => known.get(id)) };
-      if (state.me.role === 'admin' && state.presence.users.length < ids.length) {
-        refreshPresence().then(() => render(false)).catch(() => {});
-      }
+      state.presence = namedPresence(payload.presence);
+      if (state.me.role === 'admin' && state.presence.users.length < (payload.presence.generating_ids || []).length) nameUnknown();
       render(false);
       return;
     }
     if (payload.type === 'progress') {
       state.progress = payload;
+      renderProgress();
+      return;
+    }
+    // Another account's row, sent to a member as its figures alone: it only moves the platform total, and
+    // takes its stream's share out of what is still being generated.
+    if (payload.type === 'total') {
+      retireStream(payload.event.stream);
+      countTotals(state.summary.global, payload.event);
       renderProgress();
       return;
     }
@@ -389,10 +424,9 @@ function subscribe() {
 // A recorded row takes the place of the stream it settles, in the same render that adds the row's
 // figures, so the two are never counted together while the next progress update is on its way.
 function retireStream(id) {
-  const stream = state.progress.streams.find((s) => s.stream === id);
-  if (!stream) return;
-  state.progress.streams = state.progress.streams.filter((s) => s !== stream);
-  state.progress.generating = Math.max(0, num(state.progress.generating) - num(stream.completion_tokens));
+  if (id === null || id === undefined) return;
+  state.progress.shares = state.progress.shares.filter((s) => s.stream !== id);
+  state.progress.streams = state.progress.streams.filter((s) => s.stream !== id);
 }
 
 // Progress arrives up to four times a second while anything is generating, so it repaints only what it
@@ -538,9 +572,10 @@ function renderGate() {
 // figure, not a second one.
 function renderReadout() {
   const own = state.progress.streams.filter((s) => s.user_id === state.me.id);
+  const shares = state.progress.shares;
   renderPair(['generated-tokens', 'global-generated-note', 'global-input-tokens', 'global-input-note'], state.summary.global, 'every account and key', {
-    tokens: num(state.progress.generating),
-    estimated: Boolean(state.progress.estimated),
+    tokens: shares.reduce((sum, s) => sum + num(s.completion_tokens), 0),
+    estimated: shares.some((s) => s.estimated),
   });
   renderPair(['account-generated-tokens', 'account-generated-note', 'account-input-tokens', 'account-input-note'], state.summary.self, 'this account', {
     tokens: own.reduce((sum, s) => sum + num(s.completion_tokens), 0),
@@ -639,10 +674,12 @@ function streamRow(stream) {
 
 function renderFeed(arrived) {
   $('feed-title').textContent = state.me.role === 'admin' ? 'Live traffic, every account' : 'Live traffic for this account';
-  const streams = [...state.progress.streams].sort((a, b) => b.stream - a.stream);
+  // The feed holds twelve rows, streams first, so as many streams as the gateway runs at once do not push
+  // the page down; the recorded rows fill whatever is left.
+  const streams = [...state.progress.streams].sort((a, b) => b.stream - a.stream).slice(0, 12);
   $('feed-head').hidden = !state.events.length && !streams.length;
   const recorded = state.events
-    .slice(0, 12)
+    .slice(0, 12 - streams.length)
     .map(
       (event, i) =>
         `<li class="${arrived && i === 0 ? ' arrived' : ''}">
@@ -1293,6 +1330,10 @@ $('sign-out').addEventListener('click', async () => {
   state.me = null;
   if (state.live) state.live.close();
   state.live = null;
+  // An admin's streams and names are other accounts' keys, models and usernames, so none of it is left
+  // for whoever signs in next.
+  state.progress = { shares: [], streams: [] };
+  names.clear();
   showAuth();
 });
 

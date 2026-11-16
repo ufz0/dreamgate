@@ -401,17 +401,14 @@ fn stream_body(
                     drain_buffer(&mut buffer, &mut generated, &mut report);
                     estimate += tokens::estimate_tokens(&generated[estimated_upto..]);
                     estimated_upto = generated.len();
-                    // The same choice the row makes below: what the upstream reported once it has, and
-                    // the estimate until then.
-                    if report.reported() {
-                        inflight.update(
-                            report.prompt.unwrap_or(0),
-                            report.completion.unwrap_or(0),
-                            false,
-                        );
-                    } else {
-                        inflight.update(prompt_tokens, estimate, true);
-                    }
+                    // What the upstream has reported once it has reported it, and the estimate until then.
+                    // The generated count is what the page shows moving, so it is only called reported
+                    // when the upstream has reported that count itself, not when it has sent the input's.
+                    inflight.update(
+                        report.prompt.unwrap_or(prompt_tokens),
+                        report.completion.unwrap_or(estimate),
+                        report.completion.is_none(),
+                    );
                     if tx.send(Ok(bytes)).await.is_err() {
                         // The client disconnected mid-stream. The row is still written, with whatever
                         // the upstream had reported up to there; the final usage chunk, which is where a
@@ -432,12 +429,9 @@ fn stream_body(
                 false,
             )
         } else {
-            (prompt_tokens, tokens::estimate_tokens(&generated), true)
+            (prompt_tokens, estimate, true)
         };
-        // Off the list before the row is written, so a page never reads the stream's progress after the
-        // row's event: at worst it drops the progress a moment before the row arrives, never counting both.
         let stream = inflight.stream();
-        drop(inflight);
         let row = UsageRow {
             api_key_id: ctx.key.id,
             user_id: ctx.key.user_id,
@@ -456,9 +450,16 @@ fn stream_body(
             created_at: crate::clock::now(),
             stream: Some(stream),
         };
-        if let Err(err) = usage::record(&ctx.st, &row).await {
-            tracing::warn!("usage record failed: {err}");
-        }
+        // The stream stays on the list while its row is written, and leaves it in the step that sends the
+        // row's event, so a page goes from one to the other without a moment showing neither.
+        let event = match usage::write(&ctx.st, &row).await {
+            Ok(event) => Some(event),
+            Err(err) => {
+                tracing::warn!("usage record failed: {err}");
+                None
+            }
+        };
+        inflight.settle(event);
         // Released here rather than when the handler returned, so a stream is still counted
         // while it is running. The connection slot is given back at the same point, because the request
         // is still in flight for as long as the stream is being read.

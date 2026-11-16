@@ -8,7 +8,7 @@ use serde_json::{Value, json};
 use sqlx::Row;
 
 use crate::auth::Caller;
-use crate::live::HubEvent;
+use crate::live::{HubEvent, LiveEvent};
 use crate::state::State;
 
 // A user is online while they have done something through the gateway in the last five
@@ -49,9 +49,19 @@ pub struct Progress {
     pub started_at: String,
 }
 
+// What anyone signed in is told about a stream, whichever account it belongs to: how much it has
+// generated, which is already part of the platform total they see, and the stream it is, so the row that
+// settles it can take its share out of that total. Nothing in it says whose stream it is.
+#[derive(Serialize)]
+struct Share {
+    stream: u64,
+    completion_tokens: i64,
+    estimated: bool,
+}
+
 // Held by a stream task while it reads, so a page can show a generation as it happens rather than only
-// once its row is written. Dropping it takes the stream off the list; the task does that just before it
-// writes the row, so on the page the row's event is what replaces the stream's progress.
+// once its row is written. The task settles it with the row's event, which takes the stream off the list
+// and sends the event in one step; dropping it without that, as a panic does, only takes it off.
 pub struct InFlight {
     st: State,
     stream: u64,
@@ -113,6 +123,19 @@ impl InFlight {
             presence.version += 1;
         }
     }
+
+    // A page reads the list under the same lock, so it sees either the stream or the row's event waiting
+    // for it, never neither and never both: the figure neither dips while the row is written nor counts the
+    // two together. A row that could not be written has no event, and the stream only leaves the list.
+    pub fn settle(self, event: Option<LiveEvent>) {
+        let mut presence = self.st.presence.lock().expect("presence lock");
+        if presence.streams.remove(&self.stream).is_some() {
+            presence.version += 1;
+        }
+        if let Some(event) = event {
+            let _ = self.st.hub.send(HubEvent::Usage(event));
+        }
+    }
 }
 
 impl Drop for InFlight {
@@ -125,35 +148,37 @@ impl Drop for InFlight {
 }
 
 // What a page is sent about the streams in flight, or nothing when they have not changed since `seen`.
-// The total across every account is part of the platform total anyone signed in sees; the streams
-// themselves are scoped like the rest of the usage, every account's for an admin and otherwise the
-// caller's own. The list is copied out so the lock is not held while it is written as JSON.
+// Every stream's share goes to anyone signed in, because together they are part of the platform total;
+// the streams themselves, with their key and model, are scoped like the rest of the usage, every account's
+// for an admin and otherwise the caller's own. The list is copied out so the lock is not held while it is
+// written as JSON.
 pub fn progress(st: &State, scoped: bool, user_id: i64, seen: Option<u64>) -> Option<(u64, Value)> {
-    let (version, generating, estimated, mut streams) = {
+    let (version, mut all) = {
         let presence = st.presence.lock().expect("presence lock");
         if seen == Some(presence.version) {
             return None;
         }
         (
             presence.version,
-            presence
-                .streams
-                .values()
-                .map(|p| p.completion_tokens)
-                .sum::<i64>(),
-            presence.streams.values().any(|p| p.estimated),
-            presence
-                .streams
-                .values()
-                .filter(|p| !scoped || p.user_id == user_id)
-                .cloned()
-                .collect::<Vec<_>>(),
+            presence.streams.values().cloned().collect::<Vec<_>>(),
         )
     };
-    streams.sort_by_key(|p| p.stream);
+    all.sort_by_key(|p| p.stream);
+    let shares = all
+        .iter()
+        .map(|p| Share {
+            stream: p.stream,
+            completion_tokens: p.completion_tokens,
+            estimated: p.estimated,
+        })
+        .collect::<Vec<_>>();
+    let streams = all
+        .into_iter()
+        .filter(|p| !scoped || p.user_id == user_id)
+        .collect::<Vec<_>>();
     Some((
         version,
-        json!({ "type": "progress", "generating": generating, "estimated": estimated, "streams": streams }),
+        json!({ "type": "progress", "shares": shares, "streams": streams }),
     ))
 }
 
