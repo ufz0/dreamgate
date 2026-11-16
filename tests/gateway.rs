@@ -33,8 +33,19 @@ async fn test_state() -> State {
     }
 }
 
-// An OpenAI-compatible upstream with three behaviours: it reports usage, reports none, or answers
-// with a reasoning section beside the answer.
+// The arguments of a tool call as an upstream would send them: OpenAI puts them in a JSON string, some
+// servers send them already parsed, and a stream carries them in pieces across deltas.
+fn tool_arguments(model: &str) -> Option<Vec<Value>> {
+    match model {
+        "calls-tool" => Some(vec![json!("echo hello")]),
+        "parsed-arguments" => Some(vec![json!({ "command": "echo hello" })]),
+        "split-arguments" => Some(vec![json!("{\"comma"), json!("nd\":\"nd\"}")]),
+        _ => None,
+    }
+}
+
+// An OpenAI-compatible upstream with four behaviours: it reports usage, reports none, answers with a
+// reasoning section beside the answer, or answers with a tool call and nothing else.
 async fn mock_chat(Json(body): Json<Value>) -> Response {
     let model = body.get("model").and_then(Value::as_str).unwrap_or("");
     let reports_usage = model == "reports-usage";
@@ -45,7 +56,16 @@ async fn mock_chat(Json(body): Json<Value>) -> Response {
                 "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"think hard\"}}]}\n\n",
             );
         }
-        chunks.push_str("data: {\"choices\":[{\"delta\":{\"content\":\"hello world\"}}]}\n\n");
+        if let Some(pieces) = tool_arguments(model) {
+            for piece in pieces {
+                let delta = json!({
+                    "choices": [{ "delta": { "tool_calls": [{ "function": { "name": "shell", "arguments": piece } }] } }],
+                });
+                chunks.push_str(&format!("data: {delta}\n\n"));
+            }
+        } else {
+            chunks.push_str("data: {\"choices\":[{\"delta\":{\"content\":\"hello world\"}}]}\n\n");
+        }
         if reports_usage {
             chunks.push_str("data: {\"choices\":[],\"usage\":{\"prompt_tokens\":11,\"completion_tokens\":7}}\n\n");
         }
@@ -60,6 +80,10 @@ async fn mock_chat(Json(body): Json<Value>) -> Response {
     }
     let message = if model == "reasons" {
         json!({ "content": "hello world", "reasoning_content": "think hard" })
+    } else if let Some(pieces) = tool_arguments(model) {
+        // An answer that is not a stream carries the whole arguments at once, so the fragment case can
+        // only be read from the stream.
+        json!({ "tool_calls": [{ "function": { "name": "shell", "arguments": pieces[0] } }] })
     } else {
         json!({ "content": "hello world" })
     };
@@ -484,6 +508,96 @@ async fn estimates_tokens_when_the_upstream_reports_none() {
         usage[0]["completion_tokens"], 4,
         "two words in the answer, two subword pieces each"
     );
+}
+
+#[tokio::test]
+async fn estimates_the_arguments_of_a_tool_call_when_the_upstream_reports_none() {
+    let st = test_state().await;
+    let router = build_router(st.clone());
+    let base_url = mock_upstream().await;
+    let cookie = register(&router, "ada").await;
+
+    // No default model on the connection, so the model in the request chooses which shape of tool call
+    // the mock answers with.
+    post_json(
+        &router,
+        "/api/connections",
+        &cookie,
+        json!({ "name": "test", "base_url": base_url }),
+    )
+    .await;
+    let (_, created) =
+        post_json(&router, "/api/keys", &cookie, json!({ "name": "test key" })).await;
+    let key = created["key"].as_str().unwrap().to_string();
+
+    // A turn that is only a tool call is text the model produced, so its estimate is not zero. The
+    // numbers are the estimator's own arithmetic: "echo hello" is one piece for the first word and two
+    // for the second, and the JSON text of the parsed form adds a piece for the braces and the key.
+    for (shape, expected) in [("calls-tool", 3), ("parsed-arguments", 6)] {
+        for stream in [true, false] {
+            let response = gateway_call(
+                &router,
+                &key,
+                json!({
+                    "model": shape,
+                    "messages": [{ "role": "user", "content": "hi" }],
+                    "stream": stream,
+                }),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK);
+            if stream {
+                // The row is written when the stream ends, so the response has to be read for it.
+                response.into_body().collect().await.unwrap();
+            }
+
+            let usage = recorded_usage(&st.pool).await;
+            let row = usage.last().unwrap();
+            assert_eq!(row["estimated"], true, "{row}");
+            assert_eq!(
+                row["completion_tokens"], expected,
+                "the arguments of the tool call"
+            );
+            assert_eq!(row["streamed"], stream);
+        }
+    }
+}
+
+#[tokio::test]
+async fn counts_each_piece_of_a_fragmented_tool_call_as_the_stream_sent_it() {
+    let st = test_state().await;
+    let router = build_router(st.clone());
+    let base_url = mock_upstream().await;
+    let cookie = register(&router, "ada").await;
+
+    post_json(
+        &router,
+        "/api/connections",
+        &cookie,
+        json!({ "name": "test", "base_url": base_url, "default_model": "split-arguments" }),
+    )
+    .await;
+    let (_, created) =
+        post_json(&router, "/api/keys", &cookie, json!({ "name": "test key" })).await;
+    let key = created["key"].as_str().unwrap().to_string();
+
+    // The same text as one piece would be 4, and the mock sends it in two. The pieces are joined with a
+    // space before the estimate counts per whitespace chunk, so a delta boundary is counted as a word: 2
+    // for `{"comma` and 3 for `nd":"nd"}`. That is how a rough estimate can sit above what an upstream
+    // reports, and it is asserted here rather than left assumed.
+    let response = gateway_call(
+        &router,
+        &key,
+        json!({ "messages": [{ "role": "user", "content": "hi" }], "stream": true }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    response.into_body().collect().await.unwrap();
+
+    let usage = recorded_usage(&st.pool).await;
+    let row = usage.last().unwrap();
+    assert_eq!(row["estimated"], true, "{row}");
+    assert_eq!(row["completion_tokens"], 5);
 }
 
 #[tokio::test]

@@ -184,12 +184,36 @@ fn build_payload(body: &Value, model: &str) -> Value {
 // generated text when the upstream reports no usage.
 const TEXT_PARTS: [&str; 3] = ["content", "reasoning_content", "reasoning"];
 
+// An estimate counts everything the model produced, not only the answer: the reasoning text beside the
+// reply, and the arguments of a tool call. The tool name is left out. That is a deliberate omission,
+// not a claim that a name is not generated — any real tokenizer would count it — and it is one of the
+// ways an estimate sits below what an upstream reports.
 fn text_of(part: &Value) -> String {
-    TEXT_PARTS
+    let mut pieces: Vec<String> = TEXT_PARTS
         .iter()
-        .filter_map(|key| part.get(key).and_then(Value::as_str))
-        .collect::<Vec<_>>()
-        .join(" ")
+        .filter_map(|key| part.get(key).and_then(Value::as_str).map(str::to_string))
+        .collect();
+    for call in part
+        .get("tool_calls")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let Some(arguments) = call
+            .get("function")
+            .and_then(|function| function.get("arguments"))
+        else {
+            continue;
+        };
+        // OpenAI sends the arguments as a JSON string and some servers send them already parsed. Both
+        // are text the model wrote, so the estimate reads either as the text a tokenizer would see.
+        match arguments {
+            Value::String(text) => pieces.push(text.to_string()),
+            Value::Object(_) | Value::Array(_) => pieces.push(arguments.to_string()),
+            _ => {}
+        }
+    }
+    pieces.join(" ")
 }
 
 // Forwarded bytes go to the client unchanged; this only reads complete SSE lines to
