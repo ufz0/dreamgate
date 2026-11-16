@@ -125,7 +125,8 @@ only, like the rest of the per-account data.
 
 Self-registration is closed by default as soon as the first account exists, because the first account
 to register is the admin. An admin can open it again from the Accounts view. The entry screen opens on
-Sign in whatever that setting says, and offers Register only while registration is open; while it is
+Sign in for an instance that already has accounts, and on Register for a first account, because there
+is nothing there to sign in to; Register is offered only while registration is open, and while it is
 closed `POST /api/register` answers 403, so an admin either opens registration or makes the account
 themselves from the Accounts view.
 

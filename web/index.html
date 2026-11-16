@@ -16,6 +16,8 @@
     <p class="note" id="first-account-note">The first account to register becomes the admin.</p>
   </div>
   <form class="entry-form" id="auth-form">
+    <!-- The mode is chosen when the screen renders, so this markup only says what it shows for an
+         instance that already has accounts; a first account is opened on Register by the app. -->
     <div class="switch" role="group" aria-label="Account">
       <button type="button" id="mode-register" aria-pressed="false">Register</button>
       <button type="button" id="mode-login" aria-pressed="true">Sign in</button>

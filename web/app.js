@@ -927,14 +927,22 @@ function showAuth() {
   renderAuth();
 }
 
-// The entry screen opens on Sign in, because that is what an account with a password already does.
-// Register is offered only while registration is open, and the note says when it is closed.
+// The mode the entry screen is in. Declared above the functions that read it, since it is only ever
+// used from a render or a click, both of which happen after this has run.
+let mode = 'login';
+
+// The entry screen opens on Sign in. An account with a password signs in, so that is the default; an
+// instance with no accounts has nothing to sign in to, so a first account opens on Register. The mode
+// is chosen on every render rather than kept, because a mode the screen hides is one the server
+// refuses: Register is only offered while registration is open, and `POST /api/register` answers 403
+// when it is not.
 function renderAuth() {
   const open = state.settings.open_registration;
   $('first-account-note').hidden = state.settings.has_accounts;
   $('mode-register').hidden = !open;
   $('register-note').hidden = open;
-  setMode(mode);
+  const firstAccount = !state.settings.has_accounts;
+  setMode(open && (firstAccount || mode === 'register') ? 'register' : 'login');
 }
 
 // An account made by an admin has no password until the person signs in for the first time, so
@@ -955,16 +963,12 @@ function showShell() {
   ], state.theme, 'Theme', 'theme');
 }
 
-let mode = 'login';
-
 function setMode(next) {
   mode = next;
   $('mode-register').setAttribute('aria-pressed', String(mode === 'register'));
   $('mode-login').setAttribute('aria-pressed', String(mode === 'login'));
   $('auth-submit').textContent = mode === 'register' ? 'Register' : 'Sign in';
   showFirstPasswordNote();
-  // The username is the identity for both paths, so the field stays in whichever mode is open.
-  notice('');
 }
 
 // Registering can end without a session: an account that has to be approved is not signed in,
@@ -1032,8 +1036,17 @@ $('auth-form').addEventListener('submit', (event) => {
   submitAuth(event.target);
 });
 
-$('mode-register').addEventListener('click', () => setMode('register'));
-$('mode-login').addEventListener('click', () => setMode('login'));
+// A message belongs to the mode that produced it, so switching modes clears it. This is done at the
+// click rather than in setMode, because renderAuth calls setMode too and must not erase a message it
+// has just written, such as a settings read that failed before the screen was drawn.
+$('mode-register').addEventListener('click', () => {
+  notice('');
+  setMode('register');
+});
+$('mode-login').addEventListener('click', () => {
+  notice('');
+  setMode('login');
+});
 $('toggle-rail').addEventListener('click', toggleRail);
 $('scrim').addEventListener('click', () => $('shell').removeAttribute('data-drawer'));
 $('confirm-cancel').addEventListener('click', () => $('confirm').close());
