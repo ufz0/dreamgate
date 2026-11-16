@@ -16,8 +16,13 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
-      # Pinned to the minimum rustc that edition 2024 needs, so the build does not move on its own.
-      - uses: dtolnay/rust-toolchain@1.85
+      # Pinned so the build does not move on its own. This is the toolchain the code is formatted
+      # with: a different rustfmt can wrap differently, so the check has to be the same one the
+      # change was written with. It also cannot go below 1.88, which encoding_rs and the icu packages
+      # in the lockfile require.
+      - uses: dtolnay/rust-toolchain@1.99
+        with:
+          components: rustfmt
       - run: cargo fmt --check
 
   clippy:
@@ -26,7 +31,9 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.85
+      - uses: dtolnay/rust-toolchain@1.99
+        with:
+          components: clippy
       - run: cargo clippy --all-targets --locked -- -D warnings
 
   tests:
@@ -35,7 +42,7 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.85
+      - uses: dtolnay/rust-toolchain@1.99
       - run: cargo test --locked
 
   checklist:
@@ -44,7 +51,11 @@ jobs:
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
-      - run: |
+      # gh reads GH_TOKEN, not GITHUB_TOKEN, so it has to be named here.
+      - name: Checklist
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
           set -eu
 
           pr=$(gh api "repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }}")

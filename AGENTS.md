@@ -41,9 +41,10 @@ changes to `web/` take effect on reload.
 
 - Rust 2024 edition. The code is formatted with rustfmt and CI checks `cargo fmt --check`, so run
   `cargo fmt` before committing and leave the files as rustfmt writes them. Comments are wrapped by
-  hand, because rustfmt does not reflow them. CI checks formatting with the rustfmt of the toolchain
-  it pins (1.85); a newer rustfmt can wrap differently, so a version difference can make CI disagree
-  with your editor — format with the pinned one rather than arguing about the style.
+  hand, because rustfmt does not reflow them. CI checks formatting with the rustfmt of the toolchain it
+  pins, which is the one the code is formatted with; a different rustfmt can wrap differently, so the
+  check has to be the same one the change was written with. The pin cannot go below 1.88, because
+  packages in the lockfile require it.
 - Comments are full sentences that explain *why*, not what. A comment that restates
   the code is noise; one that records a constraint the code cannot express is worth
   keeping. Match the style already in `src/db.rs` and `src/auth.rs`.
@@ -82,8 +83,8 @@ changes to `web/` take effect on reload.
 - CI runs on every pull request, and each rule it can check appears there as its own check: the base
   branch, `cargo fmt --check`, clippy, the tests, and the description — that every checklist item is
   answered and the Review section says the findings or that the change adds no behaviour. The toolchain
-  is pinned to the minimum rustc that edition 2024 needs, so the build does not move on its own, and
-  nothing else is in CI: a failure always says something about the change.
+  is pinned rather than left to `stable`, so the build does not move on its own, and nothing else is in
+  CI: a failure always says something about the change.
 - The pull request description says what the change does and why, at the level of
   behaviour rather than of files.
 
