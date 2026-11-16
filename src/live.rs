@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use axum::body::{Body, Bytes};
 use axum::extract::State as AxumState;
 use axum::http::{HeaderValue, header};
@@ -6,13 +8,28 @@ use futures_util::{StreamExt, stream};
 use serde::Serialize;
 use serde_json::json;
 use tokio::sync::broadcast;
+use tokio::time::{Interval, MissedTickBehavior};
 
 use crate::auth::Caller;
-use crate::presence::PresenceEvent;
+use crate::presence::{self, PresenceEvent};
 use crate::state::{Hub, State};
 use crate::stats;
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
+
+// How often a page is told how far the streams in flight have got: often enough that a counter reads as
+// moving, and rare enough that a page with nothing else to do is not kept busy repainting.
+const PROGRESS_EVERY: Duration = Duration::from_millis(250);
+
+// What one page's stream keeps between events: where it is in the hub, its tick, the version of the
+// streams it last read, and the progress it was last sent.
+struct Feed {
+    st: State,
+    receiver: broadcast::Receiver<HubEvent>,
+    ticks: Interval,
+    seen: Option<u64>,
+    sent: Option<String>,
+}
 
 #[derive(Clone, Serialize)]
 pub enum HubEvent {
@@ -37,6 +54,9 @@ pub struct LiveEvent {
     pub status: i64,
     pub streamed: bool,
     pub created_at: String,
+    // The stream this row settles, when it was one; the page drops that stream's progress as it adds the
+    // row, so the two are never counted together.
+    pub stream: Option<u64>,
 }
 
 pub fn hub() -> Hub {
@@ -56,37 +76,85 @@ pub async fn stream_events(AxumState(st): AxumState<State>, caller: Caller) -> R
         json!({ "type": "snapshot", "scoped": scoped, "self": self_totals, "global": global })
             .to_string();
     let receiver = st.hub.subscribe();
+    // The progress of the streams in flight is read on a tick rather than sent through the hub: a stream
+    // changes with every chunk, and the hub would carry each change to every page, so its rate would grow
+    // with the number of streams. Read on a tick, a page gets at most four updates a second however many
+    // streams are running, and none while nothing changes. A tick that falls behind is not made up.
+    let mut ticks = tokio::time::interval(PROGRESS_EVERY);
+    ticks.set_missed_tick_behavior(MissedTickBehavior::Delay);
+
+    let feed = Feed {
+        st,
+        receiver,
+        ticks,
+        seen: None,
+        sent: None,
+    };
 
     let body =
         stream::once(
             async move { Ok::<_, BoxError>(Bytes::from(format!("data: {snapshot}\n\n"))) },
         )
-        .chain(stream::unfold(receiver, move |mut receiver| async move {
+        .chain(stream::unfold(feed, move |mut feed| async move {
             loop {
-                let event = match receiver.recv().await {
-                    Ok(event) => event,
-                    Err(_) => return None,
+                let payload = tokio::select! {
+                    // The hub is read before the tick. A stream leaves the list in the same step that sends its
+                    // row's event, so progress read without the stream has the row waiting here, and the row
+                    // goes first.
+                    biased;
+                    event = feed.receiver.recv() => {
+                        let Ok(event) = event else {
+                            return None;
+                        };
+                        // Presence is a count, so it goes to everyone; usage is scoped to the account that owns it.
+                        // Another account's row reaches a member only as its figures, because the platform total a
+                        // member sees adds them up anyway: no key, account, model or row id, and the stream it
+                        // settles so the page can take that stream's share out of the total.
+                        match event {
+                            HubEvent::Usage(usage) if scoped && usage.user_id != user_id => json!({
+                                "type": "total",
+                                "event": {
+                                    "prompt_tokens": usage.prompt_tokens,
+                                    "completion_tokens": usage.completion_tokens,
+                                    "total_tokens": usage.total_tokens,
+                                    "cached_tokens": usage.cached_tokens,
+                                    "created_at": usage.created_at,
+                                    "stream": usage.stream,
+                                },
+                            }),
+                            HubEvent::Usage(usage) => json!({ "type": "usage", "event": usage }),
+                            HubEvent::Presence(presence) => {
+                                json!({ "type": "presence", "presence": presence })
+                            }
+                        }
+                        .to_string()
+                    }
+                    _ = feed.ticks.tick() => {
+                        let Some((version, payload)) =
+                            presence::progress(&feed.st, scoped, user_id, feed.seen)
+                        else {
+                            continue;
+                        };
+                        // A row's event that arrived while the list was being read is sent first, and the
+                        // progress is read again on the next tick, so it is never sent ahead of the row.
+                        if !feed.receiver.is_empty() {
+                            continue;
+                        }
+                        feed.seen = Some(version);
+                        // The version moves with every account's streams, so a member's page can read the same
+                        // progress twice; it is only sent when it differs from what this page was last sent.
+                        let payload = payload.to_string();
+                        if feed.sent.as_deref() == Some(payload.as_str()) {
+                            continue;
+                        }
+                        feed.sent = Some(payload.clone());
+                        payload
+                    }
                 };
-                // Presence is a count, so it goes to everyone; usage is scoped to the account
-                // that owns it. Skipping an event must not end the stream for the client.
-                match &event {
-                    HubEvent::Usage(usage) if scoped && usage.user_id != user_id => continue,
-                    HubEvent::Usage(usage) => {
-                        let payload = json!({ "type": "usage", "event": usage }).to_string();
-                        return Some((
-                            Ok::<_, BoxError>(Bytes::from(format!("data: {payload}\n\n"))),
-                            receiver,
-                        ));
-                    }
-                    HubEvent::Presence(presence) => {
-                        let payload =
-                            json!({ "type": "presence", "presence": presence }).to_string();
-                        return Some((
-                            Ok::<_, BoxError>(Bytes::from(format!("data: {payload}\n\n"))),
-                            receiver,
-                        ));
-                    }
-                }
+                return Some((
+                    Ok::<_, BoxError>(Bytes::from(format!("data: {payload}\n\n"))),
+                    feed,
+                ));
             }
         }));
 

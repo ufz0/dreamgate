@@ -120,9 +120,11 @@ removed.
 Requests are handled at the same time. The lookups for a key and its account, the request to an upstream,
 the reading of a stream and the writing of the usage row are all async, and nothing in that path holds one
 request behind another: no lock is held across an upstream request or across a stream. The three locks in the
-process — the presence counts, the sign-in windows, and the map of per-connection limits — are held for a few
-instructions and released before anything is awaited, so they are plain mutexes rather than async ones: there
-is nothing to hold across an await, and the presence count is released from a `Drop`, which cannot await. A
+process — the presence counts and the streams in flight, the sign-in windows, and the map of per-connection
+limits — are held for a few instructions and released before anything is awaited, so they are plain mutexes
+rather than async ones: there is nothing to hold across an await, the presence count is released from a `Drop`,
+which cannot await, and a stream's place on the list is released in the step that sends its row or, for a
+stream that ends without one, from a `Drop`, neither of which awaits. A
 stream runs on its own task, and the slots its request was given are returned when the stream ends, not when
 the handler returned, so a long stream is counted as being in flight for as long as it is, and a request that
 arrives while a single-slot stream is running is answered as full rather than made to wait.
@@ -238,7 +240,30 @@ URL hash (`#/overview`, `#/activity`, `#/keys`, `#/connections`, `#/connect`, `#
 
 The dashboard reads `/api/stats/summary` and subscribes to `/api/live`, so the counters, the
 charts, the presence panel and the activity table update as traffic arrives — rows land in the
-current view without a reload, and nothing polls. The platform total is the only figure that
+current view without a reload. The only thing the page asks for on a timer is the presence panel, every
+30 seconds, because the five-minute online window passes with time as well as with traffic.
+
+A stream is on the page while it runs, not only once its row is written. The gateway keeps how far each
+stream in flight has got — the input and what it has generated so far, by the same estimate a row is given
+when nothing is reported, and the upstream's own count once it has reported the generated tokens — and
+`/api/live` sends that to a page at most four times a second, and only when what that page would be sent has
+changed, however many streams are running. The two generated figures at the top of the Overview include it,
+and their notes say how much of the figure is still being generated and, while it is the gateway's count,
+that it is an estimate until the request is recorded; the live traffic feed shows each stream as a row marked
+live, above the recorded rows and within the same twelve, its tokens marked with a ~ while they are
+estimated. The other figures, the charts and the support panel move when the row is recorded.
+
+When the request finishes, the stream leaves the list in the same step that sends its row, so a page goes
+from one to the other in one repaint: the figure neither dips while the row is written nor counts the two
+together, and it settles on what was recorded, which can sit below the estimate. Every stream's share of what
+is being generated goes to anyone signed in, because the platform total adds it up; the streams themselves,
+with their key and model, are listed for an admin and otherwise only the caller's own, like the rest of the
+usage. A member is sent another account's row as its token figures alone, with the stream it settles and
+when it was recorded, and without its key, account, model or id, so the platform total a member sees moves
+with every account's traffic and settles on what was recorded. Progress repaints the Overview's figures and
+feed alone, so a menu or a field being typed in elsewhere is not rebuilt under the person using it.
+
+The platform total is the only figure that
 counts other accounts, and it is shown to anyone signed in; the other figures and the charts on the
 Overview are this account's own. The live traffic feed, and the gate readout that follows its newest
 row, carry every account's requests for an admin and this account's for anyone else, and the feed's
@@ -332,7 +357,10 @@ first account, approval being on by default and blocking a sign-in until an admi
 account made by an admin with no password until its first sign-in, the account actions (disable,
 rename, new password, approve, delete) and what they do to a sign-in, a key and the recorded usage,
 that deleting a key leaves the rows recorded for it and the
-counters standing, the presence counts while a request is in flight, the connections routes being
+counters standing, the presence counts while a request is in flight, a stream's progress reaching the live
+stream while it runs, moving from the estimate to what the upstream reported, and leaving it only when its row
+arrives, which names the stream it settles, another account's stream listed for an admin and only counted for a
+member, who is sent its row's figures and nothing else, the connections routes being
 admin-only with the key a connection carries returned to an admin alone, the model list refusing a
 disabled account the same way the completion path does, sign-in attempts being bounded per account, a
 session refused past the window the cookie lasts, the cookie marked Secure only when the request came

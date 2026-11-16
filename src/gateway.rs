@@ -360,6 +360,18 @@ fn stream_body(
         let mut generated = String::new();
         let mut report = Report::default();
         let mut incoming = upstream.bytes_stream();
+        let inflight = presence::start_stream(
+            &ctx.st,
+            ctx.key.user_id,
+            &ctx.key.name,
+            &ctx.model,
+            prompt_tokens,
+        );
+        // The deltas are joined with a space and the estimate counts words, so the text added since the last
+        // chunk can be estimated on its own and added to the rest: the sum is the estimate of the whole, and
+        // the whole is not read again on every chunk.
+        let mut estimate = 0i64;
+        let mut estimated_upto = 0usize;
         // A stream is bounded by how long it goes quiet, not by a deadline for its whole length: an answer that
         // keeps arriving is not stalled, however long it takes, and cutting one that is still coming is the
         // socket dying on the client's side. Silence for the window is a dead connection, and the request
@@ -387,6 +399,16 @@ fn stream_body(
                 Ok(bytes) => {
                     buffer.extend_from_slice(&bytes);
                     drain_buffer(&mut buffer, &mut generated, &mut report);
+                    estimate += tokens::estimate_tokens(&generated[estimated_upto..]);
+                    estimated_upto = generated.len();
+                    // What the upstream has reported once it has reported it, and the estimate until then.
+                    // The generated count is what the page shows moving, so it is only called reported
+                    // when the upstream has reported that count itself, not when it has sent the input's.
+                    inflight.update(
+                        report.prompt.unwrap_or(prompt_tokens),
+                        report.completion.unwrap_or(estimate),
+                        report.completion.is_none(),
+                    );
                     if tx.send(Ok(bytes)).await.is_err() {
                         // The client disconnected mid-stream. The row is still written, with whatever
                         // the upstream had reported up to there; the final usage chunk, which is where a
@@ -407,8 +429,9 @@ fn stream_body(
                 false,
             )
         } else {
-            (prompt_tokens, tokens::estimate_tokens(&generated), true)
+            (prompt_tokens, estimate, true)
         };
+        let stream = inflight.stream();
         let row = UsageRow {
             api_key_id: ctx.key.id,
             user_id: ctx.key.user_id,
@@ -425,10 +448,18 @@ fn stream_body(
             streamed: true,
             estimated,
             created_at: crate::clock::now(),
+            stream: Some(stream),
         };
-        if let Err(err) = usage::record(&ctx.st, &row).await {
-            tracing::warn!("usage record failed: {err}");
-        }
+        // The stream stays on the list while its row is written, and leaves it in the step that sends the
+        // row's event, so a page goes from one to the other without a moment showing neither.
+        let event = match usage::write(&ctx.st, &row).await {
+            Ok(event) => Some(event),
+            Err(err) => {
+                tracing::warn!("usage record failed: {err}");
+                None
+            }
+        };
+        inflight.settle(event);
         // Released here rather than when the handler returned, so a stream is still counted
         // while it is running. The connection slot is given back at the same point, because the request
         // is still in flight for as long as the stream is being read.
@@ -634,6 +665,7 @@ pub async fn chat_completions(
                 streamed: false,
                 estimated,
                 created_at: crate::clock::now(),
+                stream: None,
             },
         )
         .await;
@@ -684,6 +716,7 @@ pub async fn chat_completions(
             streamed: wants_stream,
             estimated: true,
             created_at: crate::clock::now(),
+            stream: None,
         },
     )
     .await;

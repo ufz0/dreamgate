@@ -282,6 +282,9 @@ main {
 .feed li span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .feed li .tokens { color: var(--text); text-align: right; }
 .feed li.arrived { background: var(--bg-raised); border-radius: var(--radius-sm); }
+/* A stream still running: the accent marks the figure that is moving, as it marks what to notice on the
+   charts. */
+.feed li.inflight .tokens { color: var(--accent); }
 
 /* Transcript — the Sandbox conversation. Speakers are named, and the accent marks which side
    of the exchange is yours; model answers keep their line breaks. */

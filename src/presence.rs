@@ -4,11 +4,11 @@ use std::time::Instant;
 use axum::extract::State as AxumState;
 use axum::response::{IntoResponse, Json, Response};
 use serde::Serialize;
-use serde_json::json;
+use serde_json::{Value, json};
 use sqlx::Row;
 
 use crate::auth::Caller;
-use crate::live::HubEvent;
+use crate::live::{HubEvent, LiveEvent};
 use crate::state::State;
 
 // A user is online while they have done something through the gateway in the last five
@@ -27,6 +27,159 @@ pub struct PresenceEvent {
 pub struct Presence {
     generating: HashMap<i64, usize>,
     last_seen: HashMap<i64, Instant>,
+    streams: HashMap<u64, Progress>,
+    next_stream: u64,
+    // Moves on every change to the streams, so a page can be told only when there is something new
+    // without comparing the streams themselves.
+    version: u64,
+}
+
+// A stream in flight and how far it has got. The counts are the gateway's own estimate, the same one a
+// row is given when nothing is reported, until the upstream reports its own, which most only do in their
+// last chunk; `estimated` says which of the two they are.
+#[derive(Clone, Serialize)]
+pub struct Progress {
+    pub stream: u64,
+    pub user_id: i64,
+    pub key: String,
+    pub model: String,
+    pub prompt_tokens: i64,
+    pub completion_tokens: i64,
+    pub estimated: bool,
+    pub started_at: String,
+}
+
+// What anyone signed in is told about a stream, whichever account it belongs to: how much it has
+// generated, which is already part of the platform total they see, and the stream it is, so the row that
+// settles it can take its share out of that total. Nothing in it says whose stream it is.
+#[derive(Serialize)]
+struct Share {
+    stream: u64,
+    completion_tokens: i64,
+    estimated: bool,
+}
+
+// Held by a stream task while it reads, so a page can show a generation as it happens rather than only
+// once its row is written. The task settles it with the row's event, which takes the stream off the list
+// and sends the event in one step; dropping it without that, as a panic does, only takes it off.
+pub struct InFlight {
+    st: State,
+    stream: u64,
+}
+
+pub fn start_stream(
+    st: &State,
+    user_id: i64,
+    key: &str,
+    model: &str,
+    prompt_tokens: i64,
+) -> InFlight {
+    let mut presence = st.presence.lock().expect("presence lock");
+    presence.next_stream += 1;
+    let stream = presence.next_stream;
+    presence.streams.insert(
+        stream,
+        Progress {
+            stream,
+            user_id,
+            key: key.to_string(),
+            model: model.to_string(),
+            prompt_tokens,
+            completion_tokens: 0,
+            estimated: true,
+            started_at: crate::clock::now(),
+        },
+    );
+    presence.version += 1;
+    InFlight {
+        st: st.clone(),
+        stream,
+    }
+}
+
+impl InFlight {
+    pub fn stream(&self) -> u64 {
+        self.stream
+    }
+
+    pub fn update(&self, prompt_tokens: i64, completion_tokens: i64, estimated: bool) {
+        let mut guard = self.st.presence.lock().expect("presence lock");
+        let presence = &mut *guard;
+        let Some(progress) = presence.streams.get_mut(&self.stream) else {
+            return;
+        };
+        let next = (prompt_tokens, completion_tokens, estimated);
+        if (
+            progress.prompt_tokens,
+            progress.completion_tokens,
+            progress.estimated,
+        ) != next
+        {
+            (
+                progress.prompt_tokens,
+                progress.completion_tokens,
+                progress.estimated,
+            ) = next;
+            presence.version += 1;
+        }
+    }
+
+    // A page reads the list under the same lock, so it sees either the stream or the row's event waiting
+    // for it, never neither and never both: the figure neither dips while the row is written nor counts the
+    // two together. A row that could not be written has no event, and the stream only leaves the list.
+    pub fn settle(self, event: Option<LiveEvent>) {
+        let mut presence = self.st.presence.lock().expect("presence lock");
+        if presence.streams.remove(&self.stream).is_some() {
+            presence.version += 1;
+        }
+        if let Some(event) = event {
+            let _ = self.st.hub.send(HubEvent::Usage(event));
+        }
+    }
+}
+
+impl Drop for InFlight {
+    fn drop(&mut self) {
+        let mut presence = self.st.presence.lock().expect("presence lock");
+        if presence.streams.remove(&self.stream).is_some() {
+            presence.version += 1;
+        }
+    }
+}
+
+// What a page is sent about the streams in flight, or nothing when they have not changed since `seen`.
+// Every stream's share goes to anyone signed in, because together they are part of the platform total;
+// the streams themselves, with their key and model, are scoped like the rest of the usage, every account's
+// for an admin and otherwise the caller's own. The list is copied out so the lock is not held while it is
+// written as JSON.
+pub fn progress(st: &State, scoped: bool, user_id: i64, seen: Option<u64>) -> Option<(u64, Value)> {
+    let (version, mut all) = {
+        let presence = st.presence.lock().expect("presence lock");
+        if seen == Some(presence.version) {
+            return None;
+        }
+        (
+            presence.version,
+            presence.streams.values().cloned().collect::<Vec<_>>(),
+        )
+    };
+    all.sort_by_key(|p| p.stream);
+    let shares = all
+        .iter()
+        .map(|p| Share {
+            stream: p.stream,
+            completion_tokens: p.completion_tokens,
+            estimated: p.estimated,
+        })
+        .collect::<Vec<_>>();
+    let streams = all
+        .into_iter()
+        .filter(|p| !scoped || p.user_id == user_id)
+        .collect::<Vec<_>>();
+    Some((
+        version,
+        json!({ "type": "progress", "shares": shares, "streams": streams }),
+    ))
 }
 
 impl Presence {
