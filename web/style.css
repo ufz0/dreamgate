@@ -108,7 +108,7 @@ body {
 
 .switch button[aria-pressed="true"] { color: var(--accent); border-bottom-color: var(--accent); }
 
-.visually-hidden { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); }
+.visually-hidden { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
 
 .entry-form label { display: grid; gap: 6px; font-size: 14px; color: var(--text-muted); margin-bottom: 14px; }
 
@@ -260,9 +260,12 @@ main {
 
 /* Live traffic */
 
-.feed { list-style: none; margin: 0; padding: 0; max-height: 300px; overflow: auto; }
+/* The head names the columns of the rows under it, so it shares their grid. It scrolls in the same box as
+   the rows and sticks to its top, so it stays in place and a scrollbar narrows both alike. */
+.feed-scroll { max-height: 300px; overflow: auto; }
+.feed { list-style: none; margin: 0; padding: 0; }
 
-.feed li {
+.feed li, .feed-head {
   display: grid;
   grid-template-columns: 64px 140px minmax(0, 1fr) 44px 64px;
   gap: 12px;
@@ -272,6 +275,9 @@ main {
   font: 400 13px/1.5 var(--font-mono);
   font-variant-numeric: tabular-nums;
 }
+
+.feed-head { position: sticky; top: 0; background: var(--bg); font: 600 12px/1.5 var(--font-sans); }
+.feed-head .tokens { text-align: right; }
 
 .feed li span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .feed li .tokens { color: var(--text); text-align: right; }
@@ -579,7 +585,7 @@ input:focus-visible, select:focus-visible, textarea:focus-visible, button:focus-
   .shell[data-drawer="open"] .scrim { display: block; }
   .scrim { display: none; position: fixed; inset: 0; background: rgba(0, 0, 0, .35); z-index: 1; }
   .entry { grid-template-columns: 1fr; padding: 24px; }
-  .feed li { grid-template-columns: 56px 100px minmax(0, 1fr) 40px 56px; }
+  .feed li, .feed-head { grid-template-columns: 56px 100px minmax(0, 1fr) 40px 56px; }
 }
 
 @media (prefers-reduced-motion: reduce) {

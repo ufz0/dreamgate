@@ -212,7 +212,9 @@ URL hash (`#/overview`, `#/activity`, `#/keys`, `#/connections`, `#/connect`, `#
   request, and the speed is measured over the rows whose counts an upstream reported rather than over
   estimated ones; when nothing reported timings those rows are not shown. Totals across accounts are
   in the Accounts view.
-- **Activity** — every recorded request, newest first, plus usage by model.
+- **Activity** — the last 50 recorded requests, newest first, plus usage by model for the eight
+  models with the most tokens: every account's for an admin, and otherwise this account's own. The
+  page says which.
 - **Keys** — create, copy, disable and delete keys, with per-key usage, and a note when a
   key's binding points at a connection that is turned off. A key that is turned off stays listed and
   reads dimmer than the keys that work. The table is this account's own keys for anyone; under it an
@@ -237,8 +239,10 @@ URL hash (`#/overview`, `#/activity`, `#/keys`, `#/connections`, `#/connect`, `#
 The dashboard reads `/api/stats/summary` and subscribes to `/api/live`, so the counters, the
 charts, the presence panel and the activity table update as traffic arrives — rows land in the
 current view without a reload, and nothing polls. The platform total is the only figure that
-counts other accounts, and it is shown to anyone signed in; everything else on the Overview is
-this account's own. Per-key figures are always shown; the accounts table is admin-only.
+counts other accounts, and it is shown to anyone signed in; the other figures and the charts on the
+Overview are this account's own. The live traffic feed, and the gate readout that follows its newest
+row, carry every account's requests for an admin and this account's for anyone else, and the feed's
+heading says which. Per-key figures are always shown; the accounts table is admin-only.
 
 Presence is measured in the process, not stored: an account is online while a request of theirs
 came through the gateway in the last five minutes, and generating while one is in flight. The
