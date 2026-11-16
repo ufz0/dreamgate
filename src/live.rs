@@ -30,6 +30,9 @@ pub struct LiveEvent {
     pub prompt_tokens: i64,
     pub completion_tokens: i64,
     pub total_tokens: i64,
+    // The cache figure is carried so the split on the page moves with the row that arrives; the
+    // averages are not, because an average belongs to the stored rows rather than to one event.
+    pub cached_tokens: Option<i64>,
     pub latency_ms: i64,
     pub status: i64,
     pub streamed: bool,
