@@ -164,7 +164,10 @@ function openMenu(wrap) {
 function chooseOption(option) {
   const wrap = option.closest('.menu-wrap');
   wrap.dataset.value = option.dataset.value;
-  wrap.querySelector('.menu-button span:first-child').textContent = option.textContent;
+  // The label is the span that is not a glyph. It cannot be taken as the first span, because a menu
+  // with a glyph — the theme control, and any menu in a collapsed rail — has the glyph first, which is
+  // how choosing an option put the chosen text where the icon belongs and left the old label beside it.
+  wrap.querySelector('.menu-button span:not(.icon)').textContent = option.textContent;
   for (const item of wrap.querySelectorAll('[role="option"]')) item.setAttribute('aria-selected', String(item === option));
   closeMenus();
   if (wrap.dataset.name === 'theme') applyTheme(option.dataset.value);
