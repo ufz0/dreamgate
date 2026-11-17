@@ -391,7 +391,8 @@ output apart, including for a key or an account with no usage and after a key is
 caller's own with the other
 accounts read by an admin alone, per-account daily token limits including the day
 boundary and the admin-only rule for setting one, the admin/user scoping of the stats
-queries and the split between a caller's own figures and the platform total, a taken username named when registering, including one held for approval, with any other failure
+queries and the split between a caller's own figures and the platform total, every account listed for an admin
+however many there are, including one past the twentieth by name that is waiting for approval, a taken username named when registering, including one held for approval, with any other failure
 answered as a server error, the registration setting being read before sign in and closed by default after the
 first account, approval being on by default and blocking a sign-in until an admin grants it, an
 account made by an admin with no password until its first sign-in, the account actions (disable,

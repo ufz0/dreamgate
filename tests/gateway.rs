@@ -2984,6 +2984,63 @@ async fn the_summary_separates_the_callers_own_figures_from_the_platform_total()
     assert_eq!(recent["events"][0]["user"], "ben");
 }
 
+// The accounts in the summary are the only list an admin has to act on an account, so every account is in
+// it, however many there are. The last one by name registers itself and waits for approval, which is the
+// account an admin most needs to find.
+#[tokio::test]
+async fn the_summary_lists_every_account_for_an_admin() {
+    let st = test_state().await;
+    let router = build_router(st.clone());
+    let admin = register(&router, "ada").await;
+    for n in 0..24 {
+        let (status, _) = post_json(
+            &router,
+            "/api/users",
+            &admin,
+            json!({ "username": format!("member-{n:02}") }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+    }
+    open_registration(&router, &admin).await;
+    let (status, body) = post_json(
+        &router,
+        "/api/register",
+        "",
+        json!({ "username": "zoe", "password": "test-password" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["pending"], true);
+
+    let summary = get_json(&router, "/api/stats/summary", &admin).await;
+    let names: Vec<&str> = summary["users"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|user| user["username"].as_str().unwrap())
+        .collect();
+    assert_eq!(names.len(), 26, "every account is listed: {names:?}");
+    assert_eq!(names.len() as i64, count(&st.pool, "users").await);
+    let mut sorted = names.clone();
+    sorted.sort();
+    assert_eq!(names, sorted, "the accounts are listed by username");
+    assert!(
+        names.contains(&"member-23"),
+        "an account that sorts after the twentieth is listed: {names:?}"
+    );
+    let zoe = summary["users"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|user| user["username"] == "zoe")
+        .expect("the last account by name is listed");
+    assert_eq!(
+        zoe["pending"], true,
+        "the account waiting for approval can be found to approve"
+    );
+}
+
 #[tokio::test]
 async fn presence_counts_an_account_while_its_request_is_running() {
     let st = test_state().await;

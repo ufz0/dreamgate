@@ -146,8 +146,10 @@ async fn grouped(
 
 // Accounts with no usage still appear, because that is where an admin sets a limit. The day
 // figure is what a daily limit is measured against, so it is reported next to it, as the input and
-// the output together the way the limit counts them. Ordered by username rather than by usage so a
-// new account is never pushed off the page it is set on.
+// the output together the way the limit counts them. Every account is listed, with no cap, because this
+// is the only list the page has to act on one: an account left off it could not be approved, limited,
+// disabled, renamed or deleted. Ordered by username rather than by usage, so a row stays where it is as
+// traffic arrives and a new account is found where its name sorts.
 async fn accounts(st: &State) -> Result<Vec<serde_json::Value>, sqlx::Error> {
     let rows = sqlx::query(
         "SELECT u.id, u.username, u.enabled, u.pending, u.daily_token_cap, COUNT(r.id) AS requests, \
@@ -155,7 +157,7 @@ async fn accounts(st: &State) -> Result<Vec<serde_json::Value>, sqlx::Error> {
                 COALESCE(SUM(r.prompt_tokens), 0) AS prompt_tokens, \
                 COALESCE(SUM(r.completion_tokens), 0) AS completion_tokens, \
                 COALESCE(SUM(CASE WHEN strftime('%Y-%m-%d', r.created_at) = date('now') THEN r.total_tokens ELSE 0 END), 0) AS used_today \
-         FROM users u LEFT JOIN usage r ON r.user_id = u.id GROUP BY u.id ORDER BY u.username LIMIT 20",
+         FROM users u LEFT JOIN usage r ON r.user_id = u.id GROUP BY u.id ORDER BY u.username",
     )
     .fetch_all(&st.pool)
     .await?;
