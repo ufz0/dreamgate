@@ -247,10 +247,12 @@ pub async fn summary(AxumState(st): AxumState<State>, caller: Caller) -> Respons
 pub async fn recent(AxumState(st): AxumState<State>, caller: Caller) -> Response {
     let scoped = caller.role != "admin";
     // A recorded request outlives the key it came in on, so the key is looked up rather than
-    // assumed to still be there; the page says which rows have no key left.
+    // assumed to still be there; the page says which rows have no key left. The estimated flag goes out
+    // with the counts, so a row the gateway counted itself is not shown as one the upstream reported.
     let sql = format!(
         "SELECT r.id, k.name AS key_name, u.username AS user_name, r.model, r.prompt_tokens, \
-                r.completion_tokens, r.total_tokens, r.latency_ms, r.status, r.streamed, r.created_at \
+                r.completion_tokens, r.total_tokens, r.latency_ms, r.status, r.streamed, r.estimated, \
+                r.created_at \
          FROM usage r LEFT JOIN api_keys k ON k.id = r.api_key_id JOIN users u ON u.id = r.user_id \
          {scope} ORDER BY r.id DESC LIMIT 50",
         scope = if scoped { "WHERE r.user_id = ?" } else { "" }
@@ -284,6 +286,7 @@ pub async fn recent(AxumState(st): AxumState<State>, caller: Caller) -> Response
                 "latency_ms": row.get::<i64, _>("latency_ms"),
                 "status": row.get::<i64, _>("status"),
                 "streamed": row.get::<i64, _>("streamed") != 0,
+                "estimated": row.get::<i64, _>("estimated") != 0,
                 "created_at": row.get::<String, _>("created_at"),
             })
         })

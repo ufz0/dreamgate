@@ -3537,6 +3537,81 @@ async fn a_stream_that_reports_its_input_first_shows_it_as_reported_while_the_re
     );
 }
 
+// A recorded row says whether its counts are the gateway's estimate, in the recent rows and in the event a
+// page is sent for it, so the page can mark an estimate rather than show it as a number the upstream
+// reported. The upstream reports usage for one model and nothing for the other, both as a single answer
+// and as a stream, because the two are recorded on different paths.
+#[tokio::test]
+async fn a_recorded_row_says_whether_its_counts_were_estimated() {
+    let st = test_state().await;
+    let router = build_router(st.clone());
+    let base_url = mock_upstream().await;
+    let cookie = register(&router, "ada").await;
+    post_json(
+        &router,
+        "/api/connections",
+        &cookie,
+        json!({ "name": "test", "base_url": base_url }),
+    )
+    .await;
+    let (_, created) =
+        post_json(&router, "/api/keys", &cookie, json!({ "name": "test key" })).await;
+    let key = created["key"].as_str().unwrap().to_string();
+
+    let mut live = Live::open(&router, &cookie).await;
+    assert_eq!(live.next().await["type"], "snapshot");
+
+    let requests = [
+        ("reports-usage", false),
+        ("silent", false),
+        ("reports-usage", true),
+        ("silent", true),
+    ];
+    // Each request is finished before the next is sent, and a stream's row is written before its body
+    // ends, so the rows are recorded in this order.
+    for (model, stream) in requests {
+        let response = gateway_call(
+            &router,
+            &key,
+            json!({ "model": model, "stream": stream, "messages": [{ "role": "user", "content": "hi" }] }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        response.into_body().collect().await.unwrap();
+    }
+
+    let mut events = Vec::new();
+    while events.len() < requests.len() {
+        let event = live.next().await;
+        if event["type"] == "usage" {
+            events.push(event["event"].clone());
+        }
+    }
+    for ((model, stream), event) in requests.iter().zip(&events) {
+        assert_eq!(event["model"], *model, "{event}");
+        assert_eq!(event["streamed"], *stream, "{event}");
+        assert_eq!(
+            event["estimated"],
+            *model == "silent",
+            "the live event says whether the counts were estimated: {event}"
+        );
+    }
+
+    let recent = get_json(&router, "/api/stats/recent", &cookie).await;
+    let rows = recent["events"].as_array().unwrap();
+    assert_eq!(rows.len(), requests.len());
+    // The recent rows are newest first.
+    for ((model, stream), row) in requests.iter().rev().zip(rows) {
+        assert_eq!(row["model"], *model, "{row}");
+        assert_eq!(row["streamed"], *stream, "{row}");
+        assert_eq!(
+            row["estimated"],
+            *model == "silent",
+            "the recent row says whether the counts were estimated: {row}"
+        );
+    }
+}
+
 // Another account's stream is part of the platform total, which anyone signed in sees, but the stream
 // itself, its key and its model, is listed for an admin alone, as the rest of the usage is. A member is
 // told the stream's share of what is being generated and, when it ends, the row's figures and nothing else,

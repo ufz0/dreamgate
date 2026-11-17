@@ -579,7 +579,7 @@ function renderGate() {
     'last request',
     `<b>${esc(last.created_at.slice(11, 19))}</b>`,
     esc(last.model || 'no model'),
-    `${nf.format(last.prompt_tokens)} input and ${nf.format(last.completion_tokens)} output tokens`,
+    `${rowTokens(last, last.prompt_tokens)} input and ${rowTokens(last, last.completion_tokens)} output tokens`,
     `<span class="${last.status >= 400 ? 'danger' : ''}">${esc(last.status)}</span>`,
   ].join(' ');
 }
@@ -610,11 +610,12 @@ function renderReadout() {
 // because the two pairs show the same figures for a different set of requests.
 // What a stream still running has generated counts toward the generated figure as it arrives, so the
 // number moves with the answer. The note says how much of the figure is still in flight and, while the
-// gateway is counting it rather than the upstream, that it is an estimate until the request is recorded.
+// gateway is counting it rather than the upstream, that it is an estimate until the upstream reports it.
+// Recording the request does not end that: an upstream that never reports is recorded as the estimate.
 function renderPair([generatedId, generatedNoteId, inputId, inputNoteId], totals, scope, inflight) {
   const t = totals || {};
   $(generatedId).textContent = nf.format(num(t.completion_tokens) + inflight.tokens);
-  const running = inflight.estimated ? 'still being generated, an estimate until it is recorded' : 'still being generated';
+  const running = inflight.estimated ? 'still being generated, estimated by the gateway until the upstream reports it' : 'still being generated';
   $(generatedNoteId).textContent = inflight.tokens
     ? `what the models generated for ${scope}, including ${nf.format(inflight.tokens)} ${running}`
     : `what the models generated for ${scope}`;
@@ -683,8 +684,17 @@ function renderCharts() {
 // own flag, because an upstream can report the input before what it generated, and a flag that is missing
 // is read as an estimate rather than as a reported count.
 function streamTokens(tokens, estimated) {
-  const how = estimated ? 'Estimated by the gateway until the request is recorded' : 'As the upstream has reported so far';
+  const how = estimated ? 'Estimated by the gateway: the upstream has not reported this count yet' : 'As the upstream has reported so far';
   return `<span class="tokens" title="${how}">${estimated ? '~' : ''}${nf.format(num(tokens))}</span>`;
+}
+
+// A recorded row is marked the same way when the gateway counted it because the upstream reported nothing:
+// an upstream that never reports usage, a stream cut short before its usage chunk, a request that reached
+// no connection. The row carries one flag for its counts, so the input and the output are marked together,
+// and a missing flag is read as an estimate here as well.
+function rowTokens(event, tokens) {
+  const count = nf.format(num(tokens));
+  return event.estimated !== false ? `<span title="Estimated by the gateway: the upstream did not report this count">~${count}</span>` : count;
 }
 
 function streamRow(stream) {
@@ -713,8 +723,8 @@ function renderFeed(arrived) {
           <span>${esc(keyLabel(event))}</span>
           <span>${esc(event.model || 'no model')}</span>
           <span class="${event.status >= 400 ? 'danger' : ''}">${esc(event.status)}</span>
-          <span class="tokens">${nf.format(event.prompt_tokens)}</span>
-          <span class="tokens">${nf.format(event.completion_tokens)}</span>
+          <span class="tokens">${rowTokens(event, event.prompt_tokens)}</span>
+          <span class="tokens">${rowTokens(event, event.completion_tokens)}</span>
         </li>`,
     )
     .join('');
@@ -745,8 +755,8 @@ function renderActivity() {
               <td><span class="clamp">${esc(keyLabel(event))}</span></td>
               ${admin ? `<td><span class="clamp">${esc(event.user)}</span></td>` : ''}
               <td><span class="clamp">${esc(event.model || 'no model')}</span></td>
-              <td class="num">${nf.format(event.prompt_tokens)}</td>
-              <td class="num">${nf.format(event.completion_tokens)}</td>
+              <td class="num">${rowTokens(event, event.prompt_tokens)}</td>
+              <td class="num">${rowTokens(event, event.completion_tokens)}</td>
               <td class="num">${nf.format(event.latency_ms)} ms</td>
               <td class="num${event.status >= 400 ? ' danger' : ''}">${esc(event.status)}</td>
             </tr>`,

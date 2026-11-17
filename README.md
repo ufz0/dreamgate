@@ -257,6 +257,13 @@ feed show the two sides as separate columns rather than one sum, and `/api/keys`
 per-account and per-model rows of `/api/stats/summary` carry `prompt_tokens` and `completion_tokens` beside
 the total they already had.
 
+A recorded row whose counts the gateway estimated, because the upstream reported none, is marked the way a
+stream's estimate is: its input and its output tokens each carry a ~ in the Activity table, the live traffic
+feed and the gate readout on the Overview, and say on hover that the upstream did not report them. The row has
+one flag for both counts, `estimated`, and `/api/stats/recent` and the row's event on `/api/live` carry it
+beside them. The token totals add estimated and reported rows together and do not say how much of a total is
+estimated.
+
 The dashboard reads `/api/stats/summary` and subscribes to `/api/live`, so the counters, the charts, the
 presence panel, the activity table and an account's row in the Accounts view update as traffic arrives — rows
 land in the current view without a reload. The only thing the page asks for on a timer is the presence panel,
@@ -268,7 +275,8 @@ given when nothing is reported until the upstream has reported that count itself
 `/api/live` sends that to a page at most four times a second, and only when what that page would be sent has
 changed, however many streams are running. The two generated figures at the top of the Overview include it,
 and their notes say how much of the figure is still being generated and, while it is the gateway's count,
-that it is an estimate until the request is recorded; the live traffic feed shows each stream as a row marked
+that it is an estimate until the upstream reports it, and the recorded row stays one when the upstream never
+does; the live traffic feed shows each stream as a row marked
 live, above the recorded rows and within the same twelve, its input and its output tokens each marked with a ~
 while that count is the gateway's estimate, because an upstream can report the input before what it generated.
 The other figures, the charts and the support panel move when the row is recorded.
@@ -369,7 +377,9 @@ cargo test
 ```
 
 The suite runs the gateway against a mock OpenAI-compatible upstream and covers usage
-recording, estimation when the upstream reports nothing including reasoning text, SSE
+recording, estimation when the upstream reports nothing including reasoning text, the `estimated` flag a
+recorded row carries in `/api/stats/recent` and in its event on `/api/live`, true for a row the gateway
+estimated and false for one the upstream reported, answered at once or streamed, SSE
 pass-through, that a client's reasoning level reaches the upstream unchanged, that a request naming no model
 reaches the upstream without one and is recorded as `unknown`, upstream failover,
 a connection marked down being tried after the ones that are not rather than skipped, including when every

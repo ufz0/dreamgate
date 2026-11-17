@@ -92,6 +92,7 @@ pub async fn write(st: &State, row: &UsageRow) -> Result<LiveEvent, sqlx::Error>
         latency_ms: row.latency_ms,
         status: row.status,
         streamed: row.streamed,
+        estimated: row.estimated,
         created_at: row.created_at.clone(),
         stream: row.stream,
     };

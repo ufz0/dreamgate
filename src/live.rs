@@ -53,6 +53,10 @@ pub struct LiveEvent {
     pub latency_ms: i64,
     pub status: i64,
     pub streamed: bool,
+    // Whether the counts are the gateway's estimate because the upstream reported none. The row has one
+    // flag for both, so the page marks the input and the output together, the way it marks a stream's
+    // estimate, rather than showing an estimate as a number the upstream gave.
+    pub estimated: bool,
     pub created_at: String,
     // The stream this row settles, when it was one; the page drops that stream's progress as it adds the
     // row, so the two are never counted together.
