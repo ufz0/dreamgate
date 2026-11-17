@@ -4,6 +4,7 @@ pub mod clock;
 pub mod db;
 pub mod gateway;
 pub mod keys;
+pub mod limits;
 pub mod live;
 pub mod presence;
 pub mod registry;

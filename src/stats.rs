@@ -145,12 +145,15 @@ async fn grouped(
 }
 
 // Accounts with no usage still appear, because that is where an admin sets a limit. The day
-// figure is what a daily limit is measured against, so it is reported next to it. Ordered by
-// username rather than by usage so a new account is never pushed off the page it is set on.
+// figure is what a daily limit is measured against, so it is reported next to it, as the input and
+// the output together the way the limit counts them. Ordered by username rather than by usage so a
+// new account is never pushed off the page it is set on.
 async fn accounts(st: &State) -> Result<Vec<serde_json::Value>, sqlx::Error> {
     let rows = sqlx::query(
         "SELECT u.id, u.username, u.enabled, u.pending, u.daily_token_cap, COUNT(r.id) AS requests, \
                 COALESCE(SUM(r.total_tokens), 0) AS tokens, \
+                COALESCE(SUM(r.prompt_tokens), 0) AS prompt_tokens, \
+                COALESCE(SUM(r.completion_tokens), 0) AS completion_tokens, \
                 COALESCE(SUM(CASE WHEN strftime('%Y-%m-%d', r.created_at) = date('now') THEN r.total_tokens ELSE 0 END), 0) AS used_today \
          FROM users u LEFT JOIN usage r ON r.user_id = u.id GROUP BY u.id ORDER BY u.username LIMIT 20",
     )
@@ -167,6 +170,8 @@ async fn accounts(st: &State) -> Result<Vec<serde_json::Value>, sqlx::Error> {
                 "daily_token_cap": row.get::<Option<i64>, _>("daily_token_cap"),
                 "requests": row.get::<i64, _>("requests"),
                 "tokens": row.get::<i64, _>("tokens"),
+                "prompt_tokens": row.get::<i64, _>("prompt_tokens"),
+                "completion_tokens": row.get::<i64, _>("completion_tokens"),
                 "used_today": row.get::<i64, _>("used_today"),
             })
         })
@@ -197,12 +202,16 @@ async fn build_summary(st: &State, caller: &Caller) -> Result<serde_json::Value,
         "-14 days",
     )
     .await?;
+    // The eight are the ones with the most tokens, input and output together, and the two sides are
+    // reported apart as well, because the page shows them apart.
     let models = grouped(
         st,
         !admin,
         caller.id,
         &format!(
-            "SELECT COALESCE(model, 'unknown') AS model, COUNT(*) AS requests, COALESCE(SUM(total_tokens), 0) AS tokens \
+            "SELECT COALESCE(model, 'unknown') AS model, COUNT(*) AS requests, COALESCE(SUM(total_tokens), 0) AS tokens, \
+                    COALESCE(SUM(prompt_tokens), 0) AS prompt_tokens, \
+                    COALESCE(SUM(completion_tokens), 0) AS completion_tokens \
              FROM usage {scope} GROUP BY model ORDER BY tokens DESC LIMIT 8",
             scope = scope_clause(!admin, "usage.user_id"),
         ),

@@ -30,10 +30,14 @@ pub struct UpdateKey {
 }
 
 // One row shape for both lists. The Keys page shows the caller's own keys; an admin can ask for
-// the other accounts separately, so a table never mixes two owners.
+// the other accounts separately, so a table never mixes two owners. The input and the output are
+// reported apart because the page shows them apart; the total stays, because the list is ordered by it
+// and a client that read it before still can.
 const KEY_SQL: &str = "SELECT k.id, k.name, k.key, k.model, k.connection_id, k.enabled, k.rpm_limit, k.token_cap, \
         k.created_at, c.name AS connection, u.username AS owner, \
-        COUNT(r.id) AS requests, COALESCE(SUM(r.total_tokens), 0) AS tokens \
+        COUNT(r.id) AS requests, COALESCE(SUM(r.total_tokens), 0) AS tokens, \
+        COALESCE(SUM(r.prompt_tokens), 0) AS prompt_tokens, \
+        COALESCE(SUM(r.completion_tokens), 0) AS completion_tokens \
  FROM api_keys k LEFT JOIN usage r ON r.api_key_id = k.id \
  LEFT JOIN connections c ON c.id = k.connection_id \
  JOIN users u ON u.id = k.user_id {scope} GROUP BY k.id ORDER BY tokens DESC";
@@ -64,6 +68,8 @@ async fn key_rows(
                 "token_cap": row.get::<Option<i64>, _>("token_cap"),
                 "requests": row.get::<i64, _>("requests"),
                 "tokens": row.get::<i64, _>("tokens"),
+                "prompt_tokens": row.get::<i64, _>("prompt_tokens"),
+                "completion_tokens": row.get::<i64, _>("completion_tokens"),
                 "created_at": row.get::<String, _>("created_at"),
             })
         })

@@ -105,6 +105,27 @@ pub async fn require_session(
     next.run(req).await
 }
 
+// Bcrypt is genuinely CPU-bound: a cost-10 hash takes tens of milliseconds, which is long enough to
+// hold the runtime worker an async handler is standing on while other requests are only waiting for an
+// upstream. It is moved to the blocking pool, which is the one place this code uses it.
+pub async fn hash_password(password: &str) -> Result<String, String> {
+    let password = password.to_string();
+    let joined = tokio::task::spawn_blocking(move || bcrypt::hash(&password, 10))
+        .await
+        .map_err(|err| err.to_string())?;
+    joined.map_err(|err| err.to_string())
+}
+
+pub async fn password_matches(password: &str, hash: &str) -> bool {
+    let password = password.to_string();
+    let hash = hash.to_string();
+    match tokio::task::spawn_blocking(move || bcrypt::verify(&password, &hash)).await {
+        Ok(verified) => verified.unwrap_or(false),
+        // A blocking task that panics is not a password that matches.
+        Err(_) => false,
+    }
+}
+
 // The count is kept in the process rather than in the database: it only has to bound a loop, not
 // survive a restart.
 fn attempt_allowed(st: &State, username: &str) -> bool {
@@ -214,14 +235,10 @@ pub async fn register(
     let role = if count == 0 { "admin" } else { "user" };
     // The first account is never held back, because there is no one to approve it.
     let pending = count > 0 && crate::settings::requires_approval(&st).await;
-    let hash = match bcrypt::hash(&body.password, 10) {
+    let hash = match hash_password(&body.password).await {
         Ok(hash) => hash,
         Err(err) => {
-            return error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "server_error",
-                err.to_string(),
-            );
+            return error(StatusCode::INTERNAL_SERVER_ERROR, "server_error", err);
         }
     };
 
@@ -237,7 +254,23 @@ pub async fn register(
     .await
     {
         Ok(row) => row,
-        Err(err) => return error(StatusCode::CONFLICT, "invalid_request", err.to_string()),
+        // A name that is taken is named rather than answered with the driver text. The username is the
+        // only unique column on users, so a unique violation here can only mean that; a failure for any
+        // other reason is not dressed up as a taken name.
+        Err(sqlx::Error::Database(db)) if db.is_unique_violation() => {
+            return error(
+                StatusCode::CONFLICT,
+                "invalid_request",
+                format!("the username {username} is already taken"),
+            );
+        }
+        Err(err) => {
+            return error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "server_error",
+                err.to_string(),
+            );
+        }
     };
     let id = row.get::<i64, _>("id");
     if pending {
@@ -325,7 +358,7 @@ pub async fn login(
     // what they enter then becomes their own password.
     match row.get::<Option<String>, _>("password_hash") {
         Some(hash) => {
-            if !bcrypt::verify(&body.password, &hash).unwrap_or(false) {
+            if !password_matches(&body.password, &hash).await {
                 return error(
                     StatusCode::UNAUTHORIZED,
                     "invalid_credentials",
@@ -341,14 +374,10 @@ pub async fn login(
                     "password must be at least 8 characters",
                 );
             }
-            let hash = match bcrypt::hash(&body.password, 10) {
+            let hash = match hash_password(&body.password).await {
                 Ok(hash) => hash,
                 Err(err) => {
-                    return error(
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        "server_error",
-                        err.to_string(),
-                    );
+                    return error(StatusCode::INTERNAL_SERVER_ERROR, "server_error", err);
                 }
             };
             if let Err(err) = sqlx::query("UPDATE users SET password_hash = ? WHERE id = ?")

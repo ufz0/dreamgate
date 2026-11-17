@@ -1,3 +1,4 @@
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use axum::{
@@ -8,7 +9,7 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, post},
 };
-use dreamgate::{build_router, db, live, presence, state::State};
+use dreamgate::{build_router, db, limits, live, presence, state::State};
 use futures_util::stream;
 use http_body_util::BodyExt;
 use serde_json::{Value, json};
@@ -25,12 +26,25 @@ async fn test_state() -> State {
     for statement in db::SCHEMA {
         sqlx::query(*statement).execute(&pool).await.unwrap();
     }
+
+    // Far above what any test in this file sends, so a test is not shaped by admission: as a result the main
+    // suite never exercises it, including its interaction with the failover test. The tests that check admission
+    // build their own state in tests/concurrency.rs. The time bounds are the ones the gateway runs with,
+    // because the mock answers long before either of them.
+    let limits = limits::Limits::new(
+        1024,
+        1024,
+        Duration::from_secs(limits::DEFAULT_REQUEST_TIMEOUT_SECS),
+        Duration::from_secs(limits::DEFAULT_STREAM_STALL_SECS),
+        Duration::from_secs(limits::DEFAULT_CONNECT_TIMEOUT_SECS),
+    );
     State {
         pool,
-        http: reqwest::Client::new(),
+        http: limits.http_client(),
         hub: live::hub(),
         presence: Default::default(),
         attempts: Default::default(),
+        limits: Arc::new(limits),
     }
 }
 
@@ -440,6 +454,68 @@ async fn first_registered_account_is_admin() {
     no_approval(&router, &admin).await;
     let member = register(&router, "ben").await;
     assert_eq!(get_json(&router, "/api/me", &member).await["role"], "user");
+}
+
+#[tokio::test]
+async fn a_taken_username_is_named_when_registering() {
+    let st = test_state().await;
+    let router = build_router(st.clone());
+
+    let admin = register(&router, "ada").await;
+    open_registration(&router, &admin).await;
+
+    // Approval is on, so this account is held, and a held account's name is taken all the same.
+    let (status, body) = post_json(
+        &router,
+        "/api/register",
+        "",
+        json!({ "username": "ben", "password": "test-password" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["pending"], true);
+
+    // The entry screen shows the response's message when it is a short sentence, so this is what a
+    // person reads rather than the driver's text. The name is trimmed before it is stored, and the
+    // trimmed name is the one reported.
+    for attempt in ["ben", " ben "] {
+        let (status, body) = post_json(
+            &router,
+            "/api/register",
+            "",
+            json!({ "username": attempt, "password": "test-password" }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(
+            body["error"]["message"],
+            "the username ben is already taken"
+        );
+    }
+
+    // An insert that fails for another reason is a server error, not a taken name. A trigger that
+    // refuses every insert stands in for a database that cannot take the row.
+    sqlx::query(
+        "CREATE TRIGGER refuse_accounts BEFORE INSERT ON users BEGIN SELECT RAISE(ABORT, 'refused'); END",
+    )
+    .execute(&st.pool)
+    .await
+    .unwrap();
+    let (status, body) = post_json(
+        &router,
+        "/api/register",
+        "",
+        json!({ "username": "cy", "password": "test-password" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(body["error"]["type"], "server_error");
+    assert!(
+        !body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("already taken")
+    );
 }
 
 #[tokio::test]
@@ -1051,6 +1127,46 @@ async fn fails_over_to_a_healthy_connection() {
     assert_eq!(usage[0]["completion_tokens"], 7);
 }
 
+// The round of health checks is started by the binary rather than by a route, so no other test reaches
+// it. A connection is created without a check, so its row reads unknown until a round has looked at it.
+#[tokio::test]
+async fn the_health_check_round_marks_a_connection_that_answers() {
+    let st = test_state().await;
+    let router = build_router(st.clone());
+    let base_url = mock_upstream().await;
+    let cookie = register(&router, "ada").await;
+    let (_, created) = post_json(
+        &router,
+        "/api/connections",
+        &cookie,
+        json!({ "name": "live", "base_url": base_url }),
+    )
+    .await;
+    let id = created["id"].as_i64().unwrap();
+
+    // The first round runs as soon as the task starts, and the mock answers at once, so the window is
+    // far longer than the round needs. A round that stops is only started again after 30 seconds, so a
+    // round that cannot read the row is caught here as a row that still reads unknown.
+    let round = tokio::spawn(dreamgate::registry::health_checker(st.clone()));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let health: String = sqlx::query_scalar("SELECT health FROM connections WHERE id = ?")
+            .bind(id)
+            .fetch_one(&st.pool)
+            .await
+            .unwrap();
+        if health == "ok" {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the connection still reads {health} after the first round"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    round.abort();
+}
+
 #[tokio::test]
 async fn per_key_rate_limit_blocks_the_third_request() {
     let st = test_state().await;
@@ -1126,6 +1242,117 @@ async fn key_limits_must_be_positive() {
 }
 
 #[tokio::test]
+async fn a_connection_can_state_its_capability_or_leave_it_out_but_not_state_zero() {
+    let st = test_state().await;
+    let router = build_router(st.clone());
+    let admin = register(&router, "ada").await;
+
+    // A capability of 0 would admit nothing, which is not what leaving it out means, so it is rejected
+    // rather than stored, as a key limit of 0 is.
+    let (status, _) = post_json(
+        &router,
+        "/api/connections",
+        &admin,
+        json!({ "name": "zero", "base_url": "http://127.0.0.1:8080", "max_concurrent": 0 }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    // Leaving it out is not a limit of one: it is nothing stated, and the default applies to that
+    // connection alone.
+    let (status, body) = post_json(
+        &router,
+        "/api/connections",
+        &admin,
+        json!({ "name": "unstated", "base_url": "http://127.0.0.1:8080" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["connections"][0]["max_concurrent"], json!(null));
+}
+
+#[tokio::test]
+async fn the_connection_limit_is_added_to_a_database_written_before_it() {
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
+        .unwrap();
+    for statement in db::SCHEMA {
+        sqlx::query(*statement).execute(&pool).await.unwrap();
+    }
+
+    // A connections table as it was before a capability could be stated, with a row written then.
+    sqlx::query("DROP TABLE connections")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "CREATE TABLE connections (
+            id INTEGER PRIMARY KEY,
+            name TEXT NOT NULL UNIQUE,
+            base_url TEXT NOT NULL,
+            api_key TEXT,
+            default_model TEXT,
+            enabled INTEGER NOT NULL DEFAULT 1,
+            priority INTEGER NOT NULL DEFAULT 0,
+            health TEXT NOT NULL DEFAULT 'unknown',
+            last_checked_at TEXT,
+            created_at TEXT NOT NULL
+        )",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query("INSERT INTO connections (name, base_url, created_at) VALUES ('old', 'http://127.0.0.1:8080', '2026-01-01T00:00:00Z')")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    db::migrate(&pool).await.unwrap();
+
+    // The row that was already there reads as nothing stated, which is not a limit of one.
+    let row = sqlx::query("SELECT name, max_concurrent FROM connections")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(row.get::<String, _>("name"), "old");
+    assert_eq!(
+        row.get::<Option<i64>, _>("max_concurrent"),
+        None,
+        "a connection written before the change reads as nothing stated"
+    );
+
+    // Running it again on a table that is already current changes nothing.
+    db::migrate(&pool).await.unwrap();
+    assert_eq!(
+        sqlx::query("SELECT max_concurrent FROM connections")
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+            .get::<Option<i64>, _>("max_concurrent"),
+        None
+    );
+
+    // A connection can state its capability now.
+    sqlx::query(
+        "INSERT INTO connections (name, base_url, max_concurrent, created_at) \
+         VALUES ('stated', 'http://127.0.0.1:11434', 3, '2026-01-01T00:00:00Z')",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        sqlx::query("SELECT max_concurrent FROM connections WHERE name = 'stated'")
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+            .get::<Option<i64>, _>("max_concurrent"),
+        Some(3)
+    );
+}
+
+#[tokio::test]
 async fn the_keys_list_is_the_callers_own_and_only_an_admin_can_read_the_others() {
     let st = test_state().await;
     let router = build_router(st.clone());
@@ -1164,6 +1391,124 @@ async fn the_keys_list_is_the_callers_own_and_only_an_admin_can_read_the_others(
     assert_eq!(
         denied["error"]["message"],
         "only an admin can see keys from other accounts"
+    );
+}
+
+#[tokio::test]
+async fn the_key_account_and_model_figures_carry_the_input_and_the_output_apart() {
+    let st = test_state().await;
+    let router = build_router(st.clone());
+    let base_url = mock_upstream().await;
+    let admin = register(&router, "ada").await;
+    post_json(
+        &router,
+        "/api/connections",
+        &admin,
+        json!({ "name": "test", "base_url": base_url, "default_model": "reports-usage" }),
+    )
+    .await;
+    open_registration(&router, &admin).await;
+    no_approval(&router, &admin).await;
+    let member = register(&router, "ben").await;
+    // An account an admin made has no usage, and still has a row.
+    post_json(&router, "/api/users", &admin, json!({ "username": "cy" })).await;
+
+    // The mock reports 11 tokens in and 7 out for every request.
+    let (_, used) = post_json(&router, "/api/keys", &admin, json!({ "name": "used" })).await;
+    post_json(&router, "/api/keys", &admin, json!({ "name": "unused" })).await;
+    let (_, member_key) = post_json(
+        &router,
+        "/api/keys",
+        &member,
+        json!({ "name": "member key" }),
+    )
+    .await;
+    for key in [&used, &used, &member_key] {
+        gateway_call(
+            &router,
+            key["key"].as_str().unwrap(),
+            json!({ "messages": [{ "role": "user", "content": "hi" }] }),
+        )
+        .await;
+    }
+
+    let own = get_json(&router, "/api/keys", &admin).await;
+    let named = |list: &Value, name: &str| {
+        list["keys"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|key| key["name"] == name)
+            .cloned()
+            .unwrap()
+    };
+    let key = named(&own, "used");
+    assert_eq!(key["prompt_tokens"], 22);
+    assert_eq!(key["completion_tokens"], 14);
+    assert_eq!(key["tokens"], 36, "the total a key's cap counts stays");
+    let idle = named(&own, "unused");
+    assert_eq!(
+        (&idle["prompt_tokens"], &idle["completion_tokens"]),
+        (&json!(0), &json!(0)),
+        "a key that has not been used reads zero on both sides, not null"
+    );
+    let others = get_json(&router, "/api/keys/others", &admin).await;
+    let theirs = named(&others, "member key");
+    assert_eq!(theirs["prompt_tokens"], 11);
+    assert_eq!(theirs["completion_tokens"], 7);
+
+    let summary = get_json(&router, "/api/stats/summary", &admin).await;
+    let models = summary["models"].as_array().unwrap();
+    assert_eq!(models.len(), 1);
+    assert_eq!(models[0]["prompt_tokens"], 33);
+    assert_eq!(models[0]["completion_tokens"], 21);
+    assert_eq!(models[0]["tokens"], 54);
+    let member_summary = get_json(&router, "/api/stats/summary", &member).await;
+    assert_eq!(
+        member_summary["models"][0]["prompt_tokens"], 11,
+        "a member's models are their own"
+    );
+    assert_eq!(member_summary["models"][0]["completion_tokens"], 7);
+
+    // A recorded request outlives its key, so the account's split stands when the key goes.
+    let (status, _) = send_json(
+        &router,
+        http::Method::DELETE,
+        &format!("/api/keys/{}", used["id"]),
+        &admin,
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let summary = get_json(&router, "/api/stats/summary", &admin).await;
+    let account = |name: &str| {
+        summary["users"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|user| user["username"] == name)
+            .cloned()
+            .unwrap()
+    };
+    let ada = account("ada");
+    assert_eq!(ada["prompt_tokens"], 22);
+    assert_eq!(ada["completion_tokens"], 14);
+    assert_eq!(
+        ada["used_today"], 36,
+        "the day figure is the input and the output together, as the daily limit counts it"
+    );
+    let ben = account("ben");
+    assert_eq!(ben["prompt_tokens"], 11);
+    assert_eq!(ben["completion_tokens"], 7);
+    let cy = account("cy");
+    assert_eq!(
+        (
+            &cy["prompt_tokens"],
+            &cy["completion_tokens"],
+            &cy["used_today"]
+        ),
+        (&json!(0), &json!(0), &json!(0)),
+        "an account with no usage reads zero on both sides, not null"
     );
 }
 
@@ -1281,6 +1626,11 @@ async fn per_key_token_cap_blocks_the_next_request() {
     )
     .await;
     assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    // The cap counts the input and the output together, so the refusal says so.
+    assert_eq!(
+        json_body(response).await["error"]["message"],
+        "key 'capped' has reached its token cap of 10 input and output tokens"
+    );
 }
 
 #[tokio::test]
@@ -1330,6 +1680,10 @@ async fn account_daily_limit_blocks_the_next_request() {
     )
     .await;
     assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(
+        json_body(response).await["error"]["message"],
+        "account 'ada' has used its daily token limit of 15 input and output tokens"
+    );
 }
 
 #[tokio::test]
@@ -2512,4 +2866,369 @@ async fn the_session_cookie_is_marked_secure_only_when_the_request_arrived_over_
         cookie.contains("Max-Age=2592000"),
         "the cookie and the stored session last the same window"
     );
+}
+
+// An upstream that streams one word every `delay_ms`, `words` times, and reports usage in its last chunk as
+// an OpenAI-shaped server does, so a stream is still running for long enough to be watched from the page.
+// It holds the stream open for a second after the usage chunk, four progress ticks, as an upstream that
+// sends its end separately can, so the counts it reported are seen in flight before the row.
+async fn slow_upstream(words: usize, delay_ms: u64, input_first: bool) -> String {
+    let chat = move || async move {
+        let body = stream::unfold(0usize, move |sent| async move {
+            if sent > words {
+                tokio::time::sleep(Duration::from_millis(1000)).await;
+                return None;
+            }
+            tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+            // Some engines report the input in their first chunk and what they generated only in the last,
+            // so the mock can send the input's count with the first word.
+            let line = if sent == 0 && input_first {
+                json!({ "choices": [{ "delta": { "content": "word0" } }], "usage": { "prompt_tokens": 11 } })
+            } else if sent < words {
+                json!({ "choices": [{ "delta": { "content": format!("word{sent}") } }] })
+            } else {
+                json!({ "choices": [], "usage": { "prompt_tokens": 11, "completion_tokens": 42 } })
+            };
+            Some((
+                Ok::<_, std::io::Error>(format!("data: {line}\n\n")),
+                sent + 1,
+            ))
+        });
+        let mut out = Response::new(Body::from_stream(body));
+        out.headers_mut().insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("text/event-stream"),
+        );
+        out
+    };
+    let app = Router::new().route("/v1/chat/completions", post(chat));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    format!("http://{addr}")
+}
+
+// The live stream read the way the page reads it: one event at a time, each a `data:` line and a blank line.
+// A read waits no longer than five seconds, so a stream that stops sending fails the test rather than
+// hanging it.
+struct Live {
+    body: Body,
+    buffer: String,
+}
+
+impl Live {
+    async fn open(router: &Router, cookie: &str) -> Live {
+        let response = call(
+            router,
+            Request::get("/api/live")
+                .header("cookie", cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        Live {
+            body: response.into_body(),
+            buffer: String::new(),
+        }
+    }
+
+    async fn next(&mut self) -> Value {
+        loop {
+            if let Some(end) = self.buffer.find("\n\n") {
+                let event: String = self.buffer.drain(..end + 2).collect();
+                let data = event.trim().strip_prefix("data: ").unwrap();
+                return serde_json::from_str(data).unwrap();
+            }
+            let frame = tokio::time::timeout(Duration::from_secs(5), self.body.frame())
+                .await
+                .expect("an event within five seconds")
+                .expect("the live stream is still open")
+                .unwrap();
+            if let Ok(data) = frame.into_data() {
+                self.buffer.push_str(std::str::from_utf8(&data).unwrap());
+            }
+        }
+    }
+}
+
+// A stream that is still running is on the live stream, and its count moves while it runs rather than
+// arriving with the row. The count is the gateway's estimate until the upstream reports one and then what
+// the upstream reported, and the row that settles the stream names it, so the page can put one in the
+// other's place. The stream leaves the list in the same step that sends the row, so a page never reads it
+// gone before the row has arrived. The stream is two seconds of words against a progress tick of a quarter
+// of a second, so it is seen moving with room to spare.
+#[tokio::test]
+async fn a_stream_in_flight_is_on_the_live_stream_and_its_row_takes_its_place() {
+    let st = test_state().await;
+    let router = build_router(st.clone());
+    let base_url = slow_upstream(40, 50, false).await;
+    let cookie = register(&router, "ada").await;
+    post_json(
+        &router,
+        "/api/connections",
+        &cookie,
+        json!({ "name": "slow", "base_url": base_url }),
+    )
+    .await;
+    let (_, created) = post_json(&router, "/api/keys", &cookie, json!({ "name": "watched" })).await;
+    let key = created["key"].as_str().unwrap().to_string();
+
+    let mut live = Live::open(&router, &cookie).await;
+    assert_eq!(live.next().await["type"], "snapshot");
+
+    let answer = {
+        let router = router.clone();
+        tokio::spawn(async move {
+            let response = gateway_call(
+                &router,
+                &key,
+                json!({ "model": "slow-model", "stream": true, "messages": [{ "role": "user", "content": "hi" }] }),
+            )
+            .await;
+            response.into_body().collect().await.unwrap().to_bytes()
+        })
+    };
+
+    let mut estimates = Vec::new();
+    let mut reported = false;
+    let mut stream = None;
+    let mut usage = None;
+    let mut cleared = false;
+    while usage.is_none() || !cleared {
+        let event = live.next().await;
+        match event["type"].as_str() {
+            Some("progress") => match event["streams"].as_array().unwrap().first() {
+                Some(progress) => {
+                    assert!(
+                        usage.is_none(),
+                        "the stream's progress came after the row that settles it"
+                    );
+                    assert_eq!(progress["key"], "watched");
+                    assert_eq!(progress["model"], "slow-model");
+                    assert_eq!(
+                        event["shares"],
+                        json!([{
+                            "stream": progress["stream"],
+                            "completion_tokens": progress["completion_tokens"],
+                            "estimated": progress["estimated"],
+                        }])
+                    );
+                    stream = Some(progress["stream"].clone());
+                    if progress["estimated"] == true {
+                        assert!(
+                            !reported,
+                            "the count went back to an estimate after the upstream reported one"
+                        );
+                        assert_eq!(
+                            progress["prompt_estimated"], true,
+                            "the input is the gateway's estimate until the upstream reports it"
+                        );
+                        estimates.push(progress["completion_tokens"].as_i64().unwrap());
+                    } else {
+                        assert_eq!(progress["prompt_tokens"], 11);
+                        assert_eq!(progress["completion_tokens"], 42);
+                        assert_eq!(progress["prompt_estimated"], false);
+                        reported = true;
+                    }
+                    cleared = false;
+                }
+                None if stream.is_some() => {
+                    assert!(
+                        usage.is_some(),
+                        "the stream left the list before its row arrived, so the figure dipped"
+                    );
+                    assert_eq!(event["shares"], json!([]));
+                    cleared = true;
+                }
+                None => {}
+            },
+            Some("usage") => usage = Some(event),
+            _ => {}
+        }
+    }
+    answer.await.unwrap();
+
+    assert!(
+        estimates.windows(2).all(|pair| pair[0] <= pair[1]),
+        "the estimate only goes up while the stream runs: {estimates:?}"
+    );
+    let mut moving = estimates.clone();
+    moving.retain(|count| *count > 0);
+    moving.dedup();
+    assert!(
+        moving.len() >= 2,
+        "the count was seen moving while the stream ran, not only at its end: {estimates:?}"
+    );
+    assert!(
+        reported,
+        "the counts the upstream reported were seen in flight before the row"
+    );
+    let usage = usage.unwrap();
+    assert_eq!(
+        usage["event"]["stream"],
+        stream.unwrap(),
+        "the row names the stream it settles"
+    );
+    assert_eq!(usage["event"]["completion_tokens"], 42);
+}
+
+// The feed shows the input and what was generated in columns of their own, so each says on its own whether
+// it is the gateway's estimate. An upstream that reports the input in its first chunk has the input shown as
+// reported while the generated count is still an estimate, rather than both waiting for the last chunk.
+#[tokio::test]
+async fn a_stream_that_reports_its_input_first_shows_it_as_reported_while_the_rest_is_estimated() {
+    let st = test_state().await;
+    let router = build_router(st.clone());
+    let base_url = slow_upstream(20, 50, true).await;
+    let cookie = register(&router, "ada").await;
+    post_json(
+        &router,
+        "/api/connections",
+        &cookie,
+        json!({ "name": "slow", "base_url": base_url }),
+    )
+    .await;
+    let (_, created) = post_json(&router, "/api/keys", &cookie, json!({ "name": "watched" })).await;
+    let key = created["key"].as_str().unwrap().to_string();
+
+    let mut live = Live::open(&router, &cookie).await;
+    assert_eq!(live.next().await["type"], "snapshot");
+
+    let answer = {
+        let router = router.clone();
+        tokio::spawn(async move {
+            let response = gateway_call(
+                &router,
+                &key,
+                json!({ "model": "slow-model", "stream": true, "messages": [{ "role": "user", "content": "hi" }] }),
+            )
+            .await;
+            response.into_body().collect().await.unwrap().to_bytes()
+        })
+    };
+
+    let mut input_first = false;
+    loop {
+        let event = live.next().await;
+        if event["type"] == "usage" {
+            break;
+        }
+        if event["type"] != "progress" {
+            continue;
+        }
+        let Some(progress) = event["streams"].as_array().unwrap().first() else {
+            continue;
+        };
+        if progress["prompt_estimated"] == false && progress["estimated"] == true {
+            assert_eq!(
+                progress["prompt_tokens"], 11,
+                "the input shown as reported is the upstream's count"
+            );
+            input_first = true;
+        }
+        if progress["prompt_estimated"] == true {
+            assert!(
+                !input_first,
+                "the input went back to an estimate after the upstream reported it"
+            );
+        }
+    }
+    answer.await.unwrap();
+    assert!(
+        input_first,
+        "the input was seen as reported while the generated count was still an estimate"
+    );
+}
+
+// Another account's stream is part of the platform total, which anyone signed in sees, but the stream
+// itself, its key and its model, is listed for an admin alone, as the rest of the usage is. A member is
+// told the stream's share of what is being generated and, when it ends, the row's figures and nothing else,
+// naming the stream so its share leaves the total as the figures arrive.
+#[tokio::test]
+async fn another_accounts_stream_is_listed_for_an_admin_and_only_counted_for_a_member() {
+    let st = test_state().await;
+    let router = build_router(st.clone());
+    let base_url = slow_upstream(40, 50, false).await;
+    let admin = register(&router, "ada").await;
+    open_registration(&router, &admin).await;
+    no_approval(&router, &admin).await;
+    let streaming = register(&router, "ben").await;
+    let watching = register(&router, "cy").await;
+    let ben = get_json(&router, "/api/me", &streaming).await["id"].clone();
+    post_json(
+        &router,
+        "/api/connections",
+        &admin,
+        json!({ "name": "slow", "base_url": base_url }),
+    )
+    .await;
+    let (_, created) =
+        post_json(&router, "/api/keys", &streaming, json!({ "name": "ben's" })).await;
+    let key = created["key"].as_str().unwrap().to_string();
+
+    let mut admin_live = Live::open(&router, &admin).await;
+    assert_eq!(admin_live.next().await["type"], "snapshot");
+    let mut member_live = Live::open(&router, &watching).await;
+    assert_eq!(member_live.next().await["type"], "snapshot");
+
+    let answer = {
+        let router = router.clone();
+        tokio::spawn(async move {
+            let response = gateway_call(
+                &router,
+                &key,
+                json!({ "stream": true, "messages": [{ "role": "user", "content": "hi" }] }),
+            )
+            .await;
+            response.into_body().collect().await.unwrap().to_bytes()
+        })
+    };
+
+    loop {
+        let event = admin_live.next().await;
+        if let Some(progress) = event["streams"]
+            .as_array()
+            .and_then(|streams| streams.first())
+        {
+            assert_eq!(progress["key"], "ben's");
+            assert_eq!(progress["user_id"], ben);
+            break;
+        }
+    }
+
+    let mut share = None;
+    let total = loop {
+        let event = member_live.next().await;
+        match event["type"].as_str() {
+            Some("progress") => {
+                assert_eq!(
+                    event["streams"],
+                    json!([]),
+                    "another account's stream is not listed for a member"
+                );
+                if let Some(first) = event["shares"].as_array().unwrap().first() {
+                    share = Some(first["stream"].clone());
+                }
+            }
+            Some("total") => break event,
+            Some("usage") => panic!("another account's row is not sent to a member"),
+            _ => {}
+        }
+    };
+    answer.await.unwrap();
+
+    let share = share.expect("the stream's share reached the member while it ran");
+    assert_eq!(
+        total["event"]["stream"], share,
+        "the figures name the stream whose share they replace"
+    );
+    assert_eq!(total["event"]["completion_tokens"], 42);
+    assert_eq!(total["event"]["total_tokens"], 53);
+    for field in ["id", "key", "user", "user_id", "model"] {
+        assert!(
+            total["event"].get(field).is_none(),
+            "a member is not sent the row's {field}"
+        );
+    }
 }

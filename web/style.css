@@ -108,7 +108,7 @@ body {
 
 .switch button[aria-pressed="true"] { color: var(--accent); border-bottom-color: var(--accent); }
 
-.visually-hidden { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); }
+.visually-hidden { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
 
 .entry-form label { display: grid; gap: 6px; font-size: 14px; color: var(--text-muted); margin-bottom: 14px; }
 
@@ -176,6 +176,12 @@ body {
 .shell[data-collapsed="true"] .foot-row span:not(.icon),
 .shell[data-collapsed="true"] .foot-row .icon:last-child { display: none; }
 .shell[data-collapsed="true"] .foot-row { flex-direction: column; }
+/* A collapsed rail leaves 32px inside its padding, and the foot's own padding took that to 20, narrower than
+   either control, so the grid column grew from the left edge and pushed both off centre, the theme button
+   to the rail's edge. The foot drops its side padding there, its column cannot grow past the rail, and the
+   theme button takes the 30px square Sign out has, so both sit on the rail's centre line. */
+.shell[data-collapsed="true"] .sidebar-foot { padding: 6px 0; grid-template-columns: minmax(0, 1fr); }
+.shell[data-collapsed="true"] #theme-menu .menu-button { padding: 7px; }
 
 .account { color: var(--text-muted); font-size: 13px; margin: 0; }
 .account b { font-weight: 600; color: var(--text); }
@@ -240,6 +246,8 @@ main {
 .readout-pair { display: flex; flex-wrap: wrap; gap: 24px; }
 .readout-pair > div { flex: 1 1 240px; }
 
+/* The label names which side of the request a figure counts, so it reads before the number. */
+.readout-label { margin: 0 0 2px; color: var(--text-muted); font-size: 13px; font-weight: 600; }
 .readout { margin: 0 0 4px; font: 400 34px/1.2 var(--font-mono); font-variant-numeric: tabular-nums; color: var(--text); }
 .readout-note { margin: 0 0 20px; color: var(--text-muted); font-size: 13px; }
 
@@ -260,11 +268,16 @@ main {
 
 /* Live traffic */
 
-.feed { list-style: none; margin: 0; padding: 0; max-height: 300px; overflow: auto; }
+/* The head names the columns of the rows under it, so it shares their grid. It scrolls in the same box as
+   the rows and sticks to its top, so it stays in place and a scrollbar narrows both alike. The input and
+   the output are a column each, wide enough for "Output tokens" on one line. The key and the model share
+   what is left, so on a narrow window neither shrinks to nothing and the counts stay in view. */
+.feed-scroll { max-height: 300px; overflow: auto; }
+.feed { list-style: none; margin: 0; padding: 0; }
 
-.feed li {
+.feed li, .feed-head {
   display: grid;
-  grid-template-columns: 64px 140px minmax(0, 1fr) 44px 64px;
+  grid-template-columns: 64px minmax(64px, 1fr) minmax(48px, 3fr) 44px 88px 88px;
   gap: 12px;
   padding: 5px 0;
   border-bottom: 1px solid var(--border);
@@ -273,9 +286,15 @@ main {
   font-variant-numeric: tabular-nums;
 }
 
+.feed-head { position: sticky; top: 0; background: var(--bg); font: 600 12px/1.5 var(--font-sans); }
+.feed-head .tokens { text-align: right; }
+
 .feed li span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .feed li .tokens { color: var(--text); text-align: right; }
 .feed li.arrived { background: var(--bg-raised); border-radius: var(--radius-sm); }
+/* A stream still running: the accent marks the figure that is moving, as it marks what to notice on the
+   charts. */
+.feed li.inflight .tokens { color: var(--accent); }
 
 /* Transcript — the Sandbox conversation. Speakers are named, and the accent marks which side
    of the exchange is yours; model answers keep their line breaks. */
@@ -312,7 +331,9 @@ main {
 
 /* Tables */
 
-.table { overflow-x: auto; }
+/* A table scrolls sideways inside its own box. The box is positioned, so the hidden Actions header,
+   which is absolutely positioned, scrolls with it rather than widening the page. */
+.table { overflow-x: auto; position: relative; }
 
 table { width: 100%; border-collapse: collapse; }
 
@@ -343,7 +364,11 @@ tr.off td { color: var(--text-muted); }
   padding: 3px 8px;
   font-size: 13px;
   color: var(--text-muted);
+  white-space: nowrap;
 }
+
+/* A chip's text is smaller than the body's, so its glyph is drawn at the size a menu button uses. */
+.chip .icon svg { width: 14px; height: 14px; }
 
 .chip.ok { color: var(--success); }
 .chip.down { color: var(--danger); }
@@ -369,6 +394,10 @@ tr.off td { color: var(--text-muted); }
 
 .menu-button .icon svg { width: 14px; height: 14px; }
 
+/* The last glyph in a menu button is the chevron, and it points the way the list opens. The expand
+   buttons use the same glyph pointing right, so a menu turns it rather than reading as one of those. */
+.menu-button .icon:last-child svg { transform: rotate(90deg); }
+
 .menu {
   position: absolute;
   z-index: 3;
@@ -384,11 +413,12 @@ tr.off td { color: var(--text-muted); }
   box-shadow: var(--shadow-pop);
 }
 
-/* The theme control sits at the bottom of the shell, so its list always opens upward. The height is not
-   set here: app.js caps it to the room above the button when the menu is shown, because a stylesheet
-   knows the window size but not where the button is, and an uncapped list runs past the top of a short
-   screen. */
+/* The theme control sits at the bottom of the shell, so its list always opens upward, and its chevron
+   points up with it. The height is not set here: app.js caps it to the room above the button when the
+   menu is shown, because a stylesheet knows the window size but not where the button is, and an uncapped
+   list runs past the top of a short screen. */
 .menu-wrap[data-name="theme"] .menu { top: auto; bottom: calc(100% + 4px); overflow: auto; }
+.menu-wrap[data-name="theme"] .menu-button .icon:last-child svg { transform: rotate(-90deg); }
 
 .menu li {
   display: flex;
@@ -460,7 +490,11 @@ button[type="submit"] {
 
 button[type="submit"]:hover { background: var(--accent-hover); border-color: var(--accent-hover); }
 
+/* A row, so a glyph sits beside its label on the same centre line instead of on the text baseline. */
 button.ghost {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
   background: none;
   border: 0;
   padding: 6px;
@@ -566,7 +600,10 @@ input:focus-visible, select:focus-visible, textarea:focus-visible, button:focus-
   .shell[data-drawer="open"] .scrim { display: block; }
   .scrim { display: none; position: fixed; inset: 0; background: rgba(0, 0, 0, .35); z-index: 1; }
   .entry { grid-template-columns: 1fr; padding: 24px; }
-  .feed li { grid-template-columns: 56px 100px minmax(0, 1fr) 40px 56px; }
+  /* Six columns fit a phone only with less room between them: these fit the 320px a 360px phone leaves
+     inside main's padding. On a narrower screen the feed scrolls sideways, as the tables do, rather than
+     cutting the key and the model to nothing. */
+  .feed li, .feed-head { grid-template-columns: 56px minmax(41px, 1fr) minmax(41px, 1fr) 40px 56px 56px; gap: 6px; min-width: 320px; }
 }
 
 @media (prefers-reduced-motion: reduce) {

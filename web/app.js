@@ -12,18 +12,20 @@ const keyLabel = (event) => event.key || 'key removed';
 
 const ICONS = {
   overview: '<path d="M4 17a8 8 0 0 1 16 0"/><path d="M12 14l4-3"/>',
-  activity: '<path d="M4 6h16M4 12h12M4 18h8"/>',
+  activity: '<path d="M3 12h4l3-8 4 16 3-8h4"/>',
   keys: '<circle cx="8.5" cy="12" r="3.5"/><path d="M12 12h9M18 12v4M21 12v-3"/>',
   connections: '<path d="M9 3v5M15 3v5M8 8h8v6a4 4 0 0 1-8 0z"/>',
   client: '<path d="M9 7l-5 5 5 5M15 7l5 5-5 5"/>',
   accounts: '<circle cx="12" cy="9" r="4"/><path d="M4 20a8 8 0 0 1 16 0"/>',
   sandbox: '<path d="M4 5h16v11H9l-5 4z"/><path d="M8 10h8"/>',
   check: '<circle cx="12" cy="12" r="9"/><path d="M8.5 12.5l2.5 2.5 5-5"/>',
-  alert: '<path d="M12 4l8 14H4z"/><path d="M12 9v4"/>',
+  alert: '<path d="M12 3l9 17H3z"/><path d="M12 9v4M12 16.5h.01"/>',
+  pending: '<circle cx="12" cy="12" r="9"/><path d="M12 7.5V12l3 2"/>',
   chevron: '<path d="M9 6l6 6-6 6"/>',
   panel: '<rect x="3" y="4" width="18" height="16" rx="2"/><path d="M9 4v16"/>',
   exit: '<path d="M15 4H6a2 2 0 0 0-2 2v12a2 2 0 0 0 2 2h9"/><path d="M16 12h5M19 9l3 3-3 3"/>',
-  theme: '<circle cx="12" cy="12" r="8"/><path d="M12 4v16"/>',
+  // Half of the circle is filled, which is what reads as light and dark; the rest of the set is outline only.
+  theme: '<circle cx="12" cy="12" r="8"/><path d="M12 4a8 8 0 0 1 0 16z" fill="currentColor"/>',
 };
 
 function icon(name) {
@@ -32,6 +34,20 @@ function icon(name) {
 
 function paintIcons(root) {
   for (const el of root.querySelectorAll('[data-icon]')) el.innerHTML = icon(el.dataset.icon);
+}
+
+// The stored health is unknown until a check has run on a connection, which is not the same as down: the
+// gateway only skips a connection whose check failed, so one that was never checked does not get the
+// warning. A value this page does not know is shown as it is stored rather than read as one of these.
+const HEALTH = {
+  ok: ['ok', 'check', 'ok'],
+  down: ['down', 'alert', 'down'],
+  unknown: ['', 'pending', 'not checked yet'],
+};
+
+function healthChip(health) {
+  const [kind, glyph, label] = Object.hasOwn(HEALTH, health) ? HEALTH[health] : ['', null, health];
+  return `<span class="chip ${kind}">${glyph ? `<span class="icon">${icon(glyph)}</span>` : ''}<span>${esc(label)}</span></span>`;
 }
 
 const state = {
@@ -53,6 +69,9 @@ const state = {
   // first account is never blocked by a failed request.
   settings: { open_registration: true, require_approval: true, has_accounts: false },
   presence: { online: 0, generating: 0, users: [] },
+  // The streams in flight, as the gateway last said: every stream's share of what is being generated,
+  // and the streams themselves as far as this account may see them.
+  progress: { shares: [], streams: [] },
   chat: [],
   models: [],
   modelNote: '',
@@ -94,6 +113,12 @@ function report(err) {
   console.error(err);
 }
 
+// A copy button says Copied for a moment after it copies; this puts back the label it had before.
+function restoreLabel(button) {
+  clearTimeout(button.copiedTimer);
+  if (button.dataset.label) button.textContent = button.dataset.label;
+}
+
 // The clipboard is only exposed on a secure origin, so this page served over http on a LAN
 // address has no navigator.clipboard. Selecting a temporary textarea still copies there.
 async function copy(text) {
@@ -119,13 +144,16 @@ async function copy(text) {
 
 // Menus replace the native select: a button plus a list, closed on outside click and
 // Escape, navigable with the arrow keys. A glyph is for the menu that has to work in a
-// collapsed rail, where the label text is not shown.
+// collapsed rail, where the label text is not shown. The button's name carries the choice
+// as well as what is being chosen, because a name on a button replaces the text inside it.
+const menuName = (label, choice) => (choice ? `${label}: ${choice}` : label);
+
 function renderMenu(container, name, options, current, label, glyph) {
   const picked = options.find((o) => o.value === current) || options[0];
   container.dataset.name = name;
   container.dataset.value = picked ? picked.value : '';
   container.innerHTML = `
-    <button type="button" class="menu-button" aria-haspopup="listbox" aria-expanded="false" aria-label="${esc(label)}">
+    <button type="button" class="menu-button" aria-haspopup="listbox" aria-expanded="false" aria-label="${esc(menuName(label, picked?.label))}">
       ${glyph ? `<span class="icon">${icon(glyph)}</span>` : ''}
       <span>${esc(picked ? picked.label : label)}</span>
       <span class="icon">${icon('chevron')}</span>
@@ -168,11 +196,17 @@ function chooseOption(option) {
   // class — the same span the collapsed-rail rule in web/style.css hides. It cannot be taken as the
   // first child, because a menu that has a glyph puts that first.
   wrap.querySelector('.menu-button span:not(.icon)').textContent = option.textContent;
+  wrap.querySelector('.menu-button').setAttribute('aria-label', menuName(wrap.querySelector('.menu').getAttribute('aria-label'), option.textContent));
   for (const item of wrap.querySelectorAll('[role="option"]')) item.setAttribute('aria-selected', String(item === option));
   closeMenus();
-  if (wrap.dataset.name === 'theme') applyTheme(option.dataset.value);
+  if (wrap.dataset.name === 'theme') {
+    applyTheme(option.dataset.value);
+    labelRail();
+  }
   if (wrap.dataset.name === 'connect-key') {
     state.connectKey = option.dataset.value;
+    // Copied was about the key that was showing, so it does not carry over to the one just picked.
+    restoreLabel($('connect-copy'));
     renderConnect();
   }
   if (wrap.dataset.name === 'sandbox-key') {
@@ -243,6 +277,8 @@ function renderNav() {
 // Data
 
 async function load() {
+  // What was in flight belongs to the session that was open before; this one is told its own.
+  state.progress = { shares: [], streams: [] };
   state.settings = await api('/api/settings');
   state.summary = await api('/api/stats/summary');
   state.keys = (await api('/api/keys')).keys;
@@ -261,8 +297,42 @@ async function loadOtherKeys() {
   state.otherKeys = state.me?.role === 'admin' ? (await api('/api/keys/others')).keys : [];
 }
 
+// Names of the accounts this page has seen generating. A live presence event carries ids but no names,
+// which only /api/presence gives, and only to an admin; the names are kept for as long as the page is
+// open, so an account is only looked up the first time it is seen rather than every time it starts.
+const names = new Map();
+let naming = null;
+
 async function refreshPresence() {
   state.presence = await api('/api/presence');
+  for (const user of state.presence.users || []) names.set(user.id, user.username);
+}
+
+function namedPresence(presence) {
+  const ids = presence.generating_ids || [];
+  return { ...presence, users: ids.filter((id) => names.has(id)).map((id) => ({ id, username: names.get(id) })) };
+}
+
+// One lookup at a time, and only the names are taken from it: the counts on the page stay the ones the
+// latest event carried, which a slower answer to an older lookup would otherwise overwrite. An account
+// that started while a lookup was out is looked up when it returns, and an answer that arrives after
+// sign out is dropped, because the names belong to the admin who asked.
+const unnamed = () => state.me?.role === 'admin' && state.presence.users.length < (state.presence.generating_ids || []).length;
+
+function nameUnknown() {
+  if (naming) return;
+  naming = api('/api/presence')
+    .then((presence) => {
+      if (!state.me) return;
+      for (const user of presence.users || []) names.set(user.id, user.username);
+      state.presence = namedPresence(state.presence);
+      render(false);
+    })
+    .catch(() => {})
+    .finally(() => {
+      naming = null;
+      if (unnamed()) nameUnknown();
+    });
 }
 
 async function refresh(path) {
@@ -276,7 +346,8 @@ async function refresh(path) {
 }
 
 // A counter moves with the same event the feed does. The top counter covers every account, so
-// any event counts; an account's own figures only move for the event that belongs to it.
+// any event counts, including the figures a member is sent for another account's row; an account's
+// own figures only move for the event that belongs to it.
 // Averages are not updated here: they are the mean of the stored rows, and one event cannot move a
 // mean that was computed over all of them.
 const isToday = (value) => String(value).slice(0, 10) === new Date().toISOString().slice(0, 10);
@@ -305,29 +376,59 @@ function countTotals(totals, event) {
 function subscribe() {
   if (state.live) state.live.close();
   state.live = new EventSource('/api/live');
+  // A live stream that is refused rather than dropped, as an expired session's is, is not tried again, so
+  // what it last said about the streams in flight would stand for good; it is taken off the page instead.
+  state.live.onerror = () => {
+    if (state.live?.readyState !== EventSource.CLOSED) return;
+    state.progress = { shares: [], streams: [] };
+    renderProgress();
+  };
   state.live.onmessage = (message) => {
     const payload = JSON.parse(message.data);
     if (payload.type === 'snapshot') {
       state.summary.self = payload.self;
       state.summary.global = payload.global;
+      // The snapshot is what was recorded when the stream opened, so progress from before it, such as a
+      // stream that ended while the page was reconnecting, no longer applies; the next tick says what does.
+      state.progress = { shares: [], streams: [] };
       render(false);
       return;
     }
     if (payload.type === 'presence') {
-      state.presence = payload.presence;
+      state.presence = namedPresence(payload.presence);
+      if (unnamed()) nameUnknown();
       render(false);
+      return;
+    }
+    if (payload.type === 'progress') {
+      state.progress = payload;
+      renderProgress();
+      return;
+    }
+    // Another account's row, sent to a member as its figures alone: it only moves the platform total, and
+    // takes its stream's share out of what is still being generated.
+    if (payload.type === 'total') {
+      retireStream(payload.event.stream);
+      countTotals(state.summary.global, payload.event);
+      renderProgress();
       return;
     }
     state.events.unshift(payload.event);
     state.events = state.events.slice(0, 50);
     const event = payload.event;
+    retireStream(event.stream);
     // Every event counts toward the total the gate has produced, but only the caller's own events
     // move the account figures or the charts.
     countTotals(state.summary.global, event);
     if (event.user_id === state.me.id) countTotals(state.summary.self, event);
-    if (isToday(event.created_at)) {
-      const account = state.summary.users.find((user) => user.id === event.user_id);
-      if (account) account.used_today = num(account.used_today) + event.total_tokens;
+    // An account's row in the Accounts view moves with the same event, so its input and output do not
+    // stand still beside a day figure that has moved.
+    const account = state.summary.users.find((user) => user.id === event.user_id);
+    if (account) {
+      account.requests = num(account.requests) + 1;
+      account.prompt_tokens = num(account.prompt_tokens) + num(event.prompt_tokens);
+      account.completion_tokens = num(account.completion_tokens) + num(event.completion_tokens);
+      if (isToday(event.created_at)) account.used_today = num(account.used_today) + event.total_tokens;
     }
     // The charts are per account, so an event from another account does not move them.
     if (event.user_id === state.me.id) addEvent(event);
@@ -336,6 +437,23 @@ function subscribe() {
     setTimeout(() => wire.classList.remove('arrive'), 180);
     render(true);
   };
+}
+
+// A recorded row takes the place of the stream it settles, in the same render that adds the row's
+// figures, so the two are never counted together while the next progress update is on its way.
+function retireStream(id) {
+  if (id === null || id === undefined) return;
+  state.progress.shares = state.progress.shares.filter((s) => s.stream !== id);
+  state.progress.streams = state.progress.streams.filter((s) => s.stream !== id);
+}
+
+// Progress arrives up to four times a second while anything is generating, so it repaints only what it
+// moves, on the Overview, rather than the whole view: a full render rebuilds every table and menu on the
+// page, and an open menu or a half-typed field would not survive it that often.
+function renderProgress() {
+  if (state.view !== 'overview') return;
+  renderReadout();
+  renderFeed(false);
 }
 
 // Time axes. Buckets persist between renders so a live event can add to them.
@@ -397,7 +515,7 @@ function areaChart(buckets) {
     .filter((_, i) => i % 4 === 0)
     .map((b, i) => `<text class="axis" x="${(10 + i * 4 * step).toFixed(1)}" y="${height - 6}">${b.label}</text>`)
     .join('');
-  return svg(`${grid}<path class="area" d="${area}"/><path class="line" d="${line}"/>${labels}`, height, `Token rate, last 24 hours, peak ${nf.format(max)} tokens in an hour`);
+  return svg(`${grid}<path class="area" d="${area}"/><path class="line" d="${line}"/>${labels}`, height, `Peak ${nf.format(max)} input and output tokens in an hour`);
 }
 
 function barChart(buckets) {
@@ -414,7 +532,7 @@ function barChart(buckets) {
   const labels = buckets
     .map((b, i) => `<text class="axis" text-anchor="middle" x="${(10 + i * slot + slot / 2).toFixed(1)}" y="${height - 6}">${b.label}</text>`)
     .join('');
-  return svg(`<line class="grid" x1="10" x2="894" y1="${height - 24}" y2="${height - 24}"/>${bars}${labels}`, height, `Requests per day, last 14 days, peak ${nf.format(max)} requests in a day`);
+  return svg(`<line class="grid" x1="10" x2="894" y1="${height - 24}" y2="${height - 24}"/>${bars}${labels}`, height, `Peak ${nf.format(max)} requests in a day`);
 }
 
 function empty(message) {
@@ -445,10 +563,11 @@ function renderGate() {
   const key = last ? state.keys.find((k) => k.name === last.key) : null;
   const bound = key && key.connection_id ? state.connections.find((c) => c.id === key.connection_id && c.enabled) : null;
   const conn = bound || topConnection();
-  $('gate-key').textContent = last ? last.key : (state.keys.length ? state.keys[0].name : 'no key yet');
-  $('gate-upstream').innerHTML = conn
-    ? `${esc(conn.name)} <span class="chip ${conn.health === 'ok' ? 'ok' : 'down'}">${icon(conn.health === 'ok' ? 'check' : 'alert')}<span>${esc(conn.health)}</span></span>`
-    : 'no connection yet';
+  $('gate-key').textContent = last ? keyLabel(last) : (state.keys.length ? state.keys[0].name : 'no key yet');
+  // The name is clamped to the width of a leg, and the chip sits beside it rather than inside it, so a
+  // long name is cut short and the health still shows.
+  $('gate-upstream').textContent = conn ? conn.name : 'no connection yet';
+  $('gate-health').innerHTML = conn ? healthChip(conn.health) : '';
 
   if (!last) {
     $('gate-read').textContent = 'Nothing has crossed the gate yet.';
@@ -458,7 +577,7 @@ function renderGate() {
     'last request',
     `<b>${esc(last.created_at.slice(11, 19))}</b>`,
     esc(last.model || 'no model'),
-    `${nf.format(last.total_tokens)} tokens`,
+    `${nf.format(last.prompt_tokens)} input and ${nf.format(last.completion_tokens)} output tokens`,
     `<span class="${last.status >= 400 ? 'danger' : ''}">${esc(last.status)}</span>`,
   ].join(' ');
 }
@@ -470,23 +589,39 @@ function renderGate() {
 // The support panel below repeats the generated number as part of its breakdown; it is the same
 // figure, not a second one.
 function renderReadout() {
-  renderPair('generated-tokens', 'global-input-tokens', 'global-input-note', state.summary.global);
-  renderPair('account-generated-tokens', 'account-input-tokens', 'account-input-note', state.summary.self);
+  const own = state.progress.streams.filter((s) => s.user_id === state.me.id);
+  const shares = state.progress.shares;
+  renderPair(['generated-tokens', 'global-generated-note', 'global-input-tokens', 'global-input-note'], state.summary.global, 'every account and key', {
+    tokens: shares.reduce((sum, s) => sum + num(s.completion_tokens), 0),
+    estimated: shares.some((s) => s.estimated),
+  });
+  renderPair(['account-generated-tokens', 'account-generated-note', 'account-input-tokens', 'account-input-note'], state.summary.self, 'this account', {
+    tokens: own.reduce((sum, s) => sum + num(s.completion_tokens), 0),
+    estimated: own.some((s) => s.estimated),
+  });
   renderSupport(state.summary.self);
 }
 
 // The cached part of the input is only a note when an engine reported it. Nothing is invented here:
 // a row that reported no cache is stored as unknown, so a zero cache across the whole instance reads
-// as "no engine reported a cache hit", not as a cache that never hit.
-function renderPair(generatedId, inputId, noteId, totals) {
+// as "no engine reported a cache hit", not as a cache that never hit. The notes open with the scope,
+// because the two pairs show the same figures for a different set of requests.
+// What a stream still running has generated counts toward the generated figure as it arrives, so the
+// number moves with the answer. The note says how much of the figure is still in flight and, while the
+// gateway is counting it rather than the upstream, that it is an estimate until the request is recorded.
+function renderPair([generatedId, generatedNoteId, inputId, inputNoteId], totals, scope, inflight) {
   const t = totals || {};
-  $('' + generatedId).textContent = nf.format(num(t.completion_tokens));
-  $('' + inputId).textContent = nf.format(num(t.prompt_tokens));
-  const note = $(noteId);
+  $(generatedId).textContent = nf.format(num(t.completion_tokens) + inflight.tokens);
+  const running = inflight.estimated ? 'still being generated, an estimate until it is recorded' : 'still being generated';
+  $(generatedNoteId).textContent = inflight.tokens
+    ? `what the models generated for ${scope}, including ${nf.format(inflight.tokens)} ${running}`
+    : `what the models generated for ${scope}`;
+  $(inputId).textContent = nf.format(num(t.prompt_tokens));
+  const note = $(inputNoteId);
   if (num(t.cached_reported)) {
-    note.textContent = `what was sent in, of which ${nf.format(num(t.cached_tokens))} came from the prompt cache`;
+    note.textContent = `what ${scope} sent in, of which ${nf.format(num(t.cached_tokens))} came from the prompt cache`;
   } else {
-    note.textContent = 'what was sent in. No engine reported a prompt cache hit.';
+    note.textContent = `what ${scope} sent in. No engine reported a prompt cache hit.`;
   }
 }
 
@@ -496,7 +631,7 @@ function renderSupport(t) {
     ['Requests today', nf.format(t.today_requests || 0)],
     [
       'Tokens today (input + output)',
-      `${nf.format(t.today_tokens || 0)} — ${nf.format(t.today_prompt_tokens || 0)} in, ${nf.format(t.today_completion_tokens || 0)} generated`,
+      `${nf.format(t.today_tokens || 0)} — ${nf.format(t.today_prompt_tokens || 0)} input, ${nf.format(t.today_completion_tokens || 0)} output`,
     ],
     ['Average latency', `${nf.format(t.avg_latency_ms || 0)} ms`],
     ['Errors (status 400 or worse)', nf.format(t.errors || 0)],
@@ -509,7 +644,7 @@ function renderSupport(t) {
     rows.push(['Average prompt processing', `${nf.format(t.avg_prompt_ms)} ms`]);
   }
   if (t.generation_tokens_per_second !== null && t.generation_tokens_per_second !== undefined) {
-    rows.push(['Average generation speed', `${nf.format(t.generation_tokens_per_second)} tokens/s`]);
+    rows.push(['Average generation speed', `${nf.format(t.generation_tokens_per_second)} output tokens/s`]);
   }
   $('support').innerHTML = rows
     .map(([label, value]) => `<div class="row"><dt>${esc(label)}</dt><dd>${esc(value)}</dd></div>`)
@@ -538,29 +673,65 @@ function renderCharts() {
   $('chart-daily').innerHTML = state.days.some((b) => b.requests > 0) ? barChart(state.days) : empty('No requests in the last 14 days.');
 }
 
+// An admin's stream carries every account's requests, and anyone else's only their own, so the heading
+// says which of the two the feed is.
+// A stream still running is a row of its own above the recorded ones, with live in place of a status it
+// does not have yet. Its tokens are the input and what has been generated so far, in the same two columns
+// a recorded row fills, and each is marked with a ~ while it is the gateway's estimate. Each column has its
+// own flag, because an upstream can report the input before what it generated, and a flag that is missing
+// is read as an estimate rather than as a reported count.
+function streamTokens(tokens, estimated) {
+  const how = estimated ? 'Estimated by the gateway until the request is recorded' : 'As the upstream has reported so far';
+  return `<span class="tokens" title="${how}">${estimated ? '~' : ''}${nf.format(num(tokens))}</span>`;
+}
+
+function streamRow(stream) {
+  return `<li class="inflight">
+    <span>${esc(stream.started_at.slice(11, 19))}</span>
+    <span>${esc(stream.key)}</span>
+    <span>${esc(stream.model || 'no model')}</span>
+    <span>live</span>
+    ${streamTokens(stream.prompt_tokens, stream.prompt_estimated !== false)}
+    ${streamTokens(stream.completion_tokens, stream.estimated !== false)}
+  </li>`;
+}
+
 function renderFeed(arrived) {
-  $('feed').innerHTML = state.events.length
-    ? state.events
-        .slice(0, 12)
-        .map(
-          (event, i) =>
-            `<li class="${arrived && i === 0 ? ' arrived' : ''}">
-              <span>${esc(event.created_at.slice(11, 19))}</span>
-              <span>${esc(keyLabel(event))}</span>
-              <span>${esc(event.model || 'no model')}</span>
-              <span class="${event.status >= 400 ? 'danger' : ''}">${esc(event.status)}</span>
-              <span class="tokens">${nf.format(event.total_tokens)}</span>
-            </li>`,
-        )
-        .join('')
-    : empty('No requests yet. Create a key and send one, and the row lands here as it happens.');
+  $('feed-title').textContent = state.me.role === 'admin' ? 'Live traffic, every account' : 'Live traffic for this account';
+  // The feed holds twelve rows, streams first, so as many streams as the gateway runs at once do not push
+  // the page down; the recorded rows fill whatever is left.
+  const streams = [...state.progress.streams].sort((a, b) => b.stream - a.stream).slice(0, 12);
+  $('feed-head').hidden = !state.events.length && !streams.length;
+  const recorded = state.events
+    .slice(0, 12 - streams.length)
+    .map(
+      (event, i) =>
+        `<li class="${arrived && i === 0 ? ' arrived' : ''}">
+          <span>${esc(event.created_at.slice(11, 19))}</span>
+          <span>${esc(keyLabel(event))}</span>
+          <span>${esc(event.model || 'no model')}</span>
+          <span class="${event.status >= 400 ? 'danger' : ''}">${esc(event.status)}</span>
+          <span class="tokens">${nf.format(event.prompt_tokens)}</span>
+          <span class="tokens">${nf.format(event.completion_tokens)}</span>
+        </li>`,
+    )
+    .join('');
+  $('feed').innerHTML =
+    streams.length || state.events.length
+      ? streams.map(streamRow).join('') + recorded
+      : empty('No requests yet. Create a key and send one, and the row lands here as it happens.');
 }
 
 // Activity
 
+// The recent rows and the models are an admin's for every account and anyone else's for their own, the
+// same scope the live stream keeps, so the lede says which.
 function renderActivity() {
   const admin = state.me.role === 'admin';
-  const columns = ['time', 'key', admin ? 'account' : null, 'model', 'tokens', 'latency', 'status'].filter(Boolean);
+  $('activity-lede').textContent = `${
+    admin ? 'The last 50 requests that crossed the gate from every account' : 'The last 50 requests this account sent through the gate'
+  }, newest first, with what each cost. New rows arrive as they happen. Times are UTC.`;
+  const columns = ['Time', 'Key', admin ? 'Account' : null, 'Model', 'Input tokens', 'Output tokens', 'Latency', 'Status'].filter(Boolean);
   $('activity-head').innerHTML = `<tr>${columns.map((c) => `<th>${esc(c)}</th>`).join('')}</tr>`;
 
   $('activity-body').innerHTML = state.events.length
@@ -572,7 +743,8 @@ function renderActivity() {
               <td><span class="clamp">${esc(keyLabel(event))}</span></td>
               ${admin ? `<td><span class="clamp">${esc(event.user)}</span></td>` : ''}
               <td><span class="clamp">${esc(event.model || 'no model')}</span></td>
-              <td class="num">${nf.format(event.total_tokens)}</td>
+              <td class="num">${nf.format(event.prompt_tokens)}</td>
+              <td class="num">${nf.format(event.completion_tokens)}</td>
               <td class="num">${nf.format(event.latency_ms)} ms</td>
               <td class="num${event.status >= 400 ? ' danger' : ''}">${esc(event.status)}</td>
             </tr>`,
@@ -584,16 +756,27 @@ function renderActivity() {
     ? state.summary.models
         .map(
           (model) =>
-            `<tr><td><span class="clamp">${esc(model.model)}</span></td><td class="num">${nf.format(model.requests)}</td><td class="num">${nf.format(model.tokens)}</td></tr>`,
+            `<tr><td><span class="clamp">${esc(model.model)}</span></td><td class="num">${nf.format(model.requests)}</td><td class="num">${nf.format(model.prompt_tokens)}</td><td class="num">${nf.format(model.completion_tokens)}</td></tr>`,
         )
         .join('')
-    : `<tr><td colspan="3">No model has been used yet. Add a connection, then send a request with a key.</td></tr>`;
+    : `<tr><td colspan="4">No model has been used yet. Add a connection, then send a request with a key.</td></tr>`;
 }
 
 // Keys
 
 function connectionOptions() {
   return [{ value: '', label: 'Any enabled connection' }, ...state.connections.map((c) => ({ value: String(c.id), label: c.name }))];
+}
+
+// The gateway takes a key's own model first, then the default of the connection that serves it, and
+// the model the client asks for only when neither is set. A key that is not bound to one connection can
+// be served by any, so it can only say which of the two it may be.
+function keyModel(key, bound) {
+  if (key.model) return key.model;
+  if (bound && bound.enabled) return bound.default_model || 'the model the client asks for';
+  return state.connections.some((c) => c.enabled && c.default_model)
+    ? "the connection's default, or the model the client asks for"
+    : 'the model the client asks for';
 }
 
 function keyRow(key, showOwner) {
@@ -606,10 +789,11 @@ function keyRow(key, showOwner) {
     ${showOwner ? `<td>${esc(key.owner)}</td>` : ''}
     <td><span class="clamp" title="${esc(key.key)}">${esc(key.name)}</span></td>
     <td>${binding}</td>
-    <td>${esc(key.model || 'the client model')}</td>
-    <td>${key.rpm_limit ? `${key.rpm_limit}/min` : 'no limit'}<br>${key.token_cap ? nf.format(key.token_cap) : 'no cap'}</td>
+    <td>${esc(keyModel(key, bound))}</td>
+    <td>${key.rpm_limit ? `${key.rpm_limit}/min` : 'no rate limit'}<br>${key.token_cap ? `${nf.format(key.token_cap)} input + output tokens` : 'no token cap'}</td>
     <td class="num">${nf.format(key.requests)}</td>
-    <td class="num">${nf.format(key.tokens)}</td>
+    <td class="num">${nf.format(key.prompt_tokens)}</td>
+    <td class="num">${nf.format(key.completion_tokens)}</td>
     <td class="num">
       <button class="link" data-copy="${esc(key.key)}">Copy key</button>
       <button class="link" data-toggle="${key.id}" data-enabled="${key.enabled}">${key.enabled ? 'Disable' : 'Enable'}</button>
@@ -631,7 +815,7 @@ function renderKeys() {
   $('other-keys-field').hidden = !admin;
   $('keys-body').innerHTML = state.keys.length
     ? state.keys.map((key) => keyRow(key, false)).join('')
-    : `<tr><td colspan="7">No key yet. Create one above, then use it as the Bearer token, or as x-api-key, against /v1/chat/completions.</td></tr>`;
+    : `<tr><td colspan="8">No key yet. Create one above, then use it as the Bearer token, or as x-api-key, against /v1/chat/completions.</td></tr>`;
 
   renderMenu($('connection-menu'), 'connection', connectionOptions(), $('connection-menu').dataset.value || '', 'Connection');
   if (!admin) return;
@@ -663,7 +847,7 @@ function renderConnections() {
             <td><span class="clamp">${esc(connection.base_url)}</span></td>
             <td>${esc(connection.default_model || 'the model the client asks for')}</td>
             <td class="num">${esc(connection.priority)}</td>
-            <td><span class="chip ${connection.health === 'ok' ? 'ok' : 'down'}">${icon(connection.health === 'ok' ? 'check' : 'alert')}<span>${esc(connection.health)}</span></span></td>
+            <td>${healthChip(connection.health)}</td>
             <td class="num">
               <button class="link" data-check="${connection.id}">Check health</button>
               <button class="link danger" data-drop="${connection.id}">Remove</button>
@@ -886,7 +1070,8 @@ function renderAccounts() {
             </td>
             <td class="num">${nf.format(user.used_today)}${over ? ' <span class="danger">over</span>' : ''}</td>
             <td class="num">${nf.format(user.requests)}</td>
-            <td class="num">${nf.format(user.tokens)}</td>
+            <td class="num">${nf.format(user.prompt_tokens)}</td>
+            <td class="num">${nf.format(user.completion_tokens)}</td>
             <td class="num">
               ${user.pending ? `<button class="link" data-approve="${user.id}">Approve</button>` : ''}
               <button class="link" data-status="${user.id}" data-enabled="${user.enabled}">${disabled ? 'Enable' : 'Disable'}</button>
@@ -895,7 +1080,7 @@ function renderAccounts() {
           </tr>`;
         })
         .join('')
-    : '<tr><td colspan="6">No account yet. The first account to register becomes the admin.</td>';
+    : '<tr><td colspan="7">No account yet. The first account to register becomes the admin.</td>';
 }
 
 // The settings on this page are for an admin: whether anyone may register, whether a new account
@@ -922,7 +1107,7 @@ function renderAccountSettings() {
       { value: 'not needed', label: 'Not needed' },
     ],
     state.settings.require_approval ? 'needed' : 'not needed',
-    'New accounts need approval',
+    'Approval for new accounts',
   );
 }
 
@@ -999,6 +1184,7 @@ function showShell() {
     { value: 'light', label: 'Light' },
     { value: 'dark', label: 'Dark' },
   ], state.theme, 'Theme', 'theme');
+  labelRail();
 }
 
 function setMode(next) {
@@ -1053,18 +1239,37 @@ function applyTheme(value) {
   localStorage.setItem('dreamgate-theme', value);
 }
 
+const narrow = window.matchMedia('(max-width: 768px)');
+
 function toggleRail() {
   const shell = $('shell');
-  if (window.matchMedia('(max-width: 768px)').matches) {
-    const open = shell.dataset.drawer === 'open';
-    if (open) shell.removeAttribute('data-drawer');
+  if (narrow.matches) {
+    if (shell.dataset.drawer === 'open') shell.removeAttribute('data-drawer');
     else shell.dataset.drawer = 'open';
-    $('toggle-rail').setAttribute('aria-expanded', String(!open));
-    return;
+  } else {
+    shell.dataset.collapsed = String(shell.dataset.collapsed !== 'true');
   }
-  const collapsed = shell.dataset.collapsed === 'true';
-  shell.dataset.collapsed = String(!collapsed);
-  $('toggle-rail').setAttribute('aria-expanded', String(collapsed));
+  labelRail();
+}
+
+// The toggle is a glyph alone, so its name says what a click does now and shows as a tooltip. The name
+// carries the state, so the button does not state it a second time with aria-expanded; under 768px it
+// opens a drawer that starts closed, so the state is read rather than assumed. A collapsed rail shows
+// only glyphs for the links, Sign out and the theme menu, so each one takes its name as a tooltip there;
+// for a link or Sign out that is also the name a screen reader reads while the text is hidden.
+function labelRail() {
+  const shell = $('shell');
+  const toggle = $('toggle-rail');
+  const open = narrow.matches ? shell.dataset.drawer === 'open' : shell.dataset.collapsed !== 'true';
+  const action = narrow.matches ? (open ? 'Close sidebar' : 'Open sidebar') : open ? 'Collapse sidebar' : 'Expand sidebar';
+  toggle.setAttribute('aria-label', action);
+  toggle.title = action;
+  const hidden = shell.dataset.collapsed === 'true';
+  for (const el of document.querySelectorAll('.nav a, #sign-out, #theme-menu .menu-button')) {
+    const name = el.getAttribute('aria-label') || el.querySelector('span:not(.icon)').textContent;
+    if (hidden) el.title = name;
+    else el.removeAttribute('title');
+  }
 }
 
 // Events
@@ -1086,7 +1291,11 @@ $('mode-login').addEventListener('click', () => {
   setMode('login');
 });
 $('toggle-rail').addEventListener('click', toggleRail);
-$('scrim').addEventListener('click', () => $('shell').removeAttribute('data-drawer'));
+$('scrim').addEventListener('click', () => {
+  $('shell').removeAttribute('data-drawer');
+  labelRail();
+});
+narrow.addEventListener('change', labelRail);
 $('confirm-cancel').addEventListener('click', () => $('confirm').close());
 
 for (const [button, fields] of [['key-advanced', 'key-advanced-fields'], ['connection-advanced', 'connection-advanced-fields']]) {
@@ -1149,6 +1358,10 @@ $('sign-out').addEventListener('click', async () => {
   state.me = null;
   if (state.live) state.live.close();
   state.live = null;
+  // An admin's streams and names are other accounts' keys, models and usernames, so none of it is left
+  // for whoever signs in next.
+  state.progress = { shares: [], streams: [] };
+  names.clear();
   showAuth();
 });
 
@@ -1268,7 +1481,11 @@ async function setLimit(user, raw) {
     notice('Daily limit must be a whole number of at least 1, or empty to clear it.', 'error');
     return;
   }
-  await changeAccount(user, { daily_token_cap: value }, `Set the daily limit for ${user.username} to ${value ? nf.format(value) : 'none'}.`);
+  await changeAccount(
+    user,
+    { daily_token_cap: value },
+    `Set the daily limit for ${user.username} to ${value ? `${nf.format(value)} input and output tokens` : 'none'}.`,
+  );
 }
 
 document.addEventListener('click', async (event) => {
@@ -1280,7 +1497,12 @@ document.addEventListener('click', async (event) => {
       notice('Nothing was copied. Select the value and copy it yourself.', 'error');
       return;
     }
+    // Copied is only true for a moment after the click, so the label goes back on its own; a second click
+    // starts the moment again rather than ending it early.
+    clearTimeout(button.copiedTimer);
+    button.dataset.label ??= button.textContent;
     button.textContent = 'Copied';
+    button.copiedTimer = setTimeout(() => restoreLabel(button), 1500);
     return;
   }
   if (button.dataset.limit) {

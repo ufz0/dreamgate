@@ -4,7 +4,11 @@ use axum::response::{IntoResponse, Json, Response};
 use serde::Deserialize;
 use serde_json::json;
 use sqlx::Row;
+use std::sync::Arc;
 use std::time::Duration;
+
+use tokio::sync::Semaphore;
+use tokio::task::JoinSet;
 
 use crate::api::error;
 use crate::auth::Caller;
@@ -21,6 +25,9 @@ pub struct Connection {
     pub priority: i64,
     pub health: String,
     pub last_checked_at: Option<String>,
+    // What the connection says it can take at once. Null means it never said, which is not the same as a
+    // limit of one: an unstated capability is admitted by the default rather than by a guess.
+    pub max_concurrent: Option<i64>,
 }
 
 fn row_to_connection(row: &sqlx::sqlite::SqliteRow) -> Connection {
@@ -34,6 +41,7 @@ fn row_to_connection(row: &sqlx::sqlite::SqliteRow) -> Connection {
         priority: row.get::<i64, _>("priority"),
         health: row.get::<String, _>("health"),
         last_checked_at: row.get::<Option<String>, _>("last_checked_at"),
+        max_concurrent: row.get::<Option<i64>, _>("max_concurrent"),
     }
 }
 
@@ -48,8 +56,8 @@ pub fn endpoint(base_url: &str, path: &str) -> String {
 
 pub async fn candidates(st: &State, preferred: Option<i64>) -> Vec<Connection> {
     let rows = sqlx::query(
-        "SELECT id, name, base_url, api_key, default_model, enabled, priority, health, last_checked_at \
-         FROM connections WHERE enabled = 1 ORDER BY priority ASC, id ASC",
+        "SELECT id, name, base_url, api_key, default_model, enabled, priority, health, last_checked_at, \
+         max_concurrent FROM connections WHERE enabled = 1 ORDER BY priority ASC, id ASC",
     )
     .fetch_all(&st.pool)
     .await
@@ -100,12 +108,14 @@ pub struct CreateConnection {
     pub api_key: Option<String>,
     pub default_model: Option<String>,
     pub priority: Option<i64>,
+    // What the connection can take at once. Left out means it never said, and the default limit applies.
+    pub max_concurrent: Option<i64>,
 }
 
 pub async fn list(AxumState(st): AxumState<State>, caller: Caller) -> Response {
     let rows = sqlx::query(
-        "SELECT id, name, base_url, api_key, default_model, enabled, priority, health, last_checked_at \
-         FROM connections ORDER BY priority ASC, id ASC",
+        "SELECT id, name, base_url, api_key, default_model, enabled, priority, health, last_checked_at, \
+         max_concurrent FROM connections ORDER BY priority ASC, id ASC",
     )
     .fetch_all(&st.pool)
     .await
@@ -128,6 +138,7 @@ pub async fn list(AxumState(st): AxumState<State>, caller: Caller) -> Response {
                 "priority": c.priority,
                 "health": c.health,
                 "last_checked_at": c.last_checked_at,
+                "max_concurrent": c.max_concurrent,
             })
         })
         .collect();
@@ -162,15 +173,25 @@ pub async fn create(
             "base_url must start with http:// or https://",
         );
     }
+    // A capability of zero would admit nothing, which is not what leaving it out means, so a stated
+    // capability has to be a real one.
+    if body.max_concurrent.is_some_and(|limit| limit < 1) {
+        return error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "max_concurrent must be positive",
+        );
+    }
     let row = sqlx::query(
-        "INSERT INTO connections (name, base_url, api_key, default_model, priority, created_at) \
-         VALUES (?, ?, ?, ?, ?, ?) RETURNING id",
+        "INSERT INTO connections (name, base_url, api_key, default_model, priority, max_concurrent, \
+         created_at) VALUES (?, ?, ?, ?, ?, ?, ?) RETURNING id",
     )
     .bind(&name)
     .bind(&base_url)
     .bind(&body.api_key)
     .bind(&body.default_model)
     .bind(body.priority.unwrap_or(0))
+    .bind(body.max_concurrent)
     .bind(crate::clock::now())
     .fetch_one(&st.pool)
     .await;
@@ -219,8 +240,8 @@ pub async fn health_check(
         );
     }
     let row = sqlx::query(
-        "SELECT id, name, base_url, api_key, default_model, enabled, priority, health, last_checked_at \
-         FROM connections WHERE id = ?",
+        "SELECT id, name, base_url, api_key, default_model, enabled, priority, health, last_checked_at, \
+         max_concurrent FROM connections WHERE id = ?",
     )
     .bind(id)
     .fetch_optional(&st.pool)
@@ -234,19 +255,51 @@ pub async fn health_check(
         .into_response()
 }
 
+// A round of health checks used to take one connection at a time, so a connection that does not answer held
+// the health of every other one behind its own timeout. They run at once now, bounded by a small number,
+// because a health check is still a request to a connection that may already be working and the round should
+// not read as traffic. A slow connection can only delay its own row now.
+const MAX_HEALTH_CHECKS_AT_ONCE: usize = 8;
+
+// The rounds run for the life of the process and nothing waits on them, so a panic in one would end
+// health checking without a word: every connection would keep the health it had, and one marked down
+// would stay skipped. A round that stops is started again after the usual wait instead, and the reason
+// is logged. It runs in a JoinSet so that dropping this task, as a test does, takes the round with it.
 pub async fn health_checker(st: State) {
     loop {
+        let mut round = JoinSet::new();
+        round.spawn(rounds(st.clone()));
+        if let Some(Err(err)) = round.join_next().await {
+            tracing::error!("the health check round stopped and is started again: {err}");
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+    }
+}
+
+async fn rounds(st: State) {
+    loop {
         let rows = sqlx::query(
-            "SELECT id, name, base_url, api_key, default_model, enabled, priority, health, last_checked_at \
-             FROM connections WHERE enabled = 1",
+            "SELECT id, name, base_url, api_key, default_model, enabled, priority, health, last_checked_at, \
+             max_concurrent FROM connections WHERE enabled = 1",
         )
         .fetch_all(&st.pool)
         .await
         .unwrap_or_default();
+
+        let gate = Arc::new(Semaphore::new(MAX_HEALTH_CHECKS_AT_ONCE));
+        let mut running = JoinSet::new();
         for row in &rows {
             let connection = row_to_connection(row);
-            let _ = check(&st, &connection).await;
+            let gate = gate.clone();
+            let st = st.clone();
+            running.spawn(async move {
+                let Ok(_slot) = gate.acquire_owned().await else {
+                    return;
+                };
+                let _ = check(&st, &connection).await;
+            });
         }
+        while running.join_next().await.is_some() {}
         tokio::time::sleep(std::time::Duration::from_secs(30)).await;
     }
 }

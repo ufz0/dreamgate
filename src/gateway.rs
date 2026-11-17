@@ -10,6 +10,7 @@ use sqlx::Row;
 use sqlx::sqlite::SqliteRow;
 
 use crate::api::error;
+use crate::limits::Admission;
 use crate::presence::{self, Active};
 use crate::registry::{self, Connection};
 use crate::state::State;
@@ -123,7 +124,10 @@ async fn enforce_limits(st: &State, key: &KeyInfo) -> Option<Response> {
             return Some(error(
                 StatusCode::TOO_MANY_REQUESTS,
                 "token_cap",
-                format!("key '{}' has reached its token cap of {cap}", key.name),
+                format!(
+                    "key '{}' has reached its token cap of {cap} input and output tokens",
+                    key.name
+                ),
             ));
         }
     }
@@ -150,7 +154,7 @@ async fn enforce_limits(st: &State, key: &KeyInfo) -> Option<Response> {
                 StatusCode::TOO_MANY_REQUESTS,
                 "token_cap",
                 format!(
-                    "account '{}' has used its daily token limit of {cap}",
+                    "account '{}' has used its daily token limit of {cap} input and output tokens",
                     account.get::<String, _>("username")
                 ),
             ));
@@ -344,6 +348,7 @@ struct StreamContext {
     conn: Connection,
     model: String,
     present: Active,
+    admission: Admission,
 }
 
 fn stream_body(
@@ -358,11 +363,57 @@ fn stream_body(
         let mut generated = String::new();
         let mut report = Report::default();
         let mut incoming = upstream.bytes_stream();
-        while let Some(chunk) = incoming.next().await {
+        let inflight = presence::start_stream(
+            &ctx.st,
+            ctx.key.user_id,
+            &ctx.key.name,
+            &ctx.model,
+            prompt_tokens,
+        );
+        // The deltas are joined with a space and the estimate counts words, so the text added since the last
+        // chunk can be estimated on its own and added to the rest: the sum is the estimate of the whole, and
+        // the whole is not read again on every chunk.
+        let mut estimate = 0i64;
+        let mut estimated_upto = 0usize;
+        // A stream is bounded by how long it goes quiet, not by a deadline for its whole length: an answer that
+        // keeps arriving is not stalled, however long it takes, and cutting one that is still coming is the
+        // socket dying on the client's side. Silence for the window is a dead connection, and the request
+        // should not hold its slot for one forever.
+        let stall = ctx.st.limits.stream_stall();
+        loop {
+            let chunk = match tokio::time::timeout(stall, incoming.next()).await {
+                Ok(Some(chunk)) => chunk,
+                Ok(None) => break,
+                Err(_) => {
+                    tracing::warn!(
+                        "upstream went quiet for {stall:?} and the stream was closed: {}",
+                        ctx.model
+                    );
+                    // The client has already been sent a 200, so there is no status left to change: the stream
+                    // ends as an error rather than as a completed answer, which is what lets a client tell an
+                    // answer that was cut from one that finished.
+                    let _ = tx
+                        .send(Err(BoxError::from("the upstream went quiet")))
+                        .await;
+                    break;
+                }
+            };
             match chunk {
                 Ok(bytes) => {
                     buffer.extend_from_slice(&bytes);
                     drain_buffer(&mut buffer, &mut generated, &mut report);
+                    estimate += tokens::estimate_tokens(&generated[estimated_upto..]);
+                    estimated_upto = generated.len();
+                    // What the upstream has reported once it has reported it, and the estimate until then.
+                    // The generated count is what the page shows moving, so it is only called reported
+                    // when the upstream has reported that count itself, not when it has sent the input's.
+                    // The input is shown in a column of its own, so it says the same of itself.
+                    inflight.update(
+                        report.prompt.unwrap_or(prompt_tokens),
+                        report.completion.unwrap_or(estimate),
+                        report.prompt.is_none(),
+                        report.completion.is_none(),
+                    );
                     if tx.send(Ok(bytes)).await.is_err() {
                         // The client disconnected mid-stream. The row is still written, with whatever
                         // the upstream had reported up to there; the final usage chunk, which is where a
@@ -383,8 +434,9 @@ fn stream_body(
                 false,
             )
         } else {
-            (prompt_tokens, tokens::estimate_tokens(&generated), true)
+            (prompt_tokens, estimate, true)
         };
+        let stream = inflight.stream();
         let row = UsageRow {
             api_key_id: ctx.key.id,
             user_id: ctx.key.user_id,
@@ -401,13 +453,23 @@ fn stream_body(
             streamed: true,
             estimated,
             created_at: crate::clock::now(),
+            stream: Some(stream),
         };
-        if let Err(err) = usage::record(&ctx.st, &row).await {
-            tracing::warn!("usage record failed: {err}");
-        }
+        // The stream stays on the list while its row is written, and leaves it in the step that sends the
+        // row's event, so a page goes from one to the other without a moment showing neither.
+        let event = match usage::write(&ctx.st, &row).await {
+            Ok(event) => Some(event),
+            Err(err) => {
+                tracing::warn!("usage record failed: {err}");
+                None
+            }
+        };
+        inflight.settle(event);
         // Released here rather than when the handler returned, so a stream is still counted
-        // while it is running.
+        // while it is running. The connection slot is given back at the same point, because the request
+        // is still in flight for as long as the stream is being read.
         drop(ctx.present);
+        drop(ctx.admission);
     });
     stream::unfold(rx, |mut rx| async move {
         rx.recv().await.map(|item| (item, rx))
@@ -459,26 +521,69 @@ pub async fn chat_completions(
     let wants_stream = body.get("stream").and_then(Value::as_bool).unwrap_or(false);
     let prompt_tokens = tokens::prompt_estimate(body.get("messages").unwrap_or(&Value::Null));
     let requested = body.get("model").and_then(Value::as_str);
+    // The request is admitted as a whole, before anything is asked of a connection, and the slots are held for
+    // as long as it runs. Nothing is queued here: a connection that is full is skipped, so one slow
+    // connection cannot hold unrelated requests behind it. Admitting once, at the start, is also what keeps a
+    // request that has already reached a connection answering as that connection failed: once something has
+    // crossed the gate it is recorded, so it cannot be turned into an overload on the next attempt.
+    let Some(global) = st.limits.try_global() else {
+        return error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "overloaded",
+            format!(
+                "the gateway is at its limit of {} requests at once",
+                st.limits.global_limit()
+            ),
+        );
+    };
     let mut last_error = String::from("no connection responded");
+    // Connections that were already at their limit when this request arrived. They are remembered so that a
+    // request which never reached an upstream can be answered as an overload rather than as a failure of an
+    // upstream that was never asked.
+    let mut full: Vec<String> = Vec::new();
+    let mut attempted = false;
 
     for conn in &candidates {
         if conn.health == "down" && candidates.len() > 1 {
             continue;
         }
+        let Ok(slot) = st
+            .limits
+            .for_connection(conn.id, conn.max_concurrent)
+            .try_acquire_owned()
+        else {
+            full.push(conn.name.clone());
+            continue;
+        };
         let model = resolve_model(key.model.as_deref(), conn, requested);
         let url = registry::endpoint(&conn.base_url, "chat/completions");
         let payload = build_payload(&body, &model);
-        let upstream = match st
+        attempted = true;
+        let mut request = st
             .http
             .post(&url)
             .header(
                 header::AUTHORIZATION,
                 format!("Bearer {}", conn.api_key.clone().unwrap_or_default()),
             )
-            .json(&payload)
-            .send()
-            .await
-        {
+            .json(&payload);
+        // Only a single answer is given a deadline for the whole of it, because for that there is an end. A
+        // stream is bounded by how long it goes quiet instead, and the same window is what bounds the wait for
+        // its head: a connection that takes the request and never answers is a dead connection, not a slow
+        // generation. Cutting a stream that is still producing an answer is what the client feels as the socket
+        // dying, and that is what this path used to do.
+        if !wants_stream {
+            request = request.timeout(st.limits.request_timeout());
+        }
+        let sent = if wants_stream {
+            tokio::time::timeout(st.limits.stream_stall(), request.send())
+                .await
+                .map_err(|_| BoxError::from("nothing arrived within the stall window"))
+                .and_then(|result| result.map_err(BoxError::from))
+        } else {
+            request.send().await.map_err(BoxError::from)
+        };
+        let upstream = match sent {
             Ok(upstream) => upstream,
             Err(err) => {
                 last_error = format!("{}: {err}", conn.name);
@@ -496,12 +601,18 @@ pub async fn chat_completions(
             );
             out.headers_mut()
                 .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-cache"));
+            // The slots are handed to the stream task, so they are held until the stream ends rather than
+            // until this handler returns.
             let ctx = StreamContext {
                 st: st.clone(),
                 key: key.clone(),
                 conn: conn.clone(),
                 model,
                 present,
+                admission: Admission {
+                    global,
+                    connection: slot,
+                },
             };
             *out.body_mut() = Body::from_stream(stream_body(ctx, upstream, started, prompt_tokens));
             return out;
@@ -559,6 +670,7 @@ pub async fn chat_completions(
                 streamed: false,
                 estimated,
                 created_at: crate::clock::now(),
+                stream: None,
             },
         )
         .await;
@@ -575,6 +687,19 @@ pub async fn chat_completions(
         );
         *out.body_mut() = Body::from(bytes);
         return out;
+    }
+
+    // A request that was never sent because every connection it could use was already at its limit is not
+    // recorded as one that crossed the gate. It is answered as an overload, with the limits it ran into.
+    if !attempted && !full.is_empty() {
+        return error(
+            StatusCode::TOO_MANY_REQUESTS,
+            "connection_full",
+            format!(
+                "every connection available to this key is at its limit of requests at once: {}",
+                full.join(", ")
+            ),
+        );
     }
 
     record(
@@ -596,6 +721,7 @@ pub async fn chat_completions(
             streamed: wants_stream,
             estimated: true,
             created_at: crate::clock::now(),
+            stream: None,
         },
     )
     .await;
@@ -642,6 +768,8 @@ pub async fn list_models(AxumState(st): AxumState<State>, headers: HeaderMap) ->
             "no enabled connection is available for this key",
         );
     };
+    // The model list is a single answer, not a stream, so the same deadline covers it as covers any single
+    // answer, as the client's total deadline did before this change.
     let result = st
         .http
         .get(registry::endpoint(&conn.base_url, "models"))
@@ -649,6 +777,7 @@ pub async fn list_models(AxumState(st): AxumState<State>, headers: HeaderMap) ->
             header::AUTHORIZATION,
             format!("Bearer {}", conn.api_key.clone().unwrap_or_default()),
         )
+        .timeout(st.limits.request_timeout())
         .send()
         .await;
     match result {
