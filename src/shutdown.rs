@@ -16,10 +16,13 @@ pub const DEFAULT_GRACE_SECS: u64 = 30;
 pub enum Phase {
     Running,
     // A signal arrived: no new request is taken, the health check says so, the dashboards' live streams
-    // end, and the requests in flight have the grace window to finish.
+    // end, and the requests in flight have the grace window to finish. Connections are still accepted, so a
+    // load balancer that has not yet stopped sending requests here reads a 503 it can retry elsewhere, and a
+    // health check that says draining, rather than a refused connection.
     Draining,
-    // The grace window passed with requests still in flight, or a second signal arrived: they are ended
-    // now, each recorded the way a cut request is.
+    // The drain is over: every request in flight finished, the grace window passed, or a second signal
+    // arrived. Whatever is still running is ended now and recorded the way a cut request is, and the server
+    // stops accepting connections.
     Closing,
 }
 
@@ -56,9 +59,9 @@ impl Shutdown {
     }
 }
 
-// Waits for a signal to stop and takes the gateway through the phases. A request gives its slots back only
-// after its row is written, so every slot of the gateway coming back is every admitted request recorded;
-// that is what the grace window waits for.
+// Waits for a signal to stop and takes the gateway through the phases. A request that reached a connection
+// gives its slots back only after its row is written, so every slot of the gateway coming back is every such
+// request recorded; that is what the grace window waits for (see `Limits::drained`).
 pub async fn on_signal(st: State, grace: Duration) {
     signal().await;
     tracing::info!(
@@ -70,12 +73,12 @@ pub async fn on_signal(st: State, grace: Duration) {
         drained = st.limits.drained(grace) => {
             if drained {
                 tracing::info!("every request in flight has finished and been recorded");
-                return;
+            } else {
+                tracing::warn!(
+                    "{} requests were still in flight after {grace:?}; they are ended now and recorded as cut",
+                    st.limits.in_flight()
+                );
             }
-            tracing::warn!(
-                "{} requests were still in flight after {grace:?}; they are ended now and recorded as cut",
-                st.limits.in_flight()
-            );
         }
         _ = signal() => {
             tracing::warn!(
@@ -85,6 +88,15 @@ pub async fn on_signal(st: State, grace: Duration) {
         }
     }
     st.shutdown.advance(Phase::Closing);
+    // The handlers stay installed for the life of the process, so a signal from here on would otherwise do
+    // nothing at all. One more is someone who will not wait for the last rows to be written, and the process
+    // stops at once, with the rows still being written lost.
+    signal().await;
+    tracing::error!(
+        "another signal: stopping at once, and {} requests are not recorded",
+        st.limits.in_flight()
+    );
+    std::process::exit(1);
 }
 
 // Ctrl-C, and on Unix the SIGTERM a service manager or a container runtime sends to stop a process.

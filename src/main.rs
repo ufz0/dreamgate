@@ -1,6 +1,5 @@
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::Path;
-
 use std::time::Duration;
 
 use dreamgate::shutdown::{self, Phase};
@@ -63,23 +62,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     ) as u64);
     tokio::spawn(shutdown::on_signal(st.clone(), grace));
 
-    // The server stops taking connections when the process starts to stop, and returns once the ones it
-    // has are done. A client that keeps a connection open after its answer has ended does not hold the
-    // process: some seconds after the grace window, it is let go.
-    let draining = st.shutdown.clone();
+    // The server keeps taking connections while the requests in flight drain, so a request that arrives
+    // then is answered 503 rather than refused, and stops once the drain is over, returning when the
+    // connections it has are done. A client that keeps a connection open after its answer has ended does not
+    // hold the process: ten seconds after the drain is over, it is let go.
+    let closing = st.shutdown.clone();
     let server = axum::serve(listener, build_router(st.clone()))
-        .with_graceful_shutdown(async move { draining.reached(Phase::Draining).await });
+        .with_graceful_shutdown(async move { closing.reached(Phase::Closing).await });
     let deadline = st.shutdown.clone();
     tokio::select! {
         served = server.into_future() => served?,
         _ = async move {
-            deadline.reached(Phase::Draining).await;
-            tokio::time::sleep(grace + Duration::from_secs(10)).await;
-        } => tracing::warn!("connections were still open after the grace window; stopping anyway"),
+            deadline.reached(Phase::Closing).await;
+            tokio::time::sleep(Duration::from_secs(10)).await;
+        } => tracing::warn!("connections were still open ten seconds after the drain; stopping anyway"),
     }
 
     // Rows are written before a request gives its slots back, so waiting for every slot is waiting for
-    // every row; then the database is closed, which leaves the write-ahead log checkpointed.
+    // every row of what was ended at Closing; then the database is closed, which leaves the write-ahead log
+    // checkpointed.
     if !st.limits.drained(Duration::from_secs(5)).await {
         tracing::error!(
             "{} requests had not been recorded when the process stopped",

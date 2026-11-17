@@ -53,9 +53,22 @@ async fn upstream() -> String {
     format!("http://{addr}")
 }
 
-// SIGTERM in the middle of a stream: the stream is let finish within the grace window and arrives whole,
-// the process stops on its own with a success, and the row is in the database file afterwards. A connection
-// the client keeps open after its answer does not hold the process past the drain.
+// The process a test started, killed when the test ends however it ends, so a test that fails before it
+// stops the process does not leave it running.
+struct Running(std::process::Child);
+
+impl Drop for Running {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+// SIGTERM in the middle of a stream: the stream is let finish within the grace window and arrives whole, a
+// request that arrives on a new connection meanwhile is answered 503 rather than refused, and so is the health
+// check, the process stops on its own with a success, and the row is in the database file afterwards, with the
+// write-ahead log checkpointed into it. A connection the client keeps open after its answer does not hold the
+// process past the drain.
 #[tokio::test]
 async fn sigterm_lets_a_running_stream_finish_records_it_and_stops_the_process() {
     let upstream = upstream().await;
@@ -76,6 +89,7 @@ async fn sigterm_lets_a_running_stream_finish_records_it_and_stops_the_process()
         .spawn()
         .unwrap();
     let stdout = child.stdout.take().unwrap();
+    let mut child = Running(child);
     let (lines, read) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         for line in BufReader::new(stdout).lines().map_while(Result::ok) {
@@ -137,10 +151,28 @@ async fn sigterm_lets_a_running_stream_finish_records_it_and_stops_the_process()
     let mut answer = chunks.next().await.unwrap().unwrap().to_vec();
 
     let signalled = Command::new("kill")
-        .args(["-TERM", &child.id().to_string()])
+        .args(["-TERM", &child.0.id().to_string()])
         .status()
         .unwrap();
     assert!(signalled.success());
+
+    // A new connection while the stream drains: a load balancer that has not yet stopped sending requests
+    // here reads answers it can act on, not a refused connection.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let fresh = reqwest::Client::new();
+    let health = fresh.get(format!("{base}/health")).send().await.unwrap();
+    assert_eq!(health.status(), 503);
+    assert_eq!(health.text().await.unwrap(), "draining");
+    let turned_away = fresh
+        .post(format!("{base}/v1/chat/completions"))
+        .bearer_auth(key)
+        .json(&json!({ "model": "m", "messages": [{ "role": "user", "content": "hi" }] }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(turned_away.status(), 503);
+    let turned_away: Value = turned_away.json().await.unwrap();
+    assert_eq!(turned_away["error"]["type"], "shutting_down");
     while let Some(chunk) = chunks.next().await {
         answer.extend_from_slice(&chunk.expect("the stream was cut rather than let finish"));
     }
@@ -156,16 +188,19 @@ async fn sigterm_lets_a_running_stream_finish_records_it_and_stops_the_process()
 
     let stopping = Instant::now();
     let status = loop {
-        if let Some(status) = child.try_wait().unwrap() {
+        if let Some(status) = child.0.try_wait().unwrap() {
             break status;
         }
         if stopping.elapsed() > Duration::from_secs(15) {
-            let _ = child.kill();
             panic!("the process did not stop after the stream finished");
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     };
     assert!(status.success(), "the process stopped with {status}");
+    assert!(
+        !dir.join("dreamgate.db-wal").exists(),
+        "the write-ahead log was left beside the database"
+    );
 
     let pool = sqlx::sqlite::SqlitePoolOptions::new()
         .connect(&format!("sqlite://{}", database.display()))
