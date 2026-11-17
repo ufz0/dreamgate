@@ -9,6 +9,7 @@ pub mod live;
 pub mod metrics;
 pub mod presence;
 pub mod registry;
+pub mod reservations;
 pub mod settings;
 pub mod shutdown;
 pub mod state;

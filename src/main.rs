@@ -69,6 +69,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             std::env::var("DREAMGATE_METRICS_TOKEN").ok(),
         )),
         shutdown: Default::default(),
+        reservations: Default::default(),
     };
 
     tokio::spawn(registry::health_checker(st.clone()));

@@ -50,6 +50,7 @@ async fn test_state() -> State {
         limits: Arc::new(limits),
         metrics: Default::default(),
         shutdown: Default::default(),
+        reservations: Default::default(),
     }
 }
 

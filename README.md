@@ -160,6 +160,19 @@ was taken by an older version.
    applies on top of a key's own cap, so a key cannot be used to work around it. Clearing
    the value clears the limit. A key's own cap is the same sum over the life of the key. Splitting
    the figures on the Overview does not change what either limit counts.
+
+   The limits hold when requests arrive together. The rows are written when a request ends, so on their own
+   they cannot see a request that is still running; a request is therefore checked and held in one step,
+   in the process, against the requests its key and its account have in flight. The per-minute limit counts a
+   request from the moment it is admitted, and keeps counting it for the minute after, so twenty requests at
+   once on a key limited to two a minute are two admitted and eighteen answered 429 `rate_limit`; after a
+   restart, the rows of the last minute still count. A cap counts what the rows have recorded plus the input of
+   the requests still running, as the gateway estimated it, because their output is not known until it has
+   been generated; a refusal that counted such an estimate says how much of what it counted it was
+   ("…, counting an estimated N input tokens of requests still in flight"). A request turned away before it
+   reaches a connection, at a full connection or a full gateway, is never recorded, so it gives back its place
+   in the minute and its hold. A disabled account is checked before any of these, so its keys are answered
+   403 even when they are also at a limit.
 3. Point a client at the gateway, for example OpenWebUI:
    - API base: `http://127.0.0.1:8787/v1`
    - API key: the DreamGate key
@@ -235,11 +248,11 @@ Requests are handled at the same time. The lookups for a key and its account, th
 the reading of a stream and the writing of the usage row are all async, and nothing in that path holds one
 request behind another: no lock is held across an upstream request or across a stream. The locks in the
 process — the presence counts and the streams in flight, the sign-in windows, the map of per-connection
-limits, the two maps of counts `/metrics` reports, and when the health check first found the pool in use —
-are held for a few instructions and released before anything is awaited, so they are plain mutexes rather than
-async ones: there is nothing to hold across an await, the presence count is released from a `Drop`, which
-cannot await, and a stream's place on the list is released in the step that sends its row or, for a stream
-that ends without one, from a `Drop`, neither of which awaits. A
+limits, the two maps of counts `/metrics` reports, when the health check first found the pool in use, and the
+requests held against a key's and an account's limits — are held for a few instructions and released before
+anything is awaited, so they are plain mutexes rather than async ones: there is nothing to hold across an await,
+the presence count is released from a `Drop`, which cannot await, and a stream's place on the list is released
+in the step that sends its row or, for a stream that ends without one, from a `Drop`, neither of which awaits. A
 stream runs on its own task, and the slots its request was given are returned when the stream ends, not when
 the handler returned, so a long stream is counted as being in flight for as long as it is, and a request that
 arrives while a single-slot stream is running is answered as full rather than made to wait.
@@ -660,6 +673,10 @@ another: ten, fifty and a hundred at once, twenty streams at once, a slow connec
 go elsewhere, a connection at its limit answering at once instead of queueing and giving its slot back to the
 next batch, a connection admitted by the capability it states rather than by the default, the gateway as a whole
 answering 503 when it is full, a stream holding its slot until it ends, and a client that leaves mid-stream.
+The key and account limits are tested at once in the same way: twenty requests sent together on a key limited
+to two a minute admit two and refuse eighteen, a key cap and an account's daily limit of one token admit one of
+ten sent together because the first one's input is held while it runs, and a request turned away at a full
+connection gives back its place in the minute, so the key can still send the one it has left.
 The time bounds are tested the same way: a stream that runs past the request deadline without ever going quiet
 has to arrive whole, including its usage chunk, so the row is not an estimate; a single answer is still given its
 deadline; a stream that goes quiet for the stall window is closed, its row recorded as an estimate, and its slot

@@ -14,6 +14,7 @@ use crate::api::{error, logged};
 use crate::limits::Admission;
 use crate::presence::{self, Active};
 use crate::registry::{self, Connection};
+use crate::reservations::{Ask, Refusal, Reservation};
 use crate::shutdown::Phase;
 use crate::state::State;
 use crate::tokens;
@@ -139,9 +140,30 @@ fn disabled_account(row: &SqliteRow) -> Option<Response> {
     None
 }
 
-async fn enforce_limits(st: &State, key: &KeyInfo) -> Option<Response> {
-    if let Some(limit) = key.rpm_limit {
-        let recent = match sqlx::query(
+// What the rows say a key and its account have used, read here and then checked together with the requests
+// still in flight in one step (`reservations`), so requests sent at the same moment cannot all pass on the
+// same reading. What comes back is the request's hold, settled once its row is written; a refusal is the
+// answer the request is given, boxed because an answer is large and is only built when one is refused.
+async fn enforce_limits(
+    st: &State,
+    key: &KeyInfo,
+    prompt_tokens: i64,
+) -> Result<Reservation, Box<Response>> {
+    let read_at = Instant::now();
+    // The account is checked before its limits, because a disabled account cannot use a key at
+    // all. The account limit counts the current day only and resets at 00:00 UTC, matching the
+    // UTC text the usage rows are stored as. It is checked after the key cap, so a key cannot
+    // be used to work around it.
+    let account = match account_row(st, key.user_id).await {
+        Ok(Some(account)) => account,
+        Ok(None) => return Err(Box::new(unknown_key())),
+        Err(err) => return Err(Box::new(unreadable(err))),
+    };
+    if let Some(blocked) = disabled_account(&account) {
+        return Err(Box::new(blocked));
+    }
+    let rpm = match key.rpm_limit {
+        Some(limit) => match sqlx::query(
             "SELECT COUNT(*) AS n FROM usage WHERE api_key_id = ? \
              AND strftime('%Y-%m-%d %H:%M:%S', created_at) >= datetime('now', '-1 minute')",
         )
@@ -149,56 +171,26 @@ async fn enforce_limits(st: &State, key: &KeyInfo) -> Option<Response> {
         .fetch_one(&st.pool)
         .await
         {
-            Ok(row) => row.get::<i64, _>("n"),
-            Err(err) => return Some(unreadable(err)),
-        };
-        if recent >= limit {
-            return Some(error(
-                StatusCode::TOO_MANY_REQUESTS,
-                "rate_limit",
-                format!(
-                    "key '{}' is limited to {limit} requests per minute",
-                    key.name
-                ),
-            ));
-        }
-    }
-    if let Some(cap) = key.token_cap {
-        let used = match sqlx::query(
+            Ok(row) => Some((limit, row.get::<i64, _>("n"))),
+            Err(err) => return Err(Box::new(unreadable(err))),
+        },
+        None => None,
+    };
+    let key_cap = match key.token_cap {
+        Some(cap) => match sqlx::query(
             "SELECT COALESCE(SUM(total_tokens), 0) AS used FROM usage WHERE api_key_id = ?",
         )
         .bind(key.id)
         .fetch_one(&st.pool)
         .await
         {
-            Ok(row) => row.get::<i64, _>("used"),
-            Err(err) => return Some(unreadable(err)),
-        };
-        if used >= cap {
-            return Some(error(
-                StatusCode::TOO_MANY_REQUESTS,
-                "token_cap",
-                format!(
-                    "key '{}' has reached its token cap of {cap} input and output tokens",
-                    key.name
-                ),
-            ));
-        }
-    }
-    // The account is checked before its limits, because a disabled account cannot use a key at
-    // all. The account limit counts the current day only and resets at 00:00 UTC, matching the
-    // UTC text the usage rows are stored as. It is checked after the key cap, so a key cannot
-    // be used to work around it.
-    let account = match account_row(st, key.user_id).await {
-        Ok(Some(account)) => account,
-        Ok(None) => return Some(unknown_key()),
-        Err(err) => return Some(unreadable(err)),
+            Ok(row) => Some((cap, row.get::<i64, _>("used"))),
+            Err(err) => return Err(Box::new(unreadable(err))),
+        },
+        None => None,
     };
-    if let Some(blocked) = disabled_account(&account) {
-        return Some(blocked);
-    }
-    if let Some(cap) = account.get::<Option<i64>, _>("daily_token_cap") {
-        let used = match sqlx::query(
+    let day_cap = match account.get::<Option<i64>, _>("daily_token_cap") {
+        Some(cap) => match sqlx::query(
             "SELECT COALESCE(SUM(total_tokens), 0) AS used FROM usage \
              WHERE user_id = ? AND strftime('%Y-%m-%d', created_at) = date('now')",
         )
@@ -206,21 +198,60 @@ async fn enforce_limits(st: &State, key: &KeyInfo) -> Option<Response> {
         .fetch_one(&st.pool)
         .await
         {
-            Ok(row) => row.get::<i64, _>("used"),
-            Err(err) => return Some(unreadable(err)),
-        };
-        if used >= cap {
-            return Some(error(
+            Ok(row) => Some((cap, row.get::<i64, _>("used"))),
+            Err(err) => return Err(Box::new(unreadable(err))),
+        },
+        None => None,
+    };
+    let ask = Ask {
+        key_id: key.id,
+        user_id: key.user_id,
+        prompt_tokens,
+        read_at,
+        rpm,
+        key_cap,
+        day_cap,
+    };
+    st.reservations.reserve(ask).map_err(|refusal| {
+        Box::new(match refusal {
+            Refusal::RateLimit { limit } => error(
+                StatusCode::TOO_MANY_REQUESTS,
+                "rate_limit",
+                format!(
+                    "key '{}' is limited to {limit} requests per minute",
+                    key.name
+                ),
+            ),
+            Refusal::KeyCap { cap, in_flight } => error(
                 StatusCode::TOO_MANY_REQUESTS,
                 "token_cap",
                 format!(
-                    "account '{}' has used its daily token limit of {cap} input and output tokens",
-                    account.get::<String, _>("username")
+                    "key '{}' has reached its token cap of {cap} input and output tokens{}",
+                    key.name,
+                    in_flight_note(in_flight)
                 ),
-            ));
-        }
+            ),
+            Refusal::DayCap { cap, in_flight } => error(
+                StatusCode::TOO_MANY_REQUESTS,
+                "token_cap",
+                format!(
+                    "account '{}' has used its daily token limit of {cap} input and output tokens{}",
+                    account.get::<String, _>("username"),
+                    in_flight_note(in_flight)
+                ),
+            ),
+        })
+    })
+}
+
+// A cap reached with requests still running counts their input as the gateway estimated it, so the answer
+// says how much of what it counted is that estimate rather than a number an upstream reported.
+fn in_flight_note(in_flight: i64) -> String {
+    if in_flight == 0 {
+        String::new()
+    } else {
+        format!(", counting an estimated {in_flight} input tokens of requests still in flight")
     }
-    None
 }
 
 fn resolve_model(
@@ -419,10 +450,11 @@ struct StreamContext {
     model: String,
     present: Active,
     admission: Admission,
+    reservation: Reservation,
 }
 
 fn stream_body(
-    ctx: StreamContext,
+    mut ctx: StreamContext,
     upstream: reqwest::Response,
     started: Instant,
     prompt_tokens: i64,
@@ -576,6 +608,7 @@ fn stream_body(
                 None
             }
         };
+        ctx.reservation.settle();
         inflight.settle(event);
         // Released here rather than when the handler returned, so a stream is still counted
         // while it is running. The connection slot is given back at the same point, because the request
@@ -628,9 +661,12 @@ pub async fn chat_completions(
     // Counted from here, so a request that is refused by a limit still marks the account as
     // active; the guard is released when the request finishes, including for a stream.
     let present = presence::track(&st, key.user_id);
-    if let Some(blocked) = enforce_limits(&st, &key).await {
-        return blocked;
-    }
+    let prompt_tokens = tokens::prompt_estimate(body.get("messages").unwrap_or(&Value::Null));
+    // Dropped without being settled, as on every early answer below, the hold is given back.
+    let mut reservation = match enforce_limits(&st, &key, prompt_tokens).await {
+        Ok(reservation) => reservation,
+        Err(blocked) => return *blocked,
+    };
 
     let candidates = registry::candidates(&st, key.connection_id).await;
     if candidates.is_empty() {
@@ -641,7 +677,6 @@ pub async fn chat_completions(
         );
     }
     let wants_stream = body.get("stream").and_then(Value::as_bool).unwrap_or(false);
-    let prompt_tokens = tokens::prompt_estimate(body.get("messages").unwrap_or(&Value::Null));
     let requested = body.get("model").and_then(Value::as_str);
     // The request is admitted as a whole, before anything is asked of a connection, and the slots are held for
     // as long as it runs. Nothing is queued here: a connection that is full is skipped, so one slow
@@ -773,6 +808,7 @@ pub async fn chat_completions(
                     global,
                     connection: slot,
                 },
+                reservation,
             };
             *out.body_mut() = Body::from_stream(stream_body(ctx, upstream, started, prompt_tokens));
             return out;
@@ -844,6 +880,7 @@ pub async fn chat_completions(
             },
         )
         .await;
+        reservation.settle();
 
         let mut out = Response::new(Body::empty());
         *out.status_mut() = status;
@@ -900,6 +937,7 @@ pub async fn chat_completions(
         },
     )
     .await;
+    reservation.settle();
     // Ended by the gateway because it was stopping, not by a connection that failed.
     if cut.is_some() {
         return shutting_down();

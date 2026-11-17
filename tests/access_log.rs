@@ -61,6 +61,7 @@ async fn app() -> (Router, State) {
         limits: Arc::new(limits),
         metrics: Default::default(),
         shutdown: Default::default(),
+        reservations: Default::default(),
     };
     (build_router(st.clone()), st)
 }
