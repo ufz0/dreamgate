@@ -47,14 +47,16 @@ Environment variables:
   applied to a stream: a stream has no known end and is bounded by silence instead.
 - `DREAMGATE_STREAM_STALL_SECS` — how long a stream may go without producing anything before it is closed as a
   dead connection, default 120
-- `DREAMGATE_METRICS_TOKEN` — the bearer token a scrape of `/metrics` has to send. Unset, the default, there is no
-  `/metrics` at all (see Monitoring)
-- `RUST_LOG` — which log lines are printed to standard output, coloured only when it is a terminal, in the usual form (`warn`,
+- `DREAMGATE_METRICS_TOKEN` — the bearer token a scrape of `/metrics` has to send, read without the spaces or
+  line break around it. Unset or blank, the default, there is no `/metrics` at all (see Monitoring)
+- `RUST_LOG` — which log lines are printed to standard output, in the usual form (`warn`,
   `info,dreamgate=debug`; a target named on its own, such as `dreamgate=debug`, turns every other one off),
-  default `info`. At that level each request prints one access line (see Monitoring) and nothing else when it
-  goes well; what prints beside those is an error or a warning, such as a usage row that could not be written, which the key caps and daily limits then do not count
-  either, an upstream that failed, with the whole chain of causes the client is not sent, a stream closed for
-  going quiet, a failure answered with a reference, or a database statement that took longer than a second
+  default `info`. At that level each request prints one access line, target `dreamgate::access`, which
+  `dreamgate::access=off` turns off on its own (see Monitoring); what prints beside those is an error or a
+  warning, such as a usage row that could not be written, which the key caps and daily limits then do not
+  count either, an upstream that failed, with the whole chain of causes the client is not sent, a stream
+  closed for going quiet, a failure answered with a reference, or a database statement that took longer than
+  a second. The lines are coloured only when standard output is a terminal and `NO_COLOR` is not set
 
 ## Using it
 
@@ -148,8 +150,8 @@ Requests are handled at the same time. The lookups for a key and its account, th
 the reading of a stream and the writing of the usage row are all async, and nothing in that path holds one
 request behind another: no lock is held across an upstream request or across a stream. The locks in the
 process — the presence counts and the streams in flight, the sign-in windows, the map of per-connection
-limits, and the two maps of counts `/metrics` reports — are held for a few instructions and released before anything is awaited, so they are plain mutexes
-rather than async ones: there is nothing to hold across an await, the presence count is released from a `Drop`,
+limits, and the two maps of counts `/metrics` reports — are held for a few instructions and released before
+anything is awaited, so they are plain mutexes rather than async ones: there is nothing to hold across an await, the presence count is released from a `Drop`,
 which cannot await, and a stream's place on the list is released in the step that sends its row or, for a
 stream that ends without one, from a `Drop`, neither of which awaits. A
 stream runs on its own task, and the slots its request was given are returned when the stream ends, not when
@@ -229,37 +231,47 @@ and started again after the same 30 seconds, so health checking does not end wit
 
 ## Monitoring
 
-`GET /health` answers 200 `ok` when the database answers a query within a second, and 503 `database unavailable`
-when it does not, with the reason logged. It does not ask the connections: an upstream that is down is not a
-reason to restart the gateway in front of it, and the Connections view and `/metrics` say which one is down. It
-needs no session, so a load balancer or an orchestrator can call it.
+`GET /health` answers 200 `ok` when the database answers, within a second, a statement that reads a page of its
+file, and 503 `database unavailable` when it does not, with the reason logged. When every connection of the
+pool is in use and none comes free within a quarter of a second, it answers 200 `busy` instead: that is a burst
+being served, the gateway admits more requests at once than the pool has connections, and a 503 then would get
+a working gateway restarted in the middle of its streams. It does not ask the connections either: an upstream
+that is down is not a reason to restart the gateway in front of it, and the Connections view and `/metrics` say
+which one is down. It needs no session, so a load balancer or an orchestrator can call it.
 
 `GET /metrics` is a Prometheus scrape in the text format, there only when `DREAMGATE_METRICS_TOKEN` is set and
 read with `Authorization: Bearer <that token>`; without the token it answers 401, and with no token set it
-answers 404, because the gateway binds every interface by default. The counts are of this run of the process,
-kept in memory and starting at zero on a restart the way a Prometheus counter is expected to:
+answers 404, because the gateway binds every interface by default; the token is compared without stopping at
+the first byte that differs. The connections' health is read from the database for each scrape, and a database
+that does not answer within a second leaves those lines out, with a warning logged, rather than holding the
+scrape past a scraper's own timeout. The counts are of this run of the process, kept in memory and starting at
+zero on a restart the way a Prometheus counter is expected to:
 
 - `dreamgate_responses_total{route, status, type}` — every answer the two gateway endpoints gave, with the error
   type it carried, so a refusal at a limit or a full connection, which is deliberately not a usage row, is
   counted here. A stream is counted by the status its head was sent with.
-- `dreamgate_upstream_failures_total{connection}` — requests to a connection that failed before it answered,
-  including the ones a request then fell over from.
+- `dreamgate_upstream_failures_total{connection}` — requests to a connection that failed before or while it
+  answered, including the ones a request then fell over from and a stream cut midway by an error.
 - `dreamgate_tokens_total{direction, source}` — the input and the output of recorded requests, with what an
   upstream reported (`source="reported"`) kept apart from what the gateway estimated (`source="estimated"`).
 - `dreamgate_request_duration_seconds{streamed}` — a histogram of the latency of recorded requests, single answers
   and streams apart.
 - `dreamgate_usage_write_failures_total` and `dreamgate_stream_stalls_total` — rows that could not be written,
   which the caps then do not count, and streams closed for going quiet.
-- `dreamgate_in_flight`, `dreamgate_in_flight_limit` and `dreamgate_connection_in_flight{connection}` — what is
-  being worked on now, for the gateway and for each connection a request has reached since the start.
-- `dreamgate_connection_up{connection}` — 1 when the last health check reached the connection and 0 when it
-  failed; a connection no check has reached yet is left out rather than reported as either.
+- `dreamgate_in_flight`, `dreamgate_in_flight_limit` and `dreamgate_connection_in_flight{connection}` — the
+  completion requests admitted and not yet finished, for the gateway and for each enabled connection a request
+  has reached since the start. The model list is not admitted that way, so it is not in them.
+- `dreamgate_connection_up{connection}` — 1 when the last health check reached an enabled connection and 0 when
+  it failed; a connection no check has reached yet is left out rather than reported as either, and so is one
+  that is turned off, because no check reaches it.
 
 Nothing is labelled by key or by account: those names are shown to an admin alone, and a label for each key
 would grow without bound.
 
-Each request also prints one access line at `info`: the method, the path without its query, the status and the
-time it took. Nothing from the headers is written, so a key or a session cookie does not reach the log.
+Each request also prints one access line at `info`, target `dreamgate::access`: the method, the path without its
+query, the status and the time it took, which for a stream is the time to its head, when the answer is handed
+on; the stream's own length is in its usage row. Nothing from the headers is written, so a key or a session
+cookie does not reach the log.
 
 ## Dashboard
 
@@ -501,10 +513,16 @@ written with the old columns (a display name, an email, a
 lifetime cap), or with usage rows that were taken with the key, to the current shape, with every index on the
 usage table in place after that table is rebuilt, a rebuild that fails partway leaving the table as it was and
 foreign keys on, and a rebuild left half-done by an earlier start run again with the rows keeping their values,
-the health check reading the database and answering 503 when it cannot, `/metrics` not being there without a
-token and refusing a scrape without it, the counts a scrape reads after traffic — answers by route, status and
-type, refusals included, tokens reported and estimated apart, a connection that failed before answering, and
-what is in flight — and the access log writing one line per request with neither its headers nor its query.
+the health check reading the database and answering 503 when it cannot and `busy` when the pool is in use,
+`/metrics` not being there without a token or with a blank one, reading a token without the line break around
+it and refusing a scrape without it, the counts a scrape reads after traffic — answers by route, status and
+type, refusals included, tokens reported and estimated apart, a stream's row counted as well as a single
+answer's, a connection that failed before answering, histogram buckets that never decrease, a usage row that
+could not be written, a stream in flight on the gateway and on its connection, and which connections are up —
+and, in a test binary of its own so its subscriber is the global one, the access log writing one line per
+request, a failure as much as a success, with neither its headers nor its query. The stall test in
+`tests/concurrency.rs` checks the stall count as well. A health check whose database does not answer within the
+second is not tested, because a database that hangs cannot be held still in a test.
 
 The concurrency tests (`tests/concurrency.rs`) run the gateway against a mock upstream that counts how many
 requests it is working on at once, and check that requests are answered at the same time rather than one after

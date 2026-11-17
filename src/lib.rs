@@ -16,12 +16,8 @@ pub mod tokens;
 pub mod usage;
 pub mod users;
 
-use axum::body::Body;
-use axum::http::Request;
 use axum::{Router, middleware, routing};
 use tower_http::services::ServeDir;
-use tower_http::trace::{DefaultOnResponse, TraceLayer};
-use tracing::Level;
 
 use crate::state::State;
 
@@ -76,20 +72,6 @@ pub fn build_router(st: State) -> Router {
         )
         .route_layer(middleware::from_fn_with_state(st.clone(), metrics::count));
 
-    // One line per request at info: the method, the path without its query, the status and how long it
-    // took. Nothing from the headers, so a key or a session cookie is never written to the log, and no
-    // separate line for a failure, because the status is already on the line.
-    let access_log = TraceLayer::new_for_http()
-        .make_span_with(|request: &Request<Body>| {
-            tracing::info_span!(
-                "request",
-                method = %request.method(),
-                path = %request.uri().path()
-            )
-        })
-        .on_response(DefaultOnResponse::new().level(Level::INFO))
-        .on_failure(());
-
     Router::new()
         .route("/health", routing::get(metrics::health))
         .route("/metrics", routing::get(metrics::scrape))
@@ -97,5 +79,5 @@ pub fn build_router(st: State) -> Router {
         .nest("/api", public.merge(private))
         .fallback_service(ServeDir::new("web"))
         .with_state(st)
-        .layer(access_log)
+        .layer(middleware::from_fn(metrics::access_log))
 }

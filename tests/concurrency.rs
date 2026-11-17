@@ -11,7 +11,7 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, post},
 };
-use dreamgate::{build_router, db, limits, live, state::State};
+use dreamgate::{build_router, db, limits, live, metrics, state::State};
 use futures_util::{future::join_all, stream};
 use http_body_util::BodyExt;
 use serde_json::{Value, json};
@@ -798,7 +798,8 @@ async fn a_stream_that_goes_quiet_is_closed_and_its_slot_is_given_back() {
     // wide enough that a loaded runner cannot turn the ordering around.
     let mock = Mock::new(25, 2).quiet(2000);
     let limits = test_time_limits(64, 1, Duration::from_secs(10), Duration::from_millis(500));
-    let st = test_state(limits, 4).await;
+    let mut st = test_state(limits, 4).await;
+    st.metrics = Arc::new(metrics::Metrics::new(Some("scrape-secret".to_string())));
     let base_url = mock_upstream(&mock).await;
     seed(&st, "ada", &base_url, "dreamgate_test", None).await;
     let router = build_router(st.clone());
@@ -850,6 +851,24 @@ async fn a_stream_that_goes_quiet_is_closed_and_its_slot_is_given_back() {
     assert_eq!(
         rows[0]["estimated"], true,
         "nothing was reported for a stream closed at the silence"
+    );
+
+    // A stream closed at the silence is counted for a scrape.
+    let scrape = router
+        .clone()
+        .oneshot(
+            axum::http::Request::get("/metrics")
+                .header("authorization", "Bearer scrape-secret")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let scrape = scrape.into_body().collect().await.unwrap().to_bytes();
+    assert!(
+        String::from_utf8_lossy(&scrape)
+            .lines()
+            .any(|l| l == "dreamgate_stream_stalls_total 1")
     );
 
     // The slot is given back when the stalled stream ends, so the next request is admitted. The release

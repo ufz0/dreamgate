@@ -2,15 +2,16 @@ use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use axum::body::Body;
 use axum::extract::{MatchedPath, Request, State as AxumState};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
-use sqlx::Row;
 
+use crate::db::{self, Probe};
+use crate::registry;
 use crate::state::State;
 use crate::usage::UsageRow;
 
@@ -27,9 +28,9 @@ const BUCKETS: [f64; 11] = [
 
 // What the gateway counts about itself for a scraper, in the process and not in the database: it is a
 // reading of this run, starts at zero on a restart the way a Prometheus counter is expected to, and costs a
-// few atomic additions per request. The two maps are behind plain mutexes, held for one insert and never
-// across an await. Nothing here is labelled by key or account: names are shown to an admin alone, and a
-// label per key would grow without bound.
+// few atomic additions per request. The two maps are behind plain mutexes, held for one insert or for one
+// read of the counts, and never across an await. Nothing here is labelled by key or account: names are shown
+// to an admin alone, and a label per key would grow without bound.
 #[derive(Default)]
 pub struct Metrics {
     // The token a scrape has to send. Without one the route is not there at all, because the gateway binds
@@ -46,17 +47,23 @@ pub struct Metrics {
     latency: [Histogram; 2],
 }
 
+// Each request is counted in the one bucket it falls in, the last being everything above the largest bound,
+// and the cumulative counts are summed when a scrape is written. Counted straight into cumulative buckets,
+// a scrape that read them while a request was being counted could show a bucket above the next one.
 #[derive(Default)]
 struct Histogram {
-    buckets: [AtomicU64; BUCKETS.len()],
-    count: AtomicU64,
+    buckets: [AtomicU64; BUCKETS.len() + 1],
     sum_ms: AtomicU64,
 }
 
 impl Metrics {
+    // A token is read as it is set, without the line break or spaces a secret file or an environment file
+    // tends to leave around it; one that is empty once they are gone is no token.
     pub fn new(token: Option<String>) -> Metrics {
         Metrics {
-            token: token.filter(|token| !token.trim().is_empty()),
+            token: token
+                .map(|token| token.trim().to_string())
+                .filter(|token| !token.is_empty()),
             ..Default::default()
         }
     }
@@ -89,12 +96,11 @@ impl Metrics {
         self.tokens[1][source].fetch_add(row.completion_tokens.max(0) as u64, Ordering::Relaxed);
         let histogram = &self.latency[usize::from(row.streamed)];
         let seconds = row.latency_ms.max(0) as f64 / 1000.0;
-        for (bucket, bound) in histogram.buckets.iter().zip(BUCKETS) {
-            if seconds <= bound {
-                bucket.fetch_add(1, Ordering::Relaxed);
-            }
-        }
-        histogram.count.fetch_add(1, Ordering::Relaxed);
+        let bucket = BUCKETS
+            .iter()
+            .position(|bound| seconds <= *bound)
+            .unwrap_or(BUCKETS.len());
+        histogram.buckets[bucket].fetch_add(1, Ordering::Relaxed);
         histogram
             .sum_ms
             .fetch_add(row.latency_ms.max(0) as u64, Ordering::Relaxed);
@@ -122,6 +128,27 @@ pub async fn count(AxumState(st): AxumState<State>, request: Request, next: Next
     response
 }
 
+// One line per request, written as a single event of its own target, `dreamgate::access`, so a `RUST_LOG`
+// that filters other targets cannot leave the line without its method and path, and the line can be turned
+// off on its own (`dreamgate::access=off`). Nothing from the headers is written, so a key or a session
+// cookie never reaches the log, and the path is written without its query. For a stream the time is the time
+// to its head, because that is when the answer is handed on; the stream's own length is in its usage row.
+pub async fn access_log(request: Request, next: Next) -> Response {
+    let method = request.method().clone();
+    let path = request.uri().path().to_string();
+    let started = Instant::now();
+    let response = next.run(request).await;
+    tracing::info!(
+        target: "dreamgate::access",
+        method = %method,
+        path = %path,
+        status = response.status().as_u16(),
+        latency_ms = started.elapsed().as_millis() as u64,
+        "request"
+    );
+    response
+}
+
 pub async fn scrape(AxumState(st): AxumState<State>, headers: HeaderMap) -> Response {
     let Some(token) = st.metrics.token.as_deref() else {
         return StatusCode::NOT_FOUND.into_response();
@@ -129,59 +156,81 @@ pub async fn scrape(AxumState(st): AxumState<State>, headers: HeaderMap) -> Resp
     let sent = headers
         .get(header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.strip_prefix("Bearer "));
-    if sent.map(str::trim) != Some(token) {
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .map(str::trim);
+    if !sent.is_some_and(|sent| same(sent, token)) {
         return StatusCode::UNAUTHORIZED.into_response();
     }
-    let connections = sqlx::query("SELECT id, name, health FROM connections ORDER BY id")
-        .fetch_all(&st.pool)
-        .await;
     let mut out = render(&st);
-    // The connections are read for the scrape rather than counted, because their health is a reading the
-    // checks keep in the database. A database that cannot be read leaves them out rather than reporting
-    // every connection as down.
-    if let Ok(rows) = connections {
-        family(
-            &mut out,
-            "dreamgate_connection_up",
-            "gauge",
-            "1 when the last health check reached the connection, 0 when it failed; a connection no check has reached yet is left out",
-        );
-        for row in &rows {
-            let name = row.get::<String, _>("name");
-            let up = match row.get::<String, _>("health").as_str() {
-                "ok" => 1,
-                "down" => 0,
-                _ => continue,
-            };
-            let _ = writeln!(
-                out,
-                "dreamgate_connection_up{{connection=\"{}\"}} {up}",
-                escape(&name)
-            );
+    // The connections' health is a reading the checks keep in the database, so it is read for the scrape.
+    // A database that does not answer within a second leaves those families out rather than holding the
+    // scrape past a scraper's own timeout, which would lose every other count at the moment they matter.
+    match tokio::time::timeout(Duration::from_secs(1), registry::health_readings(&st)).await {
+        Ok(Ok(readings)) => connection_families(&mut out, &st, &readings),
+        Ok(Err(err)) => {
+            tracing::warn!(
+                "a scrape left the connections out, because they could not be read: {err}"
+            )
         }
-        family(
-            &mut out,
-            "dreamgate_connection_in_flight",
-            "gauge",
-            "Requests a connection is working on now",
-        );
-        for row in &rows {
-            let id = row.get::<i64, _>("id");
-            if let Some(in_flight) = st.limits.connection_in_flight(id) {
-                let _ = writeln!(
-                    out,
-                    "dreamgate_connection_in_flight{{connection=\"{}\"}} {in_flight}",
-                    escape(&row.get::<String, _>("name"))
-                );
-            }
-        }
+        Err(_) => tracing::warn!(
+            "a scrape left the connections out, because the database did not answer within a second"
+        ),
     }
     (
-        [(header::CONTENT_TYPE, "text/plain; version=0.0.4")],
+        [(
+            header::CONTENT_TYPE,
+            "text/plain; version=0.0.4; charset=utf-8",
+        )],
         Body::from(out),
     )
         .into_response()
+}
+
+// Compared without stopping at the first byte that differs, so the time an answer takes does not say how
+// much of a guessed token was right.
+fn same(sent: &str, token: &str) -> bool {
+    sent.len() == token.len()
+        && sent
+            .bytes()
+            .zip(token.bytes())
+            .fold(0u8, |differ, (a, b)| differ | (a ^ b))
+            == 0
+}
+
+fn connection_families(out: &mut String, st: &State, readings: &[(i64, String, String)]) {
+    family(
+        out,
+        "dreamgate_connection_up",
+        "gauge",
+        "1 when the last health check reached an enabled connection, 0 when it failed; a connection no check has reached yet is left out",
+    );
+    for (_, name, health) in readings {
+        let up = match health.as_str() {
+            "ok" => 1,
+            "down" => 0,
+            _ => continue,
+        };
+        let _ = writeln!(
+            out,
+            "dreamgate_connection_up{{connection=\"{}\"}} {up}",
+            escape(name)
+        );
+    }
+    family(
+        out,
+        "dreamgate_connection_in_flight",
+        "gauge",
+        "Completion requests an enabled connection is working on now",
+    );
+    for (id, name, _) in readings {
+        if let Some(in_flight) = st.limits.connection_in_flight(*id) {
+            let _ = writeln!(
+                out,
+                "dreamgate_connection_in_flight{{connection=\"{}\"}} {in_flight}",
+                escape(name)
+            );
+        }
+    }
 }
 
 fn render(st: &State) -> String {
@@ -207,7 +256,7 @@ fn render(st: &State) -> String {
         &mut out,
         "dreamgate_upstream_failures_total",
         "counter",
-        "Requests to a connection that failed before it answered, by connection",
+        "Requests to a connection that failed before or while it answered, a stream cut midway included, by connection",
     );
     for (connection, n) in m
         .upstream_failures
@@ -246,17 +295,25 @@ fn render(st: &State) -> String {
     );
     for (streamed, histogram) in m.latency.iter().enumerate() {
         let streamed = streamed == 1;
-        for (bucket, bound) in histogram.buckets.iter().zip(BUCKETS) {
+        // The counts are read once each and summed here, so the buckets, `+Inf` and `_count` of one scrape
+        // agree with each other however many requests are being counted while it is written.
+        let counts: Vec<u64> = histogram
+            .buckets
+            .iter()
+            .map(|bucket| bucket.load(Ordering::Relaxed))
+            .collect();
+        let mut cumulative = 0;
+        for (count, bound) in counts.iter().zip(BUCKETS) {
+            cumulative += count;
             let _ = writeln!(
                 out,
-                "dreamgate_request_duration_seconds_bucket{{streamed=\"{streamed}\",le=\"{bound}\"}} {}",
-                bucket.load(Ordering::Relaxed)
+                "dreamgate_request_duration_seconds_bucket{{streamed=\"{streamed}\",le=\"{bound}\"}} {cumulative}"
             );
         }
-        let count = histogram.count.load(Ordering::Relaxed);
+        let total: u64 = counts.iter().sum();
         let _ = writeln!(
             out,
-            "dreamgate_request_duration_seconds_bucket{{streamed=\"{streamed}\",le=\"+Inf\"}} {count}"
+            "dreamgate_request_duration_seconds_bucket{{streamed=\"{streamed}\",le=\"+Inf\"}} {total}"
         );
         let _ = writeln!(
             out,
@@ -265,7 +322,7 @@ fn render(st: &State) -> String {
         );
         let _ = writeln!(
             out,
-            "dreamgate_request_duration_seconds_count{{streamed=\"{streamed}\"}} {count}"
+            "dreamgate_request_duration_seconds_count{{streamed=\"{streamed}\"}} {total}"
         );
     }
 
@@ -297,14 +354,14 @@ fn render(st: &State) -> String {
         &mut out,
         "dreamgate_in_flight",
         "gauge",
-        "Requests the gateway as a whole is working on now",
+        "Completion requests the gateway has admitted and not yet finished, across every connection",
     );
     let _ = writeln!(out, "dreamgate_in_flight {}", st.limits.in_flight());
     family(
         &mut out,
         "dreamgate_in_flight_limit",
         "gauge",
-        "How many requests the gateway takes at once",
+        "How many completion requests the gateway admits at once",
     );
     let _ = writeln!(
         out,
@@ -330,17 +387,18 @@ fn escape(value: &str) -> String {
 
 // The answer for a load balancer or an orchestrator: whether this process can do its work, which needs the
 // database. It does not ask the connections, because an upstream that is down is not a reason to restart the
-// gateway in front of it. A database that does not answer within a second is answered as unavailable rather
-// than waited on, since a health check that hangs is read as a dead process anyway.
+// gateway in front of it. A pool whose every connection is in use is a burst being served, not a database
+// that has stopped, so it answers `busy` with a 200 rather than a 503 that would get a working gateway
+// restarted in the middle of its streams.
 pub async fn health(AxumState(st): AxumState<State>) -> Response {
-    let probe = sqlx::query("SELECT 1").fetch_one(&st.pool);
-    match tokio::time::timeout(Duration::from_secs(1), probe).await {
-        Ok(Ok(_)) => (StatusCode::OK, "ok").into_response(),
-        Ok(Err(err)) => {
+    match db::probe(&st.pool).await {
+        Probe::Answered => (StatusCode::OK, "ok").into_response(),
+        Probe::Busy => (StatusCode::OK, "busy").into_response(),
+        Probe::Failed(err) => {
             tracing::error!("health check could not read the database: {err}");
             (StatusCode::SERVICE_UNAVAILABLE, "database unavailable").into_response()
         }
-        Err(_) => {
+        Probe::TimedOut => {
             tracing::error!("health check: the database did not answer within a second");
             (StatusCode::SERVICE_UNAVAILABLE, "database unavailable").into_response()
         }
