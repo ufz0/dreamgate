@@ -150,10 +150,11 @@ Requests are handled at the same time. The lookups for a key and its account, th
 the reading of a stream and the writing of the usage row are all async, and nothing in that path holds one
 request behind another: no lock is held across an upstream request or across a stream. The locks in the
 process — the presence counts and the streams in flight, the sign-in windows, the map of per-connection
-limits, and the two maps of counts `/metrics` reports — are held for a few instructions and released before
-anything is awaited, so they are plain mutexes rather than async ones: there is nothing to hold across an await, the presence count is released from a `Drop`,
-which cannot await, and a stream's place on the list is released in the step that sends its row or, for a
-stream that ends without one, from a `Drop`, neither of which awaits. A
+limits, the two maps of counts `/metrics` reports, and when the health check first found the pool in use —
+are held for a few instructions and released before anything is awaited, so they are plain mutexes rather than
+async ones: there is nothing to hold across an await, the presence count is released from a `Drop`, which
+cannot await, and a stream's place on the list is released in the step that sends its row or, for a stream
+that ends without one, from a `Drop`, neither of which awaits. A
 stream runs on its own task, and the slots its request was given are returned when the stream ends, not when
 the handler returned, so a long stream is counted as being in flight for as long as it is, and a request that
 arrives while a single-slot stream is running is answered as full rather than made to wait.
@@ -231,13 +232,16 @@ and started again after the same 30 seconds, so health checking does not end wit
 
 ## Monitoring
 
-`GET /health` answers 200 `ok` when the database answers, within a second, a statement that reads a page of its
-file, and 503 `database unavailable` when it does not, with the reason logged. When every connection of the
-pool is in use and none comes free within a quarter of a second, it answers 200 `busy` instead: that is a burst
-being served, the gateway admits more requests at once than the pool has connections, and a 503 then would get
-a working gateway restarted in the middle of its streams. It does not ask the connections either: an upstream
-that is down is not a reason to restart the gateway in front of it, and the Connections view and `/metrics` say
-which one is down. It needs no session, so a load balancer or an orchestrator can call it.
+`GET /health` answers 200 `ok` when the database answers, within a second, a statement that reads a table, and
+503 `database unavailable` when it does not, with the reason logged. When every connection of the pool is in use
+and none comes free within a quarter of a second, it answers 200 `busy` instead: that is a burst being served,
+the gateway admits more requests at once than the pool has connections, and a 503 then would get a working
+gateway restarted in the middle of its streams. That lasts as long as a query waits for a connection, 30
+seconds: when the checks have found the pool in use for longer, its connections are stuck rather than busy, the
+gateway's own requests are already failing with it, and the check answers 503 `database unavailable`. It does
+not ask the connections either: an upstream that is down is not a reason to restart the gateway in front of it,
+and the Connections view and `/metrics` say which one is down. It needs no session, so a load balancer or an
+orchestrator can call it.
 
 `GET /metrics` is a Prometheus scrape in the text format, there only when `DREAMGATE_METRICS_TOKEN` is set and
 read with `Authorization: Bearer <that token>`; without the token it answers 401, and with no token set it
@@ -254,8 +258,8 @@ zero on a restart the way a Prometheus counter is expected to:
   answered, including the ones a request then fell over from and a stream cut midway by an error.
 - `dreamgate_tokens_total{direction, source}` — the input and the output of recorded requests, with what an
   upstream reported (`source="reported"`) kept apart from what the gateway estimated (`source="estimated"`).
-- `dreamgate_request_duration_seconds{streamed}` — a histogram of the latency of recorded requests, single answers
-  and streams apart.
+- `dreamgate_request_duration_seconds{streamed}` — a histogram of the latency of recorded requests, single
+  answers and streams apart.
 - `dreamgate_usage_write_failures_total` and `dreamgate_stream_stalls_total` — rows that could not be written,
   which the caps then do not count, and streams closed for going quiet.
 - `dreamgate_in_flight`, `dreamgate_in_flight_limit` and `dreamgate_connection_in_flight{connection}` — the
@@ -405,7 +409,8 @@ reconnects on its own, and a request that arrives moves the counters.
 ## Security
 
 What an unauthenticated request can reach is the entry screen: `POST /api/register`, `POST /api/login`,
-`GET /api/settings`, the static files, and `GET /health`, which says only whether the database answers.
+`GET /api/settings`, the static files, and `GET /health`, which says only whether the database answers and
+whether the pool is in use.
 `GET /metrics` needs the token in `DREAMGATE_METRICS_TOKEN` and is not there without one. Everything else needs
 a session or a DreamGate key.
 
@@ -513,16 +518,17 @@ written with the old columns (a display name, an email, a
 lifetime cap), or with usage rows that were taken with the key, to the current shape, with every index on the
 usage table in place after that table is rebuilt, a rebuild that fails partway leaving the table as it was and
 foreign keys on, and a rebuild left half-done by an earlier start run again with the rows keeping their values,
-the health check reading the database and answering 503 when it cannot and `busy` when the pool is in use,
-`/metrics` not being there without a token or with a blank one, reading a token without the line break around
-it and refusing a scrape without it, the counts a scrape reads after traffic — answers by route, status and
-type, refusals included, tokens reported and estimated apart, a stream's row counted as well as a single
-answer's, a connection that failed before answering, histogram buckets that never decrease, a usage row that
-could not be written, a stream in flight on the gateway and on its connection, and which connections are up —
-and, in a test binary of its own so its subscriber is the global one, the access log writing one line per
-request, a failure as much as a success, with neither its headers nor its query. The stall test in
-`tests/concurrency.rs` checks the stall count as well. A health check whose database does not answer within the
-second is not tested, because a database that hangs cannot be held still in a test.
+the health check reading the database and answering 503 when it cannot, `busy` when the pool is in use and 503
+once it has been in use for longer than a query waits, `/metrics` not being there without a token or with a
+blank one, reading a token without the line break around it and refusing a scrape without it, the counts a
+scrape reads after traffic — answers by route, status and type, refusals included, tokens reported and estimated
+apart, a stream's row counted as well as a single answer's, a connection that failed before answering, histogram
+buckets that are cumulative, a usage row that could not be written by a single answer or by a stream, a stream
+in flight on the gateway and on its connection, and which connections are up — and, in a test binary of its own
+so its subscriber is the global one, the access log writing one line per request, a failure as much as a
+success, with neither its headers nor its query. The stall test in `tests/concurrency.rs` checks the stall count
+as well. A health check whose database does not answer within the second is not tested, because a database that
+hangs cannot be held still in a test.
 
 The concurrency tests (`tests/concurrency.rs`) run the gateway against a mock upstream that counts how many
 requests it is working on at once, and check that requests are answered at the same time rather than one after

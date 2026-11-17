@@ -45,6 +45,9 @@ pub struct Metrics {
     stream_stalls: AtomicU64,
     // The latency of each recorded request, single answers and streams apart.
     latency: [Histogram; 2],
+    // When the health check first found every pooled connection in use, in the run of checks that have
+    // found nothing else since. Held for one read and one write, never across an await.
+    busy_since: Mutex<Option<Instant>>,
 }
 
 // Each request is counted in the one bucket it falls in, the last being everything above the largest bound,
@@ -389,11 +392,34 @@ fn escape(value: &str) -> String {
 // database. It does not ask the connections, because an upstream that is down is not a reason to restart the
 // gateway in front of it. A pool whose every connection is in use is a burst being served, not a database
 // that has stopped, so it answers `busy` with a 200 rather than a 503 that would get a working gateway
-// restarted in the middle of its streams.
+// restarted in the middle of its streams; but only for as long as a query waits for a connection. A pool
+// that has given none for longer is one whose connections are stuck, on a disk that hangs for instance, and
+// the gateway's own requests are already failing with it, so the check fails as well.
 pub async fn health(AxumState(st): AxumState<State>) -> Response {
-    match db::probe(&st.pool).await {
+    let probe = db::probe(&st.pool).await;
+    let busy_for = {
+        let mut since = st.metrics.busy_since.lock().expect("busy since");
+        match probe {
+            Probe::Busy => Some(since.get_or_insert_with(Instant::now).elapsed()),
+            _ => {
+                *since = None;
+                None
+            }
+        }
+    };
+    match probe {
         Probe::Answered => (StatusCode::OK, "ok").into_response(),
-        Probe::Busy => (StatusCode::OK, "busy").into_response(),
+        Probe::Busy => {
+            let busy_for = busy_for.unwrap_or_default();
+            if busy_for < st.pool.options().get_acquire_timeout() {
+                return (StatusCode::OK, "busy").into_response();
+            }
+            tracing::error!(
+                "health check: every connection of the pool has been in use for {} seconds",
+                busy_for.as_secs()
+            );
+            (StatusCode::SERVICE_UNAVAILABLE, "database unavailable").into_response()
+        }
         Probe::Failed(err) => {
             tracing::error!("health check could not read the database: {err}");
             (StatusCode::SERVICE_UNAVAILABLE, "database unavailable").into_response()

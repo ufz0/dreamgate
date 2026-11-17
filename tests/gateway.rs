@@ -4675,6 +4675,49 @@ async fn the_health_check_answers_busy_rather_than_down_when_the_pool_is_in_use(
     );
 }
 
+// Busy is a burst being served only while a query could still get a connection by waiting. A pool that has
+// given the checks none for longer than a query waits is answered as down, and the first check that gets a
+// connection again starts over.
+#[tokio::test]
+async fn a_pool_that_stays_in_use_past_the_wait_for_a_connection_is_answered_as_down() {
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .acquire_timeout(Duration::from_millis(600))
+        .connect("sqlite::memory:")
+        .await
+        .unwrap();
+    for statement in db::SCHEMA {
+        sqlx::query(*statement).execute(&pool).await.unwrap();
+    }
+    let mut st = test_state().await;
+    st.pool = pool;
+    let router = build_router(st.clone());
+
+    let held = st.pool.acquire().await.unwrap();
+    assert_eq!(
+        get_text(&router, "/health", None).await,
+        (StatusCode::OK, "busy".to_string())
+    );
+    tokio::time::sleep(Duration::from_millis(700)).await;
+    assert_eq!(
+        get_text(&router, "/health", None).await,
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "database unavailable".to_string()
+        )
+    );
+    drop(held);
+    assert_eq!(
+        get_text(&router, "/health", None).await,
+        (StatusCode::OK, "ok".to_string())
+    );
+    let _held = st.pool.acquire().await.unwrap();
+    assert_eq!(
+        get_text(&router, "/health", None).await,
+        (StatusCode::OK, "busy".to_string())
+    );
+}
+
 // The gauges read what is happening now, so a stream that is still running is in flight for the gateway and
 // for its connection, and a connection's last check is read for whether it is up.
 #[tokio::test]
@@ -4758,4 +4801,28 @@ async fn a_usage_row_that_could_not_be_written_is_counted() {
             .any(|l| l == "dreamgate_usage_write_failures_total 1"),
         "{scrape}"
     );
+
+    // A stream's row is written by its own task, which counts a row it could not write as well.
+    let response = gateway_call(
+        &router,
+        created["key"].as_str().unwrap(),
+        json!({ "stream": true, "messages": [{ "role": "user", "content": "hi" }] }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    response.into_body().collect().await.unwrap();
+    let mut scrape = String::new();
+    for _ in 0..50 {
+        scrape = get_text(&router, "/metrics", Some("Bearer scrape-secret"))
+            .await
+            .1;
+        if scrape
+            .lines()
+            .any(|l| l == "dreamgate_usage_write_failures_total 2")
+        {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!("the stream's lost row was not counted:\n{scrape}");
 }
