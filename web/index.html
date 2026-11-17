@@ -292,14 +292,14 @@
           <label class="field">Username<input name="username" required></label>
           <div class="field">
             <label for="account-daily-limit">Daily limit</label>
-            <p class="help" id="account-daily-limit-help">Optional. Leave it empty for no limit.</p>
+            <p class="help" id="account-daily-limit-help">Optional. Counts the input and output tokens of one day together. Leave it empty for no limit.</p>
             <input id="account-daily-limit" name="daily_token_cap" type="number" min="1" aria-describedby="account-daily-limit-help">
           </div>
           <button type="submit">Create account</button>
         </form>
         <div class="table">
           <table id="accounts">
-            <thead><tr><th>Account</th><th>Daily limit</th><th>Used today (input + output)</th><th>Requests</th><th>Input tokens</th><th>Output tokens</th><th><span class="visually-hidden">Actions</span></th></tr></thead>
+            <thead><tr><th>Account</th><th>Daily limit (input + output)</th><th>Used today (input + output)</th><th>Requests</th><th>Input tokens</th><th>Output tokens</th><th><span class="visually-hidden">Actions</span></th></tr></thead>
             <tbody id="accounts-body"></tbody>
           </table>
         </div>

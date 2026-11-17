@@ -31,7 +31,8 @@ pub struct UpdateKey {
 
 // One row shape for both lists. The Keys page shows the caller's own keys; an admin can ask for
 // the other accounts separately, so a table never mixes two owners. The input and the output are
-// reported apart because the page shows them apart; the total stays, because a key's cap counts it.
+// reported apart because the page shows them apart; the total stays, because the list is ordered by it
+// and a client that read it before still can.
 const KEY_SQL: &str = "SELECT k.id, k.name, k.key, k.model, k.connection_id, k.enabled, k.rpm_limit, k.token_cap, \
         k.created_at, c.name AS connection, u.username AS owner, \
         COUNT(r.id) AS requests, COALESCE(SUM(r.total_tokens), 0) AS tokens, \

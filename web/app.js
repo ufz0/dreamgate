@@ -421,9 +421,14 @@ function subscribe() {
     // move the account figures or the charts.
     countTotals(state.summary.global, event);
     if (event.user_id === state.me.id) countTotals(state.summary.self, event);
-    if (isToday(event.created_at)) {
-      const account = state.summary.users.find((user) => user.id === event.user_id);
-      if (account) account.used_today = num(account.used_today) + event.total_tokens;
+    // An account's row in the Accounts view moves with the same event, so its input and output do not
+    // stand still beside a day figure that has moved.
+    const account = state.summary.users.find((user) => user.id === event.user_id);
+    if (account) {
+      account.requests = num(account.requests) + 1;
+      account.prompt_tokens = num(account.prompt_tokens) + num(event.prompt_tokens);
+      account.completion_tokens = num(account.completion_tokens) + num(event.completion_tokens);
+      if (isToday(event.created_at)) account.used_today = num(account.used_today) + event.total_tokens;
     }
     // The charts are per account, so an event from another account does not move them.
     if (event.user_id === state.me.id) addEvent(event);
@@ -672,18 +677,22 @@ function renderCharts() {
 // says which of the two the feed is.
 // A stream still running is a row of its own above the recorded ones, with live in place of a status it
 // does not have yet. Its tokens are the input and what has been generated so far, in the same two columns
-// a recorded row fills, and a ~ marks both while they are the gateway's estimate, because one flag covers
-// the pair.
+// a recorded row fills, and each is marked with a ~ while it is the gateway's estimate. Each column has its
+// own flag, because an upstream can report the input before what it generated, and a flag that is missing
+// is read as an estimate rather than as a reported count.
+function streamTokens(tokens, estimated) {
+  const how = estimated ? 'Estimated by the gateway until the request is recorded' : 'As the upstream has reported so far';
+  return `<span class="tokens" title="${how}">${estimated ? '~' : ''}${nf.format(num(tokens))}</span>`;
+}
+
 function streamRow(stream) {
-  const how = stream.estimated ? 'Estimated by the gateway until the request is recorded' : 'As the upstream has reported so far';
-  const mark = stream.estimated ? '~' : '';
   return `<li class="inflight">
     <span>${esc(stream.started_at.slice(11, 19))}</span>
     <span>${esc(stream.key)}</span>
     <span>${esc(stream.model || 'no model')}</span>
     <span>live</span>
-    <span class="tokens" title="${how}">${mark}${nf.format(num(stream.prompt_tokens))}</span>
-    <span class="tokens" title="${how}">${mark}${nf.format(num(stream.completion_tokens))}</span>
+    ${streamTokens(stream.prompt_tokens, stream.prompt_estimated !== false)}
+    ${streamTokens(stream.completion_tokens, stream.estimated !== false)}
   </li>`;
 }
 
@@ -1472,7 +1481,11 @@ async function setLimit(user, raw) {
     notice('Daily limit must be a whole number of at least 1, or empty to clear it.', 'error');
     return;
   }
-  await changeAccount(user, { daily_token_cap: value }, `Set the daily limit for ${user.username} to ${value ? nf.format(value) : 'none'}.`);
+  await changeAccount(
+    user,
+    { daily_token_cap: value },
+    `Set the daily limit for ${user.username} to ${value ? `${nf.format(value)} input and output tokens` : 'none'}.`,
+  );
 }
 
 document.addEventListener('click', async (event) => {

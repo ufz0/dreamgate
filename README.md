@@ -241,14 +241,15 @@ URL hash (`#/overview`, `#/activity`, `#/keys`, `#/connections`, `#/connect`, `#
 
 Every token figure on the page says which side of a request it counts: input tokens, what was sent in;
 output tokens, what the model generated; or the two together, where a figure is measured against a limit
-or a chart has always counted both. The tables and the live traffic feed show the two sides as separate
+or a chart has always counted both, as a key's token cap, an account's daily limit and the message a request
+refused at either is answered with do. The tables and the live traffic feed show the two sides as separate
 columns rather than one sum, and `/api/keys`, `/api/keys/others` and the per-account and per-model rows of
 `/api/stats/summary` carry `prompt_tokens` and `completion_tokens` beside the total they already had.
 
-The dashboard reads `/api/stats/summary` and subscribes to `/api/live`, so the counters, the
-charts, the presence panel and the activity table update as traffic arrives — rows land in the
-current view without a reload. The only thing the page asks for on a timer is the presence panel, every
-30 seconds, because the five-minute online window passes with time as well as with traffic.
+The dashboard reads `/api/stats/summary` and subscribes to `/api/live`, so the counters, the charts, the
+presence panel, the activity table and an account's row in the Accounts view update as traffic arrives — rows
+land in the current view without a reload. The only thing the page asks for on a timer is the presence panel,
+every 30 seconds, because the five-minute online window passes with time as well as with traffic.
 
 A stream is on the page while it runs, not only once its row is written. The gateway keeps how far each
 stream in flight has got — the input and what it has generated so far, by the same estimate a row is given
@@ -257,8 +258,9 @@ when nothing is reported, and the upstream's own count once it has reported the 
 changed, however many streams are running. The two generated figures at the top of the Overview include it,
 and their notes say how much of the figure is still being generated and, while it is the gateway's count,
 that it is an estimate until the request is recorded; the live traffic feed shows each stream as a row marked
-live, above the recorded rows and within the same twelve, its input and output tokens marked with a ~ while
-they are estimated. The other figures, the charts and the support panel move when the row is recorded.
+live, above the recorded rows and within the same twelve, its input and its output tokens each marked with a ~
+while that count is the gateway's estimate, because an upstream can report the input before what it generated.
+The other figures, the charts and the support panel move when the row is recorded.
 
 When the request finishes, the stream leaves the list in the same step that sends its row, so a page goes
 from one to the other in one repaint: the figure neither dips while the row is written nor counts the two
@@ -355,7 +357,9 @@ recording, estimation when the upstream reports nothing including reasoning text
 pass-through, that a client's reasoning level reaches the upstream unchanged, upstream failover,
 the round of health checks marking a connection that answers,
 the model recorded for a streamed request when nothing is pinned to a key or a connection,
-per-key limits and their validation, the keys list being the caller's own with the other
+per-key limits and their validation, the per-key, per-account and per-model figures carrying the input and the
+output apart, including for a key or an account with no usage and after a key is deleted, the keys list being the
+caller's own with the other
 accounts read by an admin alone, per-account daily token limits including the day
 boundary and the admin-only rule for setting one, the admin/user scoping of the stats
 queries and the split between a caller's own figures and the platform total, a taken username named when registering, including one held for approval, with any other failure
@@ -365,7 +369,8 @@ account made by an admin with no password until its first sign-in, the account a
 rename, new password, approve, delete) and what they do to a sign-in, a key and the recorded usage,
 that deleting a key leaves the rows recorded for it and the
 counters standing, the presence counts while a request is in flight, a stream's progress reaching the live
-stream while it runs, moving from the estimate to what the upstream reported, and leaving it only when its row
+stream while it runs, moving from the estimate to what the upstream reported, with the input marked as reported
+on its own when an upstream reports it first, and leaving it only when its row
 arrives, which names the stream it settles, another account's stream listed for an admin and only counted for a
 member, who is sent its row's figures and nothing else, the connections routes being
 admin-only with the key a connection carries returned to an admin alone, the model list refusing a

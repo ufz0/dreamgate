@@ -124,7 +124,10 @@ async fn enforce_limits(st: &State, key: &KeyInfo) -> Option<Response> {
             return Some(error(
                 StatusCode::TOO_MANY_REQUESTS,
                 "token_cap",
-                format!("key '{}' has reached its token cap of {cap}", key.name),
+                format!(
+                    "key '{}' has reached its token cap of {cap} input and output tokens",
+                    key.name
+                ),
             ));
         }
     }
@@ -151,7 +154,7 @@ async fn enforce_limits(st: &State, key: &KeyInfo) -> Option<Response> {
                 StatusCode::TOO_MANY_REQUESTS,
                 "token_cap",
                 format!(
-                    "account '{}' has used its daily token limit of {cap}",
+                    "account '{}' has used its daily token limit of {cap} input and output tokens",
                     account.get::<String, _>("username")
                 ),
             ));
@@ -404,9 +407,11 @@ fn stream_body(
                     // What the upstream has reported once it has reported it, and the estimate until then.
                     // The generated count is what the page shows moving, so it is only called reported
                     // when the upstream has reported that count itself, not when it has sent the input's.
+                    // The input is shown in a column of its own, so it says the same of itself.
                     inflight.update(
                         report.prompt.unwrap_or(prompt_tokens),
                         report.completion.unwrap_or(estimate),
+                        report.prompt.is_none(),
                         report.completion.is_none(),
                     );
                     if tx.send(Ok(bytes)).await.is_err() {
