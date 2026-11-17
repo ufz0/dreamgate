@@ -176,6 +176,12 @@ body {
 .shell[data-collapsed="true"] .foot-row span:not(.icon),
 .shell[data-collapsed="true"] .foot-row .icon:last-child { display: none; }
 .shell[data-collapsed="true"] .foot-row { flex-direction: column; }
+/* A collapsed rail leaves 32px inside its padding, and the foot's own padding took that to 20, narrower than
+   either control, so the grid column grew from the left edge and pushed both off centre, the theme button
+   to the rail's edge. The foot drops its side padding there, its column cannot grow past the rail, and the
+   theme button takes the 30px square Sign out has, so both sit on the rail's centre line. */
+.shell[data-collapsed="true"] .sidebar-foot { padding: 6px 0; grid-template-columns: minmax(0, 1fr); }
+.shell[data-collapsed="true"] #theme-menu .menu-button { padding: 7px; }
 
 .account { color: var(--text-muted); font-size: 13px; margin: 0; }
 .account b { font-weight: 600; color: var(--text); }
