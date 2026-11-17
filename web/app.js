@@ -784,10 +784,11 @@ function connectionOptions() {
 
 // The gateway takes a key's own model first, then the default of the connection that serves it, and
 // the model the client asks for only when neither is set. A key that is not bound to one connection can
-// be served by any, so it can only say which of the two it may be.
+// be served by any, so it can only say which of the two it may be, and so can a key whose connection is
+// marked down, because the gateway starts with another one.
 function keyModel(key, bound) {
   if (key.model) return key.model;
-  if (bound && bound.enabled) return bound.default_model || 'the model the client asks for';
+  if (bound && bound.enabled && firstConnection(key) === bound) return bound.default_model || 'the model the client asks for';
   return state.connections.some((c) => c.enabled && c.default_model)
     ? "the connection's default, or the model the client asks for"
     : 'the model the client asks for';

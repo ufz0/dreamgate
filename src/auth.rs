@@ -231,19 +231,24 @@ pub async fn register(
     // all counted none and were all made admin; a writing statement takes the write lock before it
     // reads, so only the first insert finds no accounts. The first account owns the instance and is
     // never held back, because there is no one to approve it; after it, registration has to be open,
-    // and a new account waits unless approval is turned off, with the defaults `settings` reads.
+    // and a new account waits unless approval is turned off, read with the names and defaults
+    // `settings` uses.
     let row = match sqlx::query(
         "INSERT INTO users (username, password_hash, role, created_at, pending) \
          SELECT ?, ?, CASE WHEN EXISTS (SELECT 1 FROM users) THEN 'user' ELSE 'admin' END, ?, \
                 EXISTS (SELECT 1 FROM users) \
-                AND COALESCE((SELECT value FROM settings WHERE key = 'require_approval'), '1') = '1' \
+                AND COALESCE((SELECT value FROM settings WHERE key = ?), ?) = '1' \
          WHERE NOT EXISTS (SELECT 1 FROM users) \
-            OR COALESCE((SELECT value FROM settings WHERE key = 'open_registration'), '0') = '1' \
+            OR COALESCE((SELECT value FROM settings WHERE key = ?), ?) = '1' \
          RETURNING id, role, pending",
     )
     .bind(&username)
     .bind(&hash)
     .bind(crate::clock::now())
+    .bind(crate::settings::APPROVAL_KEY)
+    .bind(crate::settings::APPROVAL_BY_DEFAULT)
+    .bind(crate::settings::KEY)
+    .bind(crate::settings::OPEN_BY_DEFAULT)
     .fetch_optional(&st.pool)
     .await
     {

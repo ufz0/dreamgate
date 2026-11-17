@@ -476,6 +476,8 @@ fn stream_body(
                     }
                 }
                 Err(err) => {
+                    let err = err.without_url();
+                    upstream_failed(&ctx.conn, &err);
                     let _ = tx.send(Err(BoxError::from(err))).await;
                     break;
                 }

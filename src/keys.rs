@@ -138,25 +138,30 @@ pub async fn create(
     .await;
     match result {
         Ok(row) => Json(json!({ "id": row.get::<i64, _>("id"), "key": key })).into_response(),
-        Err(sqlx::Error::Database(db))
-            if body.connection_id.is_some() && db.is_foreign_key_violation() =>
-        {
-            no_such_connection()
-        }
-        Err(err) => server_error(err),
+        Err(err) => write_failed(&st, body.connection_id, err).await,
     }
 }
 
 // A key bound to a connection that does not exist is a mistake in what was sent, not a failure of
-// the server: the connection may have been deleted in another tab while the form was open. The
-// account a key is made for is the caller's own, so when a connection was named, it is the one the
-// reference failed on.
-fn no_such_connection() -> Response {
-    error(
-        StatusCode::BAD_REQUEST,
-        "invalid_request",
-        "no connection with that id",
-    )
+// the server: the connection may have been deleted in another tab while the form was open. Which
+// reference failed is read rather than assumed, because the account a key belongs to can be deleted
+// in the same moment, and that is not the person's mistake.
+async fn write_failed(st: &State, connection_id: Option<i64>, err: sqlx::Error) -> Response {
+    let reference = matches!(&err, sqlx::Error::Database(db) if db.is_foreign_key_violation());
+    if let (true, Some(id)) = (reference, connection_id) {
+        let found = sqlx::query("SELECT 1 FROM connections WHERE id = ?")
+            .bind(id)
+            .fetch_optional(&st.pool)
+            .await;
+        if matches!(found, Ok(None)) {
+            return error(
+                StatusCode::BAD_REQUEST,
+                "invalid_request",
+                "no connection with that id",
+            );
+        }
+    }
+    server_error(err)
 }
 
 pub async fn update(
@@ -201,12 +206,7 @@ pub async fn update(
     .await;
     match result {
         Ok(_) => Json(json!({ "ok": true })).into_response(),
-        Err(sqlx::Error::Database(db))
-            if body.connection_id.is_some() && db.is_foreign_key_violation() =>
-        {
-            no_such_connection()
-        }
-        Err(err) => server_error(err),
+        Err(err) => write_failed(&st, body.connection_id, err).await,
     }
 }
 

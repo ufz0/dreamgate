@@ -95,10 +95,12 @@ not pick a level itself; it only routes and counts.
 
 When nothing names a model — none pinned to the key, no default model on the connection, and none in the
 request — the request goes out without one, exactly as the client sent it, and the upstream answers with its
-own default. DreamGate does not put a name of its own in its place. The row for such a request, when it reached
-a connection, records the model as `unknown`, because what is recorded is the model the gateway sent, not the
-one the upstream answered with. A request that reached no connection records the model the key pins or the
-request names, which here is none, so its row has no model and the page shows it as no model.
+own default. DreamGate does not put a name of its own in its place. The row for such a request, when a
+connection answered it, whatever the status, records the model as `unknown`, because what is recorded is the
+model the gateway sent, not the one the upstream answered with. A request that no connection answered, because
+every one it was sent to failed before answering, records the model the key pins or the request names, which
+here is none: its row has no model, the Activity table shows it as no model, and the usage by model counts it
+under `unknown`.
 
 An estimate counts everything the model produced, not only the answer. Reasoning models put their
 working in `reasoning_content` (or `reasoning`) beside the reply, and that text is counted as
@@ -164,13 +166,13 @@ is full does not hold unrelated requests behind it — it is skipped, the key fa
 as it always did, and a request that finds every connection it could use full is answered as an overload, 429
 `connection_full`. A connection marked down is one a request could use, tried after the others, so when every
 connection that is not marked down is full and one that is has a free slot, the request is sent there. If that
-connection is down in fact, the answer is the 502 of a request that reached a connection and failed, recorded
+connection is down in fact, the answer is the 502 of a request that was sent and got no answer, recorded
 like any other — its estimated input counts toward the key's cap and the account's day — rather than the 429
 the request would otherwise have been given, and it can take up to the connect timeout, or longer for a host
 that accepts and never answers, to find that out; the connections that were full are named in that answer
 beside the one that failed. A request that finds the gateway as a whole full is answered with 503 `overloaded`.
-Neither 429 nor 503 is recorded as usage, because nothing crossed the gate; a request that did reach a connection
-and failed there is recorded as it always was. An admission that answered by queueing would hide the queue behind
+Neither 429 nor 503 is recorded as usage, because nothing crossed the gate; a request that was sent to a
+connection and failed there is recorded as it always was. An admission that answered by queueing would hide the queue behind
 a long latency, so the overload is visible to the client and a client that wants the request processed retries.
 Admission is checked after the key and the account lookups, which is what the rest of the path has always
 done — a request turned away at a limit still reads those two rows and still marks its account as generating
@@ -385,9 +387,10 @@ What an unauthenticated request can reach is the entry screen: `POST /api/regist
   answered 400 "no connection with that id". Where a handler answers a failure inside the server, it answers
   `server_error` with a short reference (or, at the gateway, the 503 above), and what the database said is
   written to the log under that reference rather than sent to the client, so a table, a constraint or the
-  driver's text does not reach it. A few reads still answer a failure as if they had found nothing — the
-  connections list as empty, an account, a key or a connection to change as not found — which is a gap to
-  close rather than a promise. An upstream that fails is named by its connection rather than by its address,
+  driver's text does not reach it. Some reads still answer a failure as if they had found nothing — for
+  example the connections list as empty, the gateway's own read of the connections as no enabled connection,
+  the registration setting as its default, and an account, a key or a connection to act on as not found —
+  which is a gap to close rather than a promise. An upstream that fails is named by its connection rather than by its address,
   so an internal host and port, or a credential in a connection's address, does not reach a key holder; the
   whole error, with its causes, is logged as a warning under the connection's name.
 
