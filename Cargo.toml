@@ -2,6 +2,8 @@
 name = "dreamgate"
 version = "0.1.0"
 edition = "2024"
+# Packages in the lockfile need at least this; CI and rust-toolchain.toml pin the one the code is formatted with.
+rust-version = "1.88"
 
 [dependencies]
 axum = "0.8"

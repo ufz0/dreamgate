@@ -1,0 +1,8 @@
+# Only what the image build reads: the manifest, the lockfile, the source and the dashboard.
+target
+data
+.git
+.claude
+*.db
+*.db-wal
+*.db-shm

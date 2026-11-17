@@ -4856,3 +4856,39 @@ async fn a_dashboards_live_stream_ends_when_the_gateway_starts_to_stop() {
         "the live stream stayed open after the stop began"
     );
 }
+
+// nginx holds a response back until its buffer fills unless the response says not to, which would turn a
+// stream into one late answer; both kinds of event stream say so.
+#[tokio::test]
+async fn event_streams_ask_a_proxy_not_to_buffer_them() {
+    let st = test_state().await;
+    let router = build_router(st.clone());
+    let base_url = mock_upstream().await;
+    let cookie = register(&router, "ada").await;
+    post_json(
+        &router,
+        "/api/connections",
+        &cookie,
+        json!({ "name": "test", "base_url": base_url, "default_model": "reports-usage" }),
+    )
+    .await;
+    let (_, created) = post_json(&router, "/api/keys", &cookie, json!({ "name": "k" })).await;
+    let stream = gateway_call(
+        &router,
+        created["key"].as_str().unwrap(),
+        json!({ "stream": true, "messages": [{ "role": "user", "content": "hi" }] }),
+    )
+    .await;
+    assert_eq!(stream.headers()["x-accel-buffering"], "no");
+    stream.into_body().collect().await.unwrap();
+
+    let live = call(
+        &router,
+        Request::get("/api/live")
+            .header("cookie", &cookie)
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(live.headers()["x-accel-buffering"], "no");
+}

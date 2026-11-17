@@ -154,6 +154,28 @@ pub async fn probe(pool: &SqlitePool) -> Probe {
 // longer a burst being served, since the gateway's own requests are failing with it.
 pub const ACQUIRE_TIMEOUT: Duration = Duration::from_secs(30);
 
+// A copy of the database that can be taken while the gateway runs. Copying the file is not one: with WAL,
+// committed rows can still be in the -wal file beside it, and a copy taken during a write is torn.
+// `VACUUM INTO` writes a consistent snapshot to a new file instead. The database is opened as it is, not
+// created and not migrated, because a backup must not change what it copies; SQLite refuses a target that
+// already exists, so an earlier backup is never overwritten. The copy holds every key the gateway stores,
+// upstream keys included, so on Unix it is made readable by its owner alone.
+pub async fn backup(url: &str, target: &std::path::Path) -> Result<(), sqlx::Error> {
+    let options = SqliteConnectOptions::from_str(url)?.busy_timeout(Duration::from_secs(5));
+    let mut connection = SqliteConnection::connect_with(&options).await?;
+    sqlx::query("VACUUM INTO ?")
+        .bind(target.to_string_lossy().into_owned())
+        .execute(&mut connection)
+        .await?;
+    connection.close().await?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(target, std::fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(())
+}
+
 pub async fn connect(url: &str, max_connections: u32) -> Result<SqlitePool, sqlx::Error> {
     let options = SqliteConnectOptions::from_str(url)?
         .create_if_missing(true)

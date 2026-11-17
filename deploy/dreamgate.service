@@ -1,0 +1,56 @@
+# An example unit for running DreamGate under systemd, as
+# /etc/systemd/system/dreamgate.service.
+#
+# It expects the binary at /usr/local/bin/dreamgate and the dashboard's files at /opt/dreamgate/web,
+# because the dashboard is served from web/ under the working directory. The database lives in the state
+# directory systemd makes for the service, /var/lib/dreamgate, owned by a user that exists only while the
+# service runs. Settings that are secrets, such as DREAMGATE_METRICS_TOKEN, go in /etc/dreamgate.env with
+# mode 0600 rather than in this file.
+
+[Unit]
+Description=DreamGate LLM gateway
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=/usr/local/bin/dreamgate
+WorkingDirectory=/opt/dreamgate
+# Bound to loopback, for a reverse proxy in front that terminates TLS (see the README).
+Environment=DREAMGATE_ADDR=127.0.0.1:8787
+Environment=DREAMGATE_DB=/var/lib/dreamgate/dreamgate.db
+EnvironmentFile=-/etc/dreamgate.env
+DynamicUser=yes
+StateDirectory=dreamgate
+StateDirectoryMode=0700
+
+# SIGTERM starts the drain: the requests in flight get DREAMGATE_SHUTDOWN_GRACE_SECS (30 by default), then
+# up to ten more seconds for connections still open and five for the last rows. systemd is told to wait
+# longer than all of that before it kills the process.
+KillSignal=SIGTERM
+TimeoutStopSec=60
+Restart=on-failure
+RestartSec=2
+
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+CapabilityBoundingSet=
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

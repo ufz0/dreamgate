@@ -307,3 +307,84 @@ fn only_a_third_signal_stops_the_process_at_once() {
     drop(half_sent);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// A backup taken while the database is open and its latest rows are still in the write-ahead log: the copy
+// has them, it is readable by its owner alone because it holds every key, and an earlier backup is never
+// overwritten.
+#[tokio::test]
+async fn the_backup_command_copies_a_database_that_is_in_use() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = scratch("backup");
+    let database = dir.join("dreamgate.db");
+    let pool = dreamgate::db::connect(&format!("sqlite://{}", database.display()), 2)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO users (username, password_hash, role, enabled, pending, created_at) \
+         VALUES ('ada', 'hash', 'admin', 1, 0, '2026-01-01T00:00:00Z')",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    assert!(
+        dir.join("dreamgate.db-wal").exists(),
+        "the row should still be in the write-ahead log"
+    );
+
+    let target = dir.join("copy.db");
+    let run = |target: &PathBuf| {
+        Command::new(env!("CARGO_BIN_EXE_dreamgate"))
+            .args(["backup", target.to_str().unwrap()])
+            .env("DREAMGATE_DB", &database)
+            .output()
+            .unwrap()
+    };
+    let first = run(&target);
+    assert!(
+        first.status.success(),
+        "{}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    assert_eq!(
+        std::fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    let copy = sqlx::sqlite::SqlitePoolOptions::new()
+        .connect(&format!("sqlite://{}", target.display()))
+        .await
+        .unwrap();
+    let name: String = sqlx::query("SELECT username FROM users")
+        .fetch_one(&copy)
+        .await
+        .unwrap()
+        .get("username");
+    assert_eq!(name, "ada");
+    copy.close().await;
+
+    let again = run(&target);
+    assert!(!again.status.success(), "an earlier backup was overwritten");
+
+    // A database that is not there is an error, not an empty file made and copied.
+    let missing = Command::new(env!("CARGO_BIN_EXE_dreamgate"))
+        .args(["backup", dir.join("other.db").to_str().unwrap()])
+        .env("DREAMGATE_DB", dir.join("absent.db"))
+        .output()
+        .unwrap();
+    assert!(!missing.status.success());
+    assert!(!dir.join("absent.db").exists());
+
+    pool.close().await;
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// An argument the binary does not know is not taken as a reason to start serving.
+#[test]
+fn an_unknown_command_says_how_the_binary_is_used() {
+    let out = Command::new(env!("CARGO_BIN_EXE_dreamgate"))
+        .arg("serve-everything")
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("usage: dreamgate"));
+}
