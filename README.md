@@ -92,8 +92,12 @@ its own section above the answer when an upstream sends it.
 Requests are recorded with the key, user, model, token counts, latency and status — except a request that
 was turned away at a concurrency limit before reaching a connection, which is not recorded because nothing
 crossed the gate — and connections are health-checked every 30 seconds, at most eight at a time. A key with no
-connection routes to any enabled connection by priority, and a connection that is down or fails at the
-transport level falls over to the next one.
+connection routes to any enabled connection by priority, a key bound to a connection tries that one first while
+it is enabled and the others by priority after it, and a connection that fails at the transport level falls over
+to the next one. A connection whose last check marked it down is not skipped but tried last: the connections that
+are not marked down are tried first, then the ones that are, each in that same order, and no connection is tried
+twice for one request. A check is only every 30 seconds, so a connection marked down may be answering again, and
+a request still reaches one when every connection is marked down.
 
 A recorded row also carries what the engine said about the request itself, when it said anything:
 the part of the prompt served from its cache, and how long reading the prompt took against how long
@@ -224,10 +228,10 @@ URL hash (`#/overview`, `#/activity`, `#/keys`, `#/connections`, `#/connect`, `#
   account, or all of them, and see those keys with the account each one belongs to.
 - **Connections** — add and health-check upstreams. A connection that no check has reached yet reads
   "not checked yet" rather than down, here and in the gate readout on the Overview, because the gateway
-  only skips one whose check failed. Admin-only, like the per-account figures, and that rule is on the
-  routes as well as on the page. The key a connection carries is returned to an admin alone; every
-  signed-in account still sees the connection itself, because the gate readout and the model list need
-  it.
+  only puts one whose check failed behind the others. Admin-only, like the per-account figures, and that
+  rule is on the routes as well as on the page. The key a connection carries is returned to an admin
+  alone; every signed-in account still sees the connection itself, because the gate readout and the model
+  list need it.
 - **Connect a client** — the base URL, a key picker, a copyable curl request.
 - **Sandbox** — chat with any model a connection serves, through the same gateway the clients
   use, so the request is recorded like any other. Pick a key and a model from the connection's
@@ -361,6 +365,8 @@ cargo test
 The suite runs the gateway against a mock OpenAI-compatible upstream and covers usage
 recording, estimation when the upstream reports nothing including reasoning text, SSE
 pass-through, that a client's reasoning level reaches the upstream unchanged, upstream failover,
+a connection marked down being tried after the ones that are not rather than skipped, including when every
+connection is marked down, and a connection that is full passing the request on to one marked down,
 the round of health checks marking a connection that answers,
 the model recorded for a streamed request when nothing is pinned to a key or a connection,
 per-key limits and their validation, the per-key, per-account and per-model figures carrying the input and the

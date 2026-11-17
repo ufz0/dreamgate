@@ -37,8 +37,9 @@ function paintIcons(root) {
 }
 
 // The stored health is unknown until a check has run on a connection, which is not the same as down: the
-// gateway only skips a connection whose check failed, so one that was never checked does not get the
-// warning. A value this page does not know is shown as it is stored rather than read as one of these.
+// gateway only puts a connection whose check failed behind the others, so one that was never checked does
+// not get the warning. A value this page does not know is shown as it is stored rather than read as one of
+// these.
 const HEALTH = {
   ok: ['ok', 'check', 'ok'],
   down: ['down', 'alert', 'down'],
@@ -551,8 +552,9 @@ function renderOverview(arrived) {
 
 function topConnection() {
   const enabled = state.connections.filter((c) => c.enabled).sort((a, b) => a.priority - b.priority);
-  // Same order the gateway uses: highest priority, skipping a connection that is down
-  // unless it is the only one left.
+  // Same order the gateway uses: highest priority, with every connection that is down tried
+  // after the ones that are not, so the first it tries is the first that is not down, or the
+  // first of all when every one is down.
   return enabled.find((c) => c.health !== 'down') || enabled[0] || null;
 }
 

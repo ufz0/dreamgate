@@ -538,7 +538,7 @@ pub async fn chat_completions(
         return blocked;
     }
 
-    let candidates = registry::candidates(&st, key.connection_id).await;
+    let mut candidates = registry::candidates(&st, key.connection_id).await;
     if candidates.is_empty() {
         return error(
             StatusCode::BAD_GATEWAY,
@@ -571,10 +571,13 @@ pub async fn chat_completions(
     let mut full: Vec<String> = Vec::new();
     let mut attempted = false;
 
+    // A connection whose last check failed is tried last rather than skipped. Health is only checked every 30
+    // seconds, so one marked down may be answering again, and skipping every connection that is marked down
+    // would send a request nowhere when all of them are. The sort is stable, so the connections that are not
+    // down keep their order — the key's own connection first, then priority — the ones that are down follow
+    // in that same order, and each is still tried once.
+    candidates.sort_by_key(|conn| conn.health == "down");
     for conn in &candidates {
-        if conn.health == "down" && candidates.len() > 1 {
-            continue;
-        }
         let Ok(slot) = st
             .limits
             .for_connection(conn.id, conn.max_concurrent)

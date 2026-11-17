@@ -28,9 +28,10 @@ async fn test_state() -> State {
     }
 
     // Far above what any test in this file sends, so a test is not shaped by admission: as a result the main
-    // suite never exercises it, including its interaction with the failover test. The tests that check admission
-    // build their own state in tests/concurrency.rs. The time bounds are the ones the gateway runs with,
-    // because the mock answers long before either of them.
+    // suite only exercises it in the one test that fills a connection on purpose, through the capability that
+    // connection states, to see where the request goes next. The tests that check admission itself build their
+    // own state in tests/concurrency.rs. The time bounds are the ones the gateway runs with, because the mock
+    // answers long before either of them.
     let limits = limits::Limits::new(
         1024,
         1024,
@@ -1125,6 +1126,184 @@ async fn fails_over_to_a_healthy_connection() {
     let usage = recorded_usage(&st.pool).await;
     assert_eq!(usage[0]["connection_id"], healthy["id"]);
     assert_eq!(usage[0]["completion_tokens"], 7);
+}
+
+// The health a check would have written, set directly, so a test decides what the gateway reads without
+// waiting for a round.
+async fn mark_health(pool: &SqlitePool, connection: &Value, health: &str) {
+    sqlx::query("UPDATE connections SET health = ? WHERE id = ?")
+        .bind(health)
+        .bind(connection["id"].as_i64().unwrap())
+        .execute(pool)
+        .await
+        .unwrap();
+}
+
+// A check is only every 30 seconds, so a connection marked down may be answering again. When every connection
+// is marked down they are still tried in their order, rather than all skipped and the request answered as if
+// nothing could be reached.
+#[tokio::test]
+async fn connections_that_are_all_marked_down_are_still_tried() {
+    let st = test_state().await;
+    let router = build_router(st.clone());
+    let base_url = mock_upstream().await;
+    let cookie = register(&router, "ada").await;
+
+    // Nothing listens on port 1, so the first is down in fact; the second is marked down but answers.
+    let (_, dead) = post_json(
+        &router,
+        "/api/connections",
+        &cookie,
+        json!({ "name": "dead", "base_url": "http://127.0.0.1:1", "priority": 0 }),
+    )
+    .await;
+    let (_, stale) = post_json(
+        &router,
+        "/api/connections",
+        &cookie,
+        json!({ "name": "stale", "base_url": base_url, "default_model": "reports-usage", "priority": 1 }),
+    )
+    .await;
+    mark_health(&st.pool, &dead, "down").await;
+    mark_health(&st.pool, &stale, "down").await;
+    let (_, created) =
+        post_json(&router, "/api/keys", &cookie, json!({ "name": "test key" })).await;
+    let key = created["key"].as_str().unwrap().to_string();
+
+    let response = gateway_call(
+        &router,
+        &key,
+        json!({ "messages": [{ "role": "user", "content": "hi" }] }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let usage = recorded_usage(&st.pool).await;
+    assert_eq!(
+        usage.len(),
+        1,
+        "a request is one row, whichever connections it tried"
+    );
+    assert_eq!(usage[0]["connection_id"], stale["id"]);
+    assert_eq!(usage[0]["status"], 200);
+    assert_eq!(usage[0]["completion_tokens"], 7);
+}
+
+// Being tried last is what marked down means: a connection that is not marked down is asked first, even when
+// the one marked down has the better priority or is the one the key is bound to.
+#[tokio::test]
+async fn a_connection_that_is_up_is_tried_before_one_marked_down() {
+    let st = test_state().await;
+    let router = build_router(st.clone());
+    let base_url = mock_upstream().await;
+    let cookie = register(&router, "ada").await;
+
+    // Both answer, so the row says which one was asked first rather than which one was reachable.
+    let (_, stale) = post_json(
+        &router,
+        "/api/connections",
+        &cookie,
+        json!({ "name": "stale", "base_url": base_url, "default_model": "reports-usage", "priority": 0 }),
+    )
+    .await;
+    let (_, up) = post_json(
+        &router,
+        "/api/connections",
+        &cookie,
+        json!({ "name": "up", "base_url": base_url, "default_model": "reports-usage", "priority": 1 }),
+    )
+    .await;
+    mark_health(&st.pool, &stale, "down").await;
+    mark_health(&st.pool, &up, "ok").await;
+    let (_, free) = post_json(&router, "/api/keys", &cookie, json!({ "name": "free key" })).await;
+    let (_, bound) = post_json(
+        &router,
+        "/api/keys",
+        &cookie,
+        json!({ "name": "bound key", "connection_id": stale["id"] }),
+    )
+    .await;
+
+    for created in [&free, &bound] {
+        let response = gateway_call(
+            &router,
+            created["key"].as_str().unwrap(),
+            json!({ "messages": [{ "role": "user", "content": "hi" }] }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    let usage = recorded_usage(&st.pool).await;
+    assert_eq!(usage.len(), 2);
+    for row in &usage {
+        assert_eq!(row["connection_id"], up["id"]);
+    }
+}
+
+// A connection that is full is passed over as it always was, and one marked down is still a connection the
+// request can use, so it is asked rather than the request being answered as an overload. Only when it is full
+// as well is the request turned away, and then the answer names both.
+#[tokio::test]
+async fn a_full_connection_passes_the_request_on_to_one_marked_down() {
+    let st = test_state().await;
+    let router = build_router(st.clone());
+    let base_url = mock_upstream().await;
+    let cookie = register(&router, "ada").await;
+
+    let (_, busy) = post_json(
+        &router,
+        "/api/connections",
+        &cookie,
+        json!({ "name": "busy", "base_url": base_url, "default_model": "reports-usage", "priority": 0, "max_concurrent": 1 }),
+    )
+    .await;
+    let (_, stale) = post_json(
+        &router,
+        "/api/connections",
+        &cookie,
+        json!({ "name": "stale", "base_url": base_url, "default_model": "reports-usage", "priority": 1, "max_concurrent": 1 }),
+    )
+    .await;
+    mark_health(&st.pool, &busy, "ok").await;
+    mark_health(&st.pool, &stale, "down").await;
+    let (_, created) =
+        post_json(&router, "/api/keys", &cookie, json!({ "name": "test key" })).await;
+    let key = created["key"].as_str().unwrap().to_string();
+    let body = json!({ "messages": [{ "role": "user", "content": "hi" }] });
+
+    // The slot is taken from the semaphore the gateway admits by, so the connection is full without a request
+    // being held open on it.
+    let slot = |connection: &Value| {
+        st.limits
+            .for_connection(connection["id"].as_i64().unwrap(), Some(1))
+            .try_acquire_owned()
+            .unwrap()
+    };
+    let _busy_slot = slot(&busy);
+    let response = gateway_call(&router, &key, body.clone()).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let usage = recorded_usage(&st.pool).await;
+    assert_eq!(usage.len(), 1);
+    assert_eq!(usage[0]["connection_id"], stale["id"]);
+
+    let _stale_slot = slot(&stale);
+    let response = gateway_call(&router, &key, body).await;
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    let refused = json_body(response).await;
+    assert_eq!(refused["error"]["type"], "connection_full");
+    assert!(
+        refused["error"]["message"]
+            .as_str()
+            .unwrap()
+            .ends_with("busy, stale"),
+        "the answer names every connection that was full: {refused}"
+    );
+    assert_eq!(
+        recorded_usage(&st.pool).await.len(),
+        1,
+        "a request that reached no connection is not recorded"
+    );
 }
 
 // The round of health checks is started by the binary rather than by a route, so no other test reaches

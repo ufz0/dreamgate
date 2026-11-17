@@ -263,8 +263,9 @@ const MAX_HEALTH_CHECKS_AT_ONCE: usize = 8;
 
 // The rounds run for the life of the process and nothing waits on them, so a panic in one would end
 // health checking without a word: every connection would keep the health it had, and one marked down
-// would stay skipped. A round that stops is started again after the usual wait instead, and the reason
-// is logged. It runs in a JoinSet so that dropping this task, as a test does, takes the round with it.
+// would stay at the back of the order. A round that stops is started again after the usual wait instead,
+// and the reason is logged. It runs in a JoinSet so that dropping this task, as a test does, takes the
+// round with it.
 pub async fn health_checker(st: State) {
     loop {
         let mut round = JoinSet::new();

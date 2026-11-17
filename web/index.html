@@ -225,7 +225,7 @@
             <tbody id="connections-body"></tbody>
           </table>
         </div>
-        <p class="note">Checked every 30 seconds. A connection that fails at the transport level falls over to the next one.</p>
+        <p class="note">Checked every 30 seconds. A connection that fails at the transport level falls over to the next one. One marked down is not skipped: it is tried after every connection that is not, because it may be answering again.</p>
       </section>
 
       <section class="view" data-view="connect" hidden>
