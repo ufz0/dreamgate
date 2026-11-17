@@ -335,6 +335,11 @@ What an unauthenticated request can reach is the entry screen: `POST /api/regist
 - Adding, removing or checking a connection is an admin action in the API as well as in the page, and
   the key a connection carries is returned to an admin alone. A disabled account is refused at both
   gateway endpoints, not only at the completion path.
+- A key, its account and its limits are read from the database on every request, and a read that fails — a
+  write holding the database past the busy timeout, a disk that fails — answers 503 `unavailable` and is
+  logged, rather than letting the request through unchecked: a limit that could not be read is not a limit
+  that was not reached. Deleting an account deletes its keys, so a key whose account is already gone is
+  answered as a key that no longer exists.
 - Every statement takes its values as parameters; the only text put into a statement is a scope clause
   that comes from the code. Every value the page prints from the API is escaped on the way into the DOM.
 
@@ -375,7 +380,10 @@ on its own when an upstream reports it first, and leaving it only when its row
 arrives, which names the stream it settles, another account's stream listed for an admin and only counted for a
 member, who is sent its row's figures and nothing else, the connections routes being
 admin-only with the key a connection carries returned to an admin alone, the model list refusing a
-disabled account the same way the completion path does, sign-in attempts being bounded per account, a
+disabled account the same way the completion path does, a request refused rather than let through when its
+key's per-minute count, its cap or its account's day cannot be read, both gateway endpoints refusing a key
+whose account cannot be read and answering one whose account is gone as unknown, sign-in attempts being
+bounded per account, a
 session refused past the window the cookie lasts, the cookie marked Secure only when the request came
 over TLS, the migration of a usage table written before the prompt cache and timing columns — the rows
 already there keep their values and read as unknown, and a value already reported is carried across the

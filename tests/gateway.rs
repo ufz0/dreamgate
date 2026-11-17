@@ -1984,6 +1984,157 @@ async fn a_disabled_account_cannot_sign_in_or_use_its_key() {
     );
 }
 
+async fn models_call(router: &Router, key: &str) -> Response {
+    call(
+        router,
+        Request::get("/v1/models")
+            .header("authorization", format!("Bearer {key}"))
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await
+}
+
+// Dropping the usage table makes every limit read fail while the key and the account can still be
+// read, which is the shape of a database that is held or failing in the middle of a request. Each
+// key reaches a different read first: the per-minute count, the key's cap, and the account's day.
+#[tokio::test]
+async fn a_limit_that_cannot_be_read_refuses_the_request_rather_than_letting_it_through() {
+    let st = test_state().await;
+    let router = build_router(st.clone());
+    let base_url = mock_upstream().await;
+    let admin = register(&router, "ada").await;
+    post_json(
+        &router,
+        "/api/connections",
+        &admin,
+        json!({ "name": "test", "base_url": base_url, "default_model": "reports-usage" }),
+    )
+    .await;
+    let mut keys = Vec::new();
+    for body in [
+        json!({ "name": "rated", "rpm_limit": 100 }),
+        json!({ "name": "capped", "token_cap": 1000 }),
+        json!({ "name": "plain" }),
+    ] {
+        let (_, created) = post_json(&router, "/api/keys", &admin, body).await;
+        keys.push(created["key"].as_str().unwrap().to_string());
+    }
+    let me = get_json(&router, "/api/me", &admin).await;
+    let (status, _) = send_json(
+        &router,
+        http::Method::PATCH,
+        &format!("/api/users/{}", me["id"]),
+        &admin,
+        json!({ "daily_token_cap": 1000 }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    sqlx::query("DROP TABLE usage")
+        .execute(&st.pool)
+        .await
+        .unwrap();
+    for key in &keys {
+        let response = gateway_call(
+            &router,
+            key,
+            json!({ "messages": [{ "role": "user", "content": "hi" }] }),
+        )
+        .await;
+        assert_eq!(
+            response.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "a limit that could not be read is not taken as one that was not reached"
+        );
+        assert_eq!(json_body(response).await["error"]["type"], "unavailable");
+    }
+}
+
+// Renaming the account table makes the account read fail while the key read still works, so the
+// disabled-account check is the one that cannot be made, at both gateway endpoints.
+#[tokio::test]
+async fn an_account_that_cannot_be_read_is_not_taken_as_one_that_is_enabled() {
+    let st = test_state().await;
+    let router = build_router(st.clone());
+    let base_url = mock_upstream().await;
+    let admin = register(&router, "ada").await;
+    post_json(
+        &router,
+        "/api/connections",
+        &admin,
+        json!({ "name": "test", "base_url": base_url, "default_model": "reports-usage" }),
+    )
+    .await;
+    let (_, created) = post_json(&router, "/api/keys", &admin, json!({ "name": "plain" })).await;
+    let key = created["key"].as_str().unwrap().to_string();
+
+    sqlx::query("ALTER TABLE users RENAME TO users_unreadable")
+        .execute(&st.pool)
+        .await
+        .unwrap();
+    let response = gateway_call(
+        &router,
+        &key,
+        json!({ "messages": [{ "role": "user", "content": "hi" }] }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        models_call(&router, &key).await.status(),
+        StatusCode::SERVICE_UNAVAILABLE
+    );
+}
+
+// Deleting an account takes its keys with it, so a key whose account is already gone can only be
+// seen between the two. Foreign keys are switched off on the test's one connection to hold that
+// moment still.
+#[tokio::test]
+async fn a_key_whose_account_is_gone_is_answered_as_a_key_that_no_longer_exists() {
+    let st = test_state().await;
+    let router = build_router(st.clone());
+    let base_url = mock_upstream().await;
+    let admin = register(&router, "ada").await;
+    post_json(
+        &router,
+        "/api/connections",
+        &admin,
+        json!({ "name": "test", "base_url": base_url, "default_model": "reports-usage" }),
+    )
+    .await;
+    let (_, created) = post_json(&router, "/api/keys", &admin, json!({ "name": "plain" })).await;
+    let key = created["key"].as_str().unwrap().to_string();
+
+    sqlx::query("PRAGMA foreign_keys = OFF")
+        .execute(&st.pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM users")
+        .execute(&st.pool)
+        .await
+        .unwrap();
+    let response = gateway_call(
+        &router,
+        &key,
+        json!({ "messages": [{ "role": "user", "content": "hi" }] }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        json_body(response).await["error"]["type"],
+        "invalid_api_key"
+    );
+    assert_eq!(
+        models_call(&router, &key).await.status(),
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        count(&st.pool, "usage").await,
+        0,
+        "nothing reached an upstream"
+    );
+}
+
 #[tokio::test]
 async fn an_admin_can_rename_an_account_and_set_a_new_password() {
     let st = test_state().await;

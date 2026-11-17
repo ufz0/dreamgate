@@ -45,17 +45,15 @@ fn virtual_key(headers: &HeaderMap) -> Option<String> {
         .map(|v| v.trim().to_string())
 }
 
-async fn lookup_key(st: &State, raw: &str) -> Option<KeyInfo> {
+async fn lookup_key(st: &State, raw: &str) -> Result<Option<KeyInfo>, sqlx::Error> {
     let row = sqlx::query(
         "SELECT id, user_id, name, connection_id, model, enabled, rpm_limit, token_cap \
          FROM api_keys WHERE key = ?",
     )
     .bind(raw)
     .fetch_optional(&st.pool)
-    .await
-    .ok()
-    .flatten()?;
-    Some(KeyInfo {
+    .await?;
+    Ok(row.map(|row| KeyInfo {
         id: row.get::<i64, _>("id"),
         user_id: row.get::<i64, _>("user_id"),
         name: row.get::<String, _>("name"),
@@ -64,18 +62,40 @@ async fn lookup_key(st: &State, raw: &str) -> Option<KeyInfo> {
         enabled: row.get::<i64, _>("enabled") != 0,
         rpm_limit: row.get::<Option<i64>, _>("rpm_limit"),
         token_cap: row.get::<Option<i64>, _>("token_cap"),
-    })
+    }))
+}
+
+fn unknown_key() -> Response {
+    error(
+        StatusCode::UNAUTHORIZED,
+        "invalid_api_key",
+        "unknown virtual key",
+    )
+}
+
+// The key, its account and its limits are read on every request, and a read that fails (a write
+// holding the database past the busy timeout, a disk that fails) refuses the request. A limit that
+// could not be read is not a limit that was not reached: letting the request through would let a
+// disabled account, or a key past its cap, reach an upstream whenever the database was slow. The
+// answer is 503 because the refusal is the gateway's and passes, so a client that retries is right to.
+fn unreadable(err: sqlx::Error) -> Response {
+    tracing::error!("a key, its account or its limits could not be read: {err}");
+    error(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "unavailable",
+        "the gateway could not read this key's account and limits; try again",
+    )
 }
 
 // A disabled account cannot use a key at all. Both gateway endpoints read the account the same
-// way, so a key on its own cannot reach an upstream for an account that is turned off.
-async fn account_row(st: &State, user_id: i64) -> Option<SqliteRow> {
+// way, so a key on its own cannot reach an upstream for an account that is turned off. Deleting an
+// account deletes its keys with it, so a key whose account is gone is a key that is being deleted,
+// and both endpoints answer it the way they answer a key that no longer exists.
+async fn account_row(st: &State, user_id: i64) -> Result<Option<SqliteRow>, sqlx::Error> {
     sqlx::query("SELECT username, enabled, daily_token_cap FROM users WHERE id = ?")
         .bind(user_id)
         .fetch_optional(&st.pool)
         .await
-        .ok()
-        .flatten()
 }
 
 fn disabled_account(row: &SqliteRow) -> Option<Response> {
@@ -91,15 +111,17 @@ fn disabled_account(row: &SqliteRow) -> Option<Response> {
 
 async fn enforce_limits(st: &State, key: &KeyInfo) -> Option<Response> {
     if let Some(limit) = key.rpm_limit {
-        let recent = sqlx::query(
+        let recent = match sqlx::query(
             "SELECT COUNT(*) AS n FROM usage WHERE api_key_id = ? \
              AND strftime('%Y-%m-%d %H:%M:%S', created_at) >= datetime('now', '-1 minute')",
         )
         .bind(key.id)
         .fetch_one(&st.pool)
         .await
-        .map(|row| row.get::<i64, _>("n"))
-        .unwrap_or(0);
+        {
+            Ok(row) => row.get::<i64, _>("n"),
+            Err(err) => return Some(unreadable(err)),
+        };
         if recent >= limit {
             return Some(error(
                 StatusCode::TOO_MANY_REQUESTS,
@@ -112,14 +134,16 @@ async fn enforce_limits(st: &State, key: &KeyInfo) -> Option<Response> {
         }
     }
     if let Some(cap) = key.token_cap {
-        let used = sqlx::query(
+        let used = match sqlx::query(
             "SELECT COALESCE(SUM(total_tokens), 0) AS used FROM usage WHERE api_key_id = ?",
         )
         .bind(key.id)
         .fetch_one(&st.pool)
         .await
-        .map(|row| row.get::<i64, _>("used"))
-        .unwrap_or(0);
+        {
+            Ok(row) => row.get::<i64, _>("used"),
+            Err(err) => return Some(unreadable(err)),
+        };
         if used >= cap {
             return Some(error(
                 StatusCode::TOO_MANY_REQUESTS,
@@ -135,20 +159,26 @@ async fn enforce_limits(st: &State, key: &KeyInfo) -> Option<Response> {
     // all. The account limit counts the current day only and resets at 00:00 UTC, matching the
     // UTC text the usage rows are stored as. It is checked after the key cap, so a key cannot
     // be used to work around it.
-    let account = account_row(st, key.user_id).await?;
+    let account = match account_row(st, key.user_id).await {
+        Ok(Some(account)) => account,
+        Ok(None) => return Some(unknown_key()),
+        Err(err) => return Some(unreadable(err)),
+    };
     if let Some(blocked) = disabled_account(&account) {
         return Some(blocked);
     }
     if let Some(cap) = account.get::<Option<i64>, _>("daily_token_cap") {
-        let used = sqlx::query(
+        let used = match sqlx::query(
             "SELECT COALESCE(SUM(total_tokens), 0) AS used FROM usage \
              WHERE user_id = ? AND strftime('%Y-%m-%d', created_at) = date('now')",
         )
         .bind(key.user_id)
         .fetch_one(&st.pool)
         .await
-        .map(|row| row.get::<i64, _>("used"))
-        .unwrap_or(0);
+        {
+            Ok(row) => row.get::<i64, _>("used"),
+            Err(err) => return Some(unreadable(err)),
+        };
         if used >= cap {
             return Some(error(
                 StatusCode::TOO_MANY_REQUESTS,
@@ -489,12 +519,10 @@ pub async fn chat_completions(
             "missing Authorization: Bearer <virtual key>",
         );
     };
-    let Some(key) = lookup_key(&st, &raw).await else {
-        return error(
-            StatusCode::UNAUTHORIZED,
-            "invalid_api_key",
-            "unknown virtual key",
-        );
+    let key = match lookup_key(&st, &raw).await {
+        Ok(Some(key)) => key,
+        Ok(None) => return unknown_key(),
+        Err(err) => return unreadable(err),
     };
     if !key.enabled {
         return error(
@@ -736,12 +764,10 @@ pub async fn list_models(AxumState(st): AxumState<State>, headers: HeaderMap) ->
             "missing Authorization: Bearer <virtual key>",
         );
     };
-    let Some(key) = lookup_key(&st, &raw).await else {
-        return error(
-            StatusCode::UNAUTHORIZED,
-            "invalid_api_key",
-            "unknown virtual key",
-        );
+    let key = match lookup_key(&st, &raw).await {
+        Ok(Some(key)) => key,
+        Ok(None) => return unknown_key(),
+        Err(err) => return unreadable(err),
     };
     if !key.enabled {
         return error(
@@ -750,12 +776,14 @@ pub async fn list_models(AxumState(st): AxumState<State>, headers: HeaderMap) ->
             "this key is disabled",
         );
     }
-    if let Some(blocked) = account_row(&st, key.user_id)
-        .await
-        .as_ref()
-        .and_then(disabled_account)
-    {
-        return blocked;
+    match account_row(&st, key.user_id).await {
+        Ok(Some(account)) => {
+            if let Some(blocked) = disabled_account(&account) {
+                return blocked;
+            }
+        }
+        Ok(None) => return unknown_key(),
+        Err(err) => return unreadable(err),
     }
     let Some(conn) = registry::candidates(&st, key.connection_id)
         .await
