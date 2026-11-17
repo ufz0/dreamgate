@@ -510,7 +510,7 @@ function areaChart(buckets) {
     .filter((_, i) => i % 4 === 0)
     .map((b, i) => `<text class="axis" x="${(10 + i * 4 * step).toFixed(1)}" y="${height - 6}">${b.label}</text>`)
     .join('');
-  return svg(`${grid}<path class="area" d="${area}"/><path class="line" d="${line}"/>${labels}`, height, `Peak ${nf.format(max)} tokens in an hour`);
+  return svg(`${grid}<path class="area" d="${area}"/><path class="line" d="${line}"/>${labels}`, height, `Peak ${nf.format(max)} input and output tokens in an hour`);
 }
 
 function barChart(buckets) {
@@ -572,7 +572,7 @@ function renderGate() {
     'last request',
     `<b>${esc(last.created_at.slice(11, 19))}</b>`,
     esc(last.model || 'no model'),
-    `${nf.format(last.total_tokens)} tokens`,
+    `${nf.format(last.prompt_tokens)} input and ${nf.format(last.completion_tokens)} output tokens`,
     `<span class="${last.status >= 400 ? 'danger' : ''}">${esc(last.status)}</span>`,
   ].join(' ');
 }
@@ -626,7 +626,7 @@ function renderSupport(t) {
     ['Requests today', nf.format(t.today_requests || 0)],
     [
       'Tokens today (input + output)',
-      `${nf.format(t.today_tokens || 0)} — ${nf.format(t.today_prompt_tokens || 0)} in, ${nf.format(t.today_completion_tokens || 0)} generated`,
+      `${nf.format(t.today_tokens || 0)} — ${nf.format(t.today_prompt_tokens || 0)} input, ${nf.format(t.today_completion_tokens || 0)} output`,
     ],
     ['Average latency', `${nf.format(t.avg_latency_ms || 0)} ms`],
     ['Errors (status 400 or worse)', nf.format(t.errors || 0)],
@@ -639,7 +639,7 @@ function renderSupport(t) {
     rows.push(['Average prompt processing', `${nf.format(t.avg_prompt_ms)} ms`]);
   }
   if (t.generation_tokens_per_second !== null && t.generation_tokens_per_second !== undefined) {
-    rows.push(['Average generation speed', `${nf.format(t.generation_tokens_per_second)} tokens/s`]);
+    rows.push(['Average generation speed', `${nf.format(t.generation_tokens_per_second)} output tokens/s`]);
   }
   $('support').innerHTML = rows
     .map(([label, value]) => `<div class="row"><dt>${esc(label)}</dt><dd>${esc(value)}</dd></div>`)
@@ -671,17 +671,19 @@ function renderCharts() {
 // An admin's stream carries every account's requests, and anyone else's only their own, so the heading
 // says which of the two the feed is.
 // A stream still running is a row of its own above the recorded ones, with live in place of a status it
-// does not have yet. Its tokens are the input and what has been generated so far, which is what the
-// column counts for a recorded row, and a ~ marks them while they are the gateway's estimate.
+// does not have yet. Its tokens are the input and what has been generated so far, in the same two columns
+// a recorded row fills, and a ~ marks both while they are the gateway's estimate, because one flag covers
+// the pair.
 function streamRow(stream) {
-  const tokens = num(stream.prompt_tokens) + num(stream.completion_tokens);
   const how = stream.estimated ? 'Estimated by the gateway until the request is recorded' : 'As the upstream has reported so far';
+  const mark = stream.estimated ? '~' : '';
   return `<li class="inflight">
     <span>${esc(stream.started_at.slice(11, 19))}</span>
     <span>${esc(stream.key)}</span>
     <span>${esc(stream.model || 'no model')}</span>
     <span>live</span>
-    <span class="tokens" title="${how}">${stream.estimated ? '~' : ''}${nf.format(tokens)}</span>
+    <span class="tokens" title="${how}">${mark}${nf.format(num(stream.prompt_tokens))}</span>
+    <span class="tokens" title="${how}">${mark}${nf.format(num(stream.completion_tokens))}</span>
   </li>`;
 }
 
@@ -700,7 +702,8 @@ function renderFeed(arrived) {
           <span>${esc(keyLabel(event))}</span>
           <span>${esc(event.model || 'no model')}</span>
           <span class="${event.status >= 400 ? 'danger' : ''}">${esc(event.status)}</span>
-          <span class="tokens">${nf.format(event.total_tokens)}</span>
+          <span class="tokens">${nf.format(event.prompt_tokens)}</span>
+          <span class="tokens">${nf.format(event.completion_tokens)}</span>
         </li>`,
     )
     .join('');
@@ -719,7 +722,7 @@ function renderActivity() {
   $('activity-lede').textContent = `${
     admin ? 'The last 50 requests that crossed the gate from every account' : 'The last 50 requests this account sent through the gate'
   }, newest first, with what each cost. New rows arrive as they happen. Times are UTC.`;
-  const columns = ['Time', 'Key', admin ? 'Account' : null, 'Model', 'Tokens', 'Latency', 'Status'].filter(Boolean);
+  const columns = ['Time', 'Key', admin ? 'Account' : null, 'Model', 'Input tokens', 'Output tokens', 'Latency', 'Status'].filter(Boolean);
   $('activity-head').innerHTML = `<tr>${columns.map((c) => `<th>${esc(c)}</th>`).join('')}</tr>`;
 
   $('activity-body').innerHTML = state.events.length
@@ -731,7 +734,8 @@ function renderActivity() {
               <td><span class="clamp">${esc(keyLabel(event))}</span></td>
               ${admin ? `<td><span class="clamp">${esc(event.user)}</span></td>` : ''}
               <td><span class="clamp">${esc(event.model || 'no model')}</span></td>
-              <td class="num">${nf.format(event.total_tokens)}</td>
+              <td class="num">${nf.format(event.prompt_tokens)}</td>
+              <td class="num">${nf.format(event.completion_tokens)}</td>
               <td class="num">${nf.format(event.latency_ms)} ms</td>
               <td class="num${event.status >= 400 ? ' danger' : ''}">${esc(event.status)}</td>
             </tr>`,
@@ -743,10 +747,10 @@ function renderActivity() {
     ? state.summary.models
         .map(
           (model) =>
-            `<tr><td><span class="clamp">${esc(model.model)}</span></td><td class="num">${nf.format(model.requests)}</td><td class="num">${nf.format(model.tokens)}</td></tr>`,
+            `<tr><td><span class="clamp">${esc(model.model)}</span></td><td class="num">${nf.format(model.requests)}</td><td class="num">${nf.format(model.prompt_tokens)}</td><td class="num">${nf.format(model.completion_tokens)}</td></tr>`,
         )
         .join('')
-    : `<tr><td colspan="3">No model has been used yet. Add a connection, then send a request with a key.</td></tr>`;
+    : `<tr><td colspan="4">No model has been used yet. Add a connection, then send a request with a key.</td></tr>`;
 }
 
 // Keys
@@ -777,9 +781,10 @@ function keyRow(key, showOwner) {
     <td><span class="clamp" title="${esc(key.key)}">${esc(key.name)}</span></td>
     <td>${binding}</td>
     <td>${esc(keyModel(key, bound))}</td>
-    <td>${key.rpm_limit ? `${key.rpm_limit}/min` : 'no rate limit'}<br>${key.token_cap ? `${nf.format(key.token_cap)} tokens` : 'no token cap'}</td>
+    <td>${key.rpm_limit ? `${key.rpm_limit}/min` : 'no rate limit'}<br>${key.token_cap ? `${nf.format(key.token_cap)} input + output tokens` : 'no token cap'}</td>
     <td class="num">${nf.format(key.requests)}</td>
-    <td class="num">${nf.format(key.tokens)}</td>
+    <td class="num">${nf.format(key.prompt_tokens)}</td>
+    <td class="num">${nf.format(key.completion_tokens)}</td>
     <td class="num">
       <button class="link" data-copy="${esc(key.key)}">Copy key</button>
       <button class="link" data-toggle="${key.id}" data-enabled="${key.enabled}">${key.enabled ? 'Disable' : 'Enable'}</button>
@@ -801,7 +806,7 @@ function renderKeys() {
   $('other-keys-field').hidden = !admin;
   $('keys-body').innerHTML = state.keys.length
     ? state.keys.map((key) => keyRow(key, false)).join('')
-    : `<tr><td colspan="7">No key yet. Create one above, then use it as the Bearer token, or as x-api-key, against /v1/chat/completions.</td></tr>`;
+    : `<tr><td colspan="8">No key yet. Create one above, then use it as the Bearer token, or as x-api-key, against /v1/chat/completions.</td></tr>`;
 
   renderMenu($('connection-menu'), 'connection', connectionOptions(), $('connection-menu').dataset.value || '', 'Connection');
   if (!admin) return;
@@ -1056,7 +1061,8 @@ function renderAccounts() {
             </td>
             <td class="num">${nf.format(user.used_today)}${over ? ' <span class="danger">over</span>' : ''}</td>
             <td class="num">${nf.format(user.requests)}</td>
-            <td class="num">${nf.format(user.tokens)}</td>
+            <td class="num">${nf.format(user.prompt_tokens)}</td>
+            <td class="num">${nf.format(user.completion_tokens)}</td>
             <td class="num">
               ${user.pending ? `<button class="link" data-approve="${user.id}">Approve</button>` : ''}
               <button class="link" data-status="${user.id}" data-enabled="${user.enabled}">${disabled ? 'Enable' : 'Disable'}</button>
@@ -1065,7 +1071,7 @@ function renderAccounts() {
           </tr>`;
         })
         .join('')
-    : '<tr><td colspan="6">No account yet. The first account to register becomes the admin.</td>';
+    : '<tr><td colspan="7">No account yet. The first account to register becomes the admin.</td>';
 }
 
 // The settings on this page are for an admin: whether anyone may register, whether a new account

@@ -70,10 +70,12 @@
         <h1>Overview</h1>
         <div class="readout-pair">
           <div>
+            <p class="readout-label">Output tokens</p>
             <p class="readout" id="generated-tokens">0</p>
             <p class="readout-note" id="global-generated-note">what the models generated for every account and key</p>
           </div>
           <div>
+            <p class="readout-label">Input tokens</p>
             <p class="readout" id="global-input-tokens">0</p>
             <p class="readout-note" id="global-input-note">what every account and key sent in</p>
           </div>
@@ -90,10 +92,12 @@
 
         <div class="readout-pair">
           <div>
+            <p class="readout-label">Output tokens</p>
             <p class="readout" id="account-generated-tokens">0</p>
             <p class="readout-note" id="account-generated-note">what the models generated for this account</p>
           </div>
           <div>
+            <p class="readout-label">Input tokens</p>
             <p class="readout" id="account-input-tokens">0</p>
             <p class="readout-note" id="account-input-note">what this account sent in</p>
           </div>
@@ -114,7 +118,7 @@
 
         <h2 id="feed-title">Live traffic</h2>
         <div class="feed-scroll">
-          <div class="feed-head" id="feed-head"><span>Time</span><span>Key</span><span>Model</span><span>Status</span><span class="tokens">Tokens</span></div>
+          <div class="feed-head" id="feed-head"><span>Time</span><span>Key</span><span>Model</span><span>Status</span><span class="tokens">Input tokens</span><span class="tokens">Output tokens</span></div>
           <ul class="feed" id="feed" aria-live="polite"></ul>
         </div>
       </section>
@@ -128,10 +132,10 @@
             <tbody id="activity-body"></tbody>
           </table>
         </div>
-        <h2>Usage by model, the eight with the most tokens</h2>
+        <h2>Usage by model, the eight with the most tokens, input and output together</h2>
         <div class="table">
           <table id="models">
-            <thead><tr><th>Model</th><th>Requests</th><th>Tokens</th></tr></thead>
+            <thead><tr><th>Model</th><th>Requests</th><th>Input tokens</th><th>Output tokens</th></tr></thead>
             <tbody id="models-body"></tbody>
           </table>
         </div>
@@ -159,7 +163,7 @@
             <label class="field">Requests per minute<input name="rpm_limit" type="number" min="1"></label>
             <div class="field">
               <label for="key-token-cap">Token cap</label>
-              <p class="help" id="key-token-cap-help">Counted against everything this key has already used, so it does not reset. An account's daily limit, which an admin sets, counts one day and applies on top of it.</p>
+              <p class="help" id="key-token-cap-help">Counted against the input and output tokens this key has already used, together, so it does not reset. An account's daily limit, which an admin sets, counts one day and applies on top of it.</p>
               <input id="key-token-cap" name="token_cap" type="number" min="1" aria-describedby="key-token-cap-help">
             </div>
           </div>
@@ -168,7 +172,7 @@
         <div class="table">
           <table id="keys">
             <thead>
-              <tr><th>Key</th><th>Connection</th><th>Model</th><th>Limits</th><th>Requests</th><th>Tokens</th><th><span class="visually-hidden">Actions</span></th></tr>
+              <tr><th>Key</th><th>Connection</th><th>Model</th><th>Limits</th><th>Requests</th><th>Input tokens</th><th>Output tokens</th><th><span class="visually-hidden">Actions</span></th></tr>
             </thead>
             <tbody id="keys-body"></tbody>
           </table>
@@ -182,7 +186,7 @@
         <div class="table" id="other-keys-table" hidden>
           <table id="other-keys">
             <thead>
-              <tr><th>Account</th><th>Key</th><th>Connection</th><th>Model</th><th>Limits</th><th>Requests</th><th>Tokens</th><th><span class="visually-hidden">Actions</span></th></tr>
+              <tr><th>Account</th><th>Key</th><th>Connection</th><th>Model</th><th>Limits</th><th>Requests</th><th>Input tokens</th><th>Output tokens</th><th><span class="visually-hidden">Actions</span></th></tr>
             </thead>
             <tbody id="other-keys-body"></tbody>
           </table>
@@ -273,7 +277,7 @@
 
       <section class="view" data-view="accounts" hidden>
         <h1>Accounts</h1>
-        <p class="lede">The daily limit counts what an account used today and resets at 00:00 UTC; a key can have its own cap, which does not reset, and the account limit applies on top of it. Disabling an account signs it out and its keys stop working. The account you are signed in with cannot be deleted.</p>
+        <p class="lede">The daily limit counts the input and output tokens an account used today, together, and resets at 00:00 UTC; a key can have its own cap, which does not reset, and the account limit applies on top of it. Disabling an account signs it out and its keys stop working. The account you are signed in with cannot be deleted.</p>
         <div class="field" id="registration-field" hidden>
           <span>Self-registration</span>
           <p class="help">Closed as soon as the first account exists. While it is open, anyone can register.</p>
@@ -295,7 +299,7 @@
         </form>
         <div class="table">
           <table id="accounts">
-            <thead><tr><th>Account</th><th>Daily limit</th><th>Used today</th><th>Requests</th><th>Tokens</th><th><span class="visually-hidden">Actions</span></th></tr></thead>
+            <thead><tr><th>Account</th><th>Daily limit</th><th>Used today (input + output)</th><th>Requests</th><th>Input tokens</th><th>Output tokens</th><th><span class="visually-hidden">Actions</span></th></tr></thead>
             <tbody id="accounts-body"></tbody>
           </table>
         </div>

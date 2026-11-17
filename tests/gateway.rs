@@ -1395,6 +1395,112 @@ async fn the_keys_list_is_the_callers_own_and_only_an_admin_can_read_the_others(
 }
 
 #[tokio::test]
+async fn the_key_account_and_model_figures_carry_the_input_and_the_output_apart() {
+    let st = test_state().await;
+    let router = build_router(st.clone());
+    let base_url = mock_upstream().await;
+    let admin = register(&router, "ada").await;
+    post_json(
+        &router,
+        "/api/connections",
+        &admin,
+        json!({ "name": "test", "base_url": base_url, "default_model": "reports-usage" }),
+    )
+    .await;
+    open_registration(&router, &admin).await;
+    no_approval(&router, &admin).await;
+    let member = register(&router, "ben").await;
+
+    // The mock reports 11 tokens in and 7 out for every request.
+    let (_, used) = post_json(&router, "/api/keys", &admin, json!({ "name": "used" })).await;
+    post_json(&router, "/api/keys", &admin, json!({ "name": "unused" })).await;
+    let (_, member_key) = post_json(
+        &router,
+        "/api/keys",
+        &member,
+        json!({ "name": "member key" }),
+    )
+    .await;
+    for key in [&used, &used, &member_key] {
+        gateway_call(
+            &router,
+            key["key"].as_str().unwrap(),
+            json!({ "messages": [{ "role": "user", "content": "hi" }] }),
+        )
+        .await;
+    }
+
+    let own = get_json(&router, "/api/keys", &admin).await;
+    let named = |list: &Value, name: &str| {
+        list["keys"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|key| key["name"] == name)
+            .cloned()
+            .unwrap()
+    };
+    let key = named(&own, "used");
+    assert_eq!(key["prompt_tokens"], 22);
+    assert_eq!(key["completion_tokens"], 14);
+    assert_eq!(key["tokens"], 36, "the total a key's cap counts stays");
+    let idle = named(&own, "unused");
+    assert_eq!(
+        (&idle["prompt_tokens"], &idle["completion_tokens"]),
+        (&json!(0), &json!(0)),
+        "a key that has not been used reads zero on both sides, not null"
+    );
+    let others = get_json(&router, "/api/keys/others", &admin).await;
+    let theirs = named(&others, "member key");
+    assert_eq!(theirs["prompt_tokens"], 11);
+    assert_eq!(theirs["completion_tokens"], 7);
+
+    let summary = get_json(&router, "/api/stats/summary", &admin).await;
+    let models = summary["models"].as_array().unwrap();
+    assert_eq!(models.len(), 1);
+    assert_eq!(models[0]["prompt_tokens"], 33);
+    assert_eq!(models[0]["completion_tokens"], 21);
+    assert_eq!(models[0]["tokens"], 54);
+    let member_summary = get_json(&router, "/api/stats/summary", &member).await;
+    assert_eq!(
+        member_summary["models"][0]["prompt_tokens"], 11,
+        "a member's models are their own"
+    );
+    assert_eq!(member_summary["models"][0]["completion_tokens"], 7);
+
+    // A recorded request outlives its key, so the account's split stands when the key goes.
+    let (status, _) = send_json(
+        &router,
+        http::Method::DELETE,
+        &format!("/api/keys/{}", used["id"]),
+        &admin,
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let summary = get_json(&router, "/api/stats/summary", &admin).await;
+    let account = |name: &str| {
+        summary["users"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|user| user["username"] == name)
+            .cloned()
+            .unwrap()
+    };
+    let ada = account("ada");
+    assert_eq!(ada["prompt_tokens"], 22);
+    assert_eq!(ada["completion_tokens"], 14);
+    assert_eq!(
+        ada["used_today"], 36,
+        "the day figure is the input and the output together, as the daily limit counts it"
+    );
+    let ben = account("ben");
+    assert_eq!(ben["prompt_tokens"], 11);
+    assert_eq!(ben["completion_tokens"], 7);
+}
+
+#[tokio::test]
 async fn deleting_a_key_leaves_the_usage_recorded_for_it() {
     let st = test_state().await;
     let router = build_router(st.clone());
