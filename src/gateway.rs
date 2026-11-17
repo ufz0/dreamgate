@@ -92,7 +92,8 @@ fn unreadable(err: sqlx::Error) -> Response {
 // error, without the address. The log is where an admin looks for why, so it gets the whole chain of
 // causes — refused, a name that did not resolve, a certificate, a timeout — which the first line
 // leaves out.
-fn upstream_failed(conn: &Connection, err: &(dyn std::error::Error + 'static)) {
+fn upstream_failed(st: &State, conn: &Connection, err: &(dyn std::error::Error + 'static)) {
+    st.metrics.upstream_failure(&conn.name);
     let mut causes = err.to_string();
     let mut source = err.source();
     while let Some(cause) = source {
@@ -389,7 +390,9 @@ fn drain_buffer(buffer: &mut Vec<u8>, generated: &mut String, report: &mut Repor
 }
 
 async fn record(st: &State, row: &UsageRow) {
+    st.metrics.recorded(row);
     if let Err(err) = usage::record(st, row).await {
+        st.metrics.usage_write_failure();
         tracing::error!("usage record failed: {err}");
     }
 }
@@ -439,6 +442,7 @@ fn stream_body(
                 Ok(Some(chunk)) => chunk,
                 Ok(None) => break,
                 Err(_) => {
+                    ctx.st.metrics.stream_stall();
                     tracing::warn!(
                         "upstream went quiet for {stall:?} and the stream was closed: {}",
                         ctx.model
@@ -477,7 +481,7 @@ fn stream_body(
                 }
                 Err(err) => {
                     let err = err.without_url();
-                    upstream_failed(&ctx.conn, &err);
+                    upstream_failed(&ctx.st, &ctx.conn, &err);
                     let _ = tx.send(Err(BoxError::from(err))).await;
                     break;
                 }
@@ -648,7 +652,7 @@ pub async fn chat_completions(
         let upstream = match sent {
             Ok(upstream) => upstream,
             Err(err) => {
-                upstream_failed(conn, &*err);
+                upstream_failed(&st, conn, &*err);
                 last_error = format!("{}: {err}", conn.name);
                 continue;
             }
@@ -685,7 +689,7 @@ pub async fn chat_completions(
             Ok(bytes) => bytes,
             Err(err) => {
                 let err = err.without_url();
-                upstream_failed(conn, &err);
+                upstream_failed(&st, conn, &err);
                 last_error = format!("{}: {err}", conn.name);
                 continue;
             }
@@ -861,7 +865,7 @@ pub async fn list_models(AxumState(st): AxumState<State>, headers: HeaderMap) ->
                 Ok(bytes) => bytes,
                 Err(err) => {
                     let err = err.without_url();
-                    upstream_failed(&conn, &err);
+                    upstream_failed(&st, &conn, &err);
                     return error(
                         StatusCode::BAD_GATEWAY,
                         "upstream_unavailable",
@@ -881,7 +885,7 @@ pub async fn list_models(AxumState(st): AxumState<State>, headers: HeaderMap) ->
         // As on the completion path, the connection is named and its address is not.
         Err(err) => {
             let err = err.without_url();
-            upstream_failed(&conn, &err);
+            upstream_failed(&st, &conn, &err);
             error(
                 StatusCode::BAD_GATEWAY,
                 "upstream_unavailable",

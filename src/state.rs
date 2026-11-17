@@ -7,6 +7,7 @@ use tokio::sync::broadcast;
 
 use crate::limits::Limits;
 use crate::live::HubEvent;
+use crate::metrics::Metrics;
 use crate::presence::Presence;
 
 pub type Hub = broadcast::Sender<HubEvent>;
@@ -26,4 +27,6 @@ pub struct State {
     // Admission for the gateway as a whole and for each connection, so one full connection cannot make
     // unrelated requests wait.
     pub limits: Arc<Limits>,
+    // What `/metrics` reports about this run of the process.
+    pub metrics: Arc<Metrics>,
 }

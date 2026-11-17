@@ -1,14 +1,17 @@
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::Path;
 
-use dreamgate::{build_router, db, limits, live, registry, state};
+use dreamgate::{build_router, db, limits, live, metrics, registry, state};
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::filter::LevelFilter;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Coloured only on a terminal: written to a file or to the journal, the colour codes are noise in
+    // every line.
     tracing_subscriber::fmt()
         .with_env_filter(log_filter(std::env::var("RUST_LOG").ok().as_deref()))
+        .with_ansi(std::io::IsTerminal::is_terminal(&std::io::stdout()))
         .init();
 
     let database =
@@ -34,6 +37,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         presence: Default::default(),
         attempts: Default::default(),
         limits,
+        metrics: std::sync::Arc::new(metrics::Metrics::new(
+            std::env::var("DREAMGATE_METRICS_TOKEN").ok(),
+        )),
     };
 
     tokio::spawn(registry::health_checker(st.clone()));

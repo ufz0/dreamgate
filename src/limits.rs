@@ -29,9 +29,9 @@ pub struct Limits {
     stream_stall: Duration,
     connect_timeout: Duration,
     // One semaphore per connection, kept for the life of the process, so the count belongs to the connection
-    // rather than to the request that first looked it up. A plain mutex: looking one up is a hashmap read
-    // and nothing here awaits inside it.
-    per_connection: Mutex<HashMap<i64, Arc<Semaphore>>>,
+    // rather than to the request that first looked it up, with the number it was made with. A plain mutex:
+    // looking one up is a hashmap read and nothing here awaits inside it.
+    per_connection: Mutex<HashMap<i64, (usize, Arc<Semaphore>)>>,
 }
 
 pub fn from_env() -> Limits {
@@ -113,17 +113,33 @@ impl Limits {
         self.global_size
     }
 
+    // How many requests hold a slot of the gateway as a whole right now.
+    pub fn in_flight(&self) -> usize {
+        self.global_size
+            .saturating_sub(self.global.available_permits())
+    }
+
+    // How many requests hold a slot of one connection right now, for a connection a request has reached
+    // since the start; one that nothing has asked yet has no count rather than a count of zero it was
+    // never given.
+    pub fn connection_in_flight(&self, id: i64) -> Option<usize> {
+        let semaphores = self.per_connection.lock().expect("semaphore map");
+        semaphores
+            .get(&id)
+            .map(|(limit, semaphore)| limit.saturating_sub(semaphore.available_permits()))
+    }
+
     // A connection that states no capability is admitted by the default. The number is fixed when the
     // semaphore is first made for it, so changing a stored value takes effect on the next start: a
     // semaphore that has already handed out permits cannot be resized.
     pub fn for_connection(&self, id: i64, cap: Option<i64>) -> Arc<Semaphore> {
         let limit = cap.unwrap_or(self.default as i64).max(1) as usize;
         let mut semaphores = self.per_connection.lock().expect("semaphore map");
-        if let Some(existing) = semaphores.get(&id) {
+        if let Some((_, existing)) = semaphores.get(&id) {
             return existing.clone();
         }
         let semaphore = Arc::new(Semaphore::new(limit));
-        semaphores.insert(id, semaphore.clone());
+        semaphores.insert(id, (limit, semaphore.clone()));
         semaphore
     }
 

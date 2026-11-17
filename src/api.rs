@@ -7,11 +7,17 @@ use serde_json::json;
 use uuid::Uuid;
 
 pub fn error(status: StatusCode, kind: &str, message: impl Into<String>) -> Response {
-    (
+    let mut response = (
         status,
         Json(json!({ "error": { "message": message.into(), "type": kind } })),
     )
-        .into_response()
+        .into_response();
+    // The type rides on the response as well as in its body, so the count of answers can say why a
+    // request was refused without reading the body back.
+    response
+        .extensions_mut()
+        .insert(crate::metrics::ErrorType(kind.to_string()));
+    response
 }
 
 // A failure inside the server is answered with a sentence and a reference rather than with its own

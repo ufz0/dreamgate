@@ -62,6 +62,7 @@ async fn test_state(limits: limits::Limits, pool: u32) -> State {
         presence: Default::default(),
         attempts: Default::default(),
         limits: Arc::new(limits),
+        metrics: Default::default(),
     }
 }
 
