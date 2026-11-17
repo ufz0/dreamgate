@@ -6,6 +6,7 @@ pub mod gateway;
 pub mod keys;
 pub mod limits;
 pub mod live;
+pub mod metrics;
 pub mod presence;
 pub mod registry;
 pub mod settings;
@@ -61,14 +62,22 @@ pub fn build_router(st: State) -> Router {
             auth::require_session,
         ));
 
-    Router::new()
-        .route("/health", routing::get(|| async { "ok" }))
+    // Every answer the gateway endpoints give is counted, refusals included, because a refusal is
+    // deliberately not a usage row and would otherwise be counted nowhere.
+    let gateway = Router::new()
         .route("/v1/models", routing::get(gateway::list_models))
         .route(
             "/v1/chat/completions",
             routing::post(gateway::chat_completions),
         )
+        .route_layer(middleware::from_fn_with_state(st.clone(), metrics::count));
+
+    Router::new()
+        .route("/health", routing::get(metrics::health))
+        .route("/metrics", routing::get(metrics::scrape))
+        .merge(gateway)
         .nest("/api", public.merge(private))
         .fallback_service(ServeDir::new("web"))
         .with_state(st)
+        .layer(middleware::from_fn(metrics::access_log))
 }

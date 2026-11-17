@@ -1,14 +1,19 @@
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::Path;
 
-use dreamgate::{build_router, db, limits, live, registry, state};
+use dreamgate::{build_router, db, limits, live, metrics, registry, state};
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::filter::LevelFilter;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Coloured only on a terminal, and not when NO_COLOR asks for none: written to a file or to the
+    // journal, the colour codes are noise in every line.
+    let colour = std::io::IsTerminal::is_terminal(&std::io::stdout())
+        && std::env::var_os("NO_COLOR").is_none_or(|value| value.is_empty());
     tracing_subscriber::fmt()
         .with_env_filter(log_filter(std::env::var("RUST_LOG").ok().as_deref()))
+        .with_ansi(colour)
         .init();
 
     let database =
@@ -34,6 +39,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         presence: Default::default(),
         attempts: Default::default(),
         limits,
+        metrics: std::sync::Arc::new(metrics::Metrics::new(
+            std::env::var("DREAMGATE_METRICS_TOKEN").ok(),
+        )),
     };
 
     tokio::spawn(registry::health_checker(st.clone()));
@@ -68,9 +76,10 @@ fn dashboard_address(bound: SocketAddr) -> SocketAddr {
 
 // Left to the subscriber, an unset RUST_LOG prints errors alone, so a usage row that could not be
 // written, which the key caps and daily limits then do not count either, and a stream closed for going
-// quiet were never printed. The default is info instead: the warnings print, and nothing here or in the
-// libraries logs at info on every request. RUST_LOG decides when it is set, in its usual form; a value
-// that is empty, or has nothing in it that can be read, leaves the default.
+// quiet were never printed. The default is info instead: the warnings print, and the one line a request
+// writes at info is its access line; the libraries write nothing at info on every request. RUST_LOG
+// decides when it is set, in its usual form; a value that is empty, or has nothing in it that can be
+// read, leaves the default.
 fn log_filter(rust_log: Option<&str>) -> EnvFilter {
     EnvFilter::builder()
         .with_default_directive(LevelFilter::INFO.into())

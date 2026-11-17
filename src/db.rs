@@ -119,12 +119,48 @@ where
 // against that same file while a write is happening.
 pub const DEFAULT_POOL_SIZE: u32 = 16;
 
+// What the health check learns about the database.
+pub enum Probe {
+    Answered,
+    // Every connection of the pool is in use, which is requests being served rather than a database that
+    // has stopped; waiting for one would turn a burst into a failed check.
+    Busy,
+    Failed(sqlx::Error),
+    TimedOut,
+}
+
+// A statement that reads a table, within a second. `SELECT 1` alone never opens a read of the database, so
+// a file that can no longer be read would still be answered as fine. A connection is waited for briefly,
+// because one a query has just finished with goes back to the pool a moment later; a pool that has none to
+// give in that time while every connection is in use is busy rather than down.
+pub async fn probe(pool: &SqlitePool) -> Probe {
+    let mut connection =
+        match tokio::time::timeout(Duration::from_millis(250), pool.acquire()).await {
+            Ok(Ok(connection)) => connection,
+            Ok(Err(err)) => return Probe::Failed(err),
+            Err(_) if pool.size() >= pool.options().get_max_connections() => return Probe::Busy,
+            Err(_) => return Probe::TimedOut,
+        };
+    let read = sqlx::query("SELECT 1 FROM settings LIMIT 1").fetch_optional(&mut *connection);
+    match tokio::time::timeout(Duration::from_secs(1), read).await {
+        Ok(Ok(_)) => Probe::Answered,
+        Ok(Err(err)) => Probe::Failed(err),
+        Err(_) => Probe::TimedOut,
+    }
+}
+
+// How long a query waits for a pooled connection before it fails. It is the default sqlx has always used
+// here, stated because the health check reads it: a pool that has given no connection for this long is no
+// longer a burst being served, since the gateway's own requests are failing with it.
+pub const ACQUIRE_TIMEOUT: Duration = Duration::from_secs(30);
+
 pub async fn connect(url: &str, max_connections: u32) -> Result<SqlitePool, sqlx::Error> {
     let options = SqliteConnectOptions::from_str(url)?
         .create_if_missing(true)
         .busy_timeout(Duration::from_secs(5));
     let pool = SqlitePoolOptions::new()
         .max_connections(max_connections.max(1))
+        .acquire_timeout(ACQUIRE_TIMEOUT)
         .connect_with(options)
         .await?;
     for statement in SCHEMA {

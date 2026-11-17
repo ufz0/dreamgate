@@ -54,6 +54,19 @@ pub fn endpoint(base_url: &str, path: &str) -> String {
     }
 }
 
+// The health each enabled connection's last check left, for a scrape of `/metrics`. A connection that is
+// turned off is left out, because no check reaches it and what it holds is stale.
+pub async fn health_readings(st: &State) -> Result<Vec<(i64, String, String)>, sqlx::Error> {
+    let rows =
+        sqlx::query("SELECT id, name, health FROM connections WHERE enabled = 1 ORDER BY id")
+            .fetch_all(&st.pool)
+            .await?;
+    Ok(rows
+        .iter()
+        .map(|row| (row.get("id"), row.get("name"), row.get("health")))
+        .collect())
+}
+
 pub async fn candidates(st: &State, preferred: Option<i64>) -> Vec<Connection> {
     let rows = sqlx::query(
         "SELECT id, name, base_url, api_key, default_model, enabled, priority, health, last_checked_at, \

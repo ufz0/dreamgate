@@ -9,7 +9,7 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, post},
 };
-use dreamgate::{build_router, db, limits, live, presence, state::State};
+use dreamgate::{build_router, db, limits, live, metrics, presence, state::State};
 use futures_util::{future::join_all, stream};
 use http_body_util::BodyExt;
 use serde_json::{Value, json};
@@ -48,6 +48,7 @@ async fn test_state() -> State {
         presence: Default::default(),
         attempts: Default::default(),
         limits: Arc::new(limits),
+        metrics: Default::default(),
     }
 }
 
@@ -4476,4 +4477,352 @@ async fn another_accounts_stream_is_listed_for_an_admin_and_only_counted_for_a_m
             "a member is not sent the row's {field}"
         );
     }
+}
+
+async fn get_text(
+    router: &Router,
+    path: &str,
+    authorization: Option<&str>,
+) -> (StatusCode, String) {
+    let mut request = Request::get(path);
+    if let Some(value) = authorization {
+        request = request.header("authorization", value);
+    }
+    let response = call(router, request.body(Body::empty()).unwrap()).await;
+    let status = response.status();
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    (status, String::from_utf8_lossy(&bytes).to_string())
+}
+
+// The health check is for whatever decides whether to restart the process, so it reads the database rather
+// than answering ok whatever happens, and a database it cannot reach is a 503.
+#[tokio::test]
+async fn the_health_check_reads_the_database() {
+    let st = test_state().await;
+    let router = build_router(st.clone());
+    assert_eq!(
+        get_text(&router, "/health", None).await,
+        (StatusCode::OK, "ok".to_string())
+    );
+    st.pool.close().await;
+    assert_eq!(
+        get_text(&router, "/health", None).await,
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "database unavailable".to_string()
+        )
+    );
+}
+
+// The gateway binds every interface by default, so the counts are not there at all until a token is set,
+// and with one they are read with it alone.
+#[tokio::test]
+async fn metrics_are_not_there_without_a_token_and_need_it_when_there_is_one() {
+    let router = build_router(test_state().await);
+    assert_eq!(
+        get_text(&router, "/metrics", None).await.0,
+        StatusCode::NOT_FOUND
+    );
+
+    let mut st = test_state().await;
+    st.metrics = Arc::new(metrics::Metrics::new(Some("scrape-secret".to_string())));
+    let router = build_router(st);
+    assert_eq!(
+        get_text(&router, "/metrics", None).await.0,
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        get_text(&router, "/metrics", Some("Bearer wrong")).await.0,
+        StatusCode::UNAUTHORIZED
+    );
+    let (status, body) = get_text(&router, "/metrics", Some("Bearer scrape-secret")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        body.contains("# TYPE dreamgate_responses_total counter"),
+        "{body}"
+    );
+}
+
+// What a scrape reads after traffic: every answer by route, status and type, refusals included; the tokens
+// with what was reported kept apart from what was estimated; a connection that failed before answering; and
+// what is in flight now.
+#[tokio::test]
+async fn metrics_count_answers_refusals_tokens_and_failed_upstreams() {
+    let mut st = test_state().await;
+    st.metrics = Arc::new(metrics::Metrics::new(Some("scrape-secret".to_string())));
+    let router = build_router(st.clone());
+    let base_url = mock_upstream().await;
+    let cookie = register(&router, "ada").await;
+    post_json(
+        &router,
+        "/api/connections",
+        &cookie,
+        json!({ "name": "test", "base_url": base_url, "default_model": "reports-usage", "priority": 0 }),
+    )
+    .await;
+    let (_, dead) = post_json(
+        &router,
+        "/api/connections",
+        &cookie,
+        json!({ "name": "dead", "base_url": "http://127.0.0.1:1", "priority": 1 }),
+    )
+    .await;
+    let (_, free) = post_json(&router, "/api/keys", &cookie, json!({ "name": "free" })).await;
+    // Bound to the connection that does not answer, so it fails there first and falls over to the other.
+    let (_, bound) = post_json(
+        &router,
+        "/api/keys",
+        &cookie,
+        json!({ "name": "bound", "connection_id": dead["id"] }),
+    )
+    .await;
+    let body = json!({ "messages": [{ "role": "user", "content": "hi" }] });
+    for created in [&free, &bound] {
+        let response = gateway_call(&router, created["key"].as_str().unwrap(), body.clone()).await;
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+    assert_eq!(
+        gateway_call(&router, "dreamgate_not-a-key", body)
+            .await
+            .status(),
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(recorded_usage(&st.pool).await.len(), 2);
+    // A stream's row is written by the stream task rather than by the handler, so it is counted as well.
+    let response = gateway_call(
+        &router,
+        free["key"].as_str().unwrap(),
+        json!({ "stream": true, "messages": [{ "role": "user", "content": "hi" }] }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    response.into_body().collect().await.unwrap();
+    for _ in 0..50 {
+        if recorded_usage(&st.pool).await.len() == 3 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(recorded_usage(&st.pool).await.len(), 3);
+
+    let (_, scrape) = get_text(&router, "/metrics", Some("Bearer scrape-secret")).await;
+    for line in [
+        "dreamgate_responses_total{route=\"/v1/chat/completions\",status=\"200\",type=\"\"} 3",
+        "dreamgate_responses_total{route=\"/v1/chat/completions\",status=\"401\",type=\"invalid_api_key\"} 1",
+        "dreamgate_upstream_failures_total{connection=\"dead\"} 1",
+        "dreamgate_tokens_total{direction=\"input\",source=\"reported\"} 33",
+        "dreamgate_tokens_total{direction=\"output\",source=\"reported\"} 21",
+        "dreamgate_tokens_total{direction=\"input\",source=\"estimated\"} 0",
+        "dreamgate_request_duration_seconds_count{streamed=\"false\"} 2",
+        "dreamgate_request_duration_seconds_count{streamed=\"true\"} 1",
+        "dreamgate_usage_write_failures_total 0",
+        "dreamgate_in_flight 0",
+        "dreamgate_in_flight_limit 1024",
+        "dreamgate_connection_in_flight{connection=\"test\"} 0",
+        "dreamgate_request_duration_seconds_bucket{streamed=\"false\",le=\"+Inf\"} 2",
+        "dreamgate_request_duration_seconds_bucket{streamed=\"false\",le=\"300\"} 2",
+    ] {
+        assert!(
+            scrape.lines().any(|l| l == line),
+            "missing {line} in:\n{scrape}"
+        );
+    }
+    // The buckets of a histogram are cumulative, so no bucket is ever above the one after it.
+    let buckets: Vec<u64> = scrape
+        .lines()
+        .filter(|l| l.starts_with("dreamgate_request_duration_seconds_bucket{streamed=\"false\""))
+        .map(|l| l.rsplit(' ').next().unwrap().parse().unwrap())
+        .collect();
+    assert_eq!(buckets.len(), 12);
+    assert!(
+        buckets.windows(2).all(|pair| pair[0] <= pair[1]),
+        "{buckets:?}"
+    );
+}
+
+// A token is read without the line break a secret file leaves behind it, and one that is blank is no token.
+#[tokio::test]
+async fn a_metrics_token_is_read_without_the_space_around_it_and_a_blank_one_is_none() {
+    let mut st = test_state().await;
+    st.metrics = Arc::new(metrics::Metrics::new(Some("  ".to_string())));
+    assert_eq!(
+        get_text(&build_router(st), "/metrics", Some("Bearer "))
+            .await
+            .0,
+        StatusCode::NOT_FOUND
+    );
+
+    let mut st = test_state().await;
+    st.metrics = Arc::new(metrics::Metrics::new(Some("scrape-secret\n".to_string())));
+    assert_eq!(
+        get_text(&build_router(st), "/metrics", Some("Bearer scrape-secret"))
+            .await
+            .0,
+        StatusCode::OK
+    );
+}
+
+// A pool whose every connection is in use is a burst being served, so the health check says busy with a 200
+// rather than a 503 that would get a working gateway restarted.
+#[tokio::test]
+async fn the_health_check_answers_busy_rather_than_down_when_the_pool_is_in_use() {
+    let st = test_state().await;
+    let router = build_router(st.clone());
+    let _held = st.pool.acquire().await.unwrap();
+    assert_eq!(
+        get_text(&router, "/health", None).await,
+        (StatusCode::OK, "busy".to_string())
+    );
+}
+
+// Busy is a burst being served only while a query could still get a connection by waiting. A pool that has
+// given the checks none for longer than a query waits is answered as down, and the first check that gets a
+// connection again starts over.
+#[tokio::test]
+async fn a_pool_that_stays_in_use_past_the_wait_for_a_connection_is_answered_as_down() {
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .acquire_timeout(Duration::from_millis(600))
+        .connect("sqlite::memory:")
+        .await
+        .unwrap();
+    for statement in db::SCHEMA {
+        sqlx::query(*statement).execute(&pool).await.unwrap();
+    }
+    let mut st = test_state().await;
+    st.pool = pool;
+    let router = build_router(st.clone());
+
+    let held = st.pool.acquire().await.unwrap();
+    assert_eq!(
+        get_text(&router, "/health", None).await,
+        (StatusCode::OK, "busy".to_string())
+    );
+    tokio::time::sleep(Duration::from_millis(700)).await;
+    assert_eq!(
+        get_text(&router, "/health", None).await,
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "database unavailable".to_string()
+        )
+    );
+    drop(held);
+    assert_eq!(
+        get_text(&router, "/health", None).await,
+        (StatusCode::OK, "ok".to_string())
+    );
+    let _held = st.pool.acquire().await.unwrap();
+    assert_eq!(
+        get_text(&router, "/health", None).await,
+        (StatusCode::OK, "busy".to_string())
+    );
+}
+
+// The gauges read what is happening now, so a stream that is still running is in flight for the gateway and
+// for its connection, and a connection's last check is read for whether it is up.
+#[tokio::test]
+async fn a_scrape_reads_what_is_in_flight_and_which_connections_are_up() {
+    let mut st = test_state().await;
+    st.metrics = Arc::new(metrics::Metrics::new(Some("scrape-secret".to_string())));
+    let router = build_router(st.clone());
+    let slow = slow_upstream(20, 50, false).await;
+    let cookie = register(&router, "ada").await;
+    let (_, running) = post_json(
+        &router,
+        "/api/connections",
+        &cookie,
+        json!({ "name": "slow", "base_url": slow, "priority": 0 }),
+    )
+    .await;
+    let (_, dead) = post_json(
+        &router,
+        "/api/connections",
+        &cookie,
+        json!({ "name": "dead", "base_url": "http://127.0.0.1:1", "priority": 1 }),
+    )
+    .await;
+    mark_health(&st.pool, &running, "ok").await;
+    mark_health(&st.pool, &dead, "down").await;
+    let (_, created) = post_json(&router, "/api/keys", &cookie, json!({ "name": "k" })).await;
+
+    let stream = gateway_call(
+        &router,
+        created["key"].as_str().unwrap(),
+        json!({ "model": "m", "stream": true, "messages": [{ "role": "user", "content": "hi" }] }),
+    )
+    .await;
+    assert_eq!(stream.status(), StatusCode::OK);
+    let (_, scrape) = get_text(&router, "/metrics", Some("Bearer scrape-secret")).await;
+    for line in [
+        "dreamgate_in_flight 1",
+        "dreamgate_connection_in_flight{connection=\"slow\"} 1",
+        "dreamgate_connection_up{connection=\"slow\"} 1",
+        "dreamgate_connection_up{connection=\"dead\"} 0",
+    ] {
+        assert!(
+            scrape.lines().any(|l| l == line),
+            "missing {line} in:\n{scrape}"
+        );
+    }
+    stream.into_body().collect().await.unwrap();
+}
+
+// A row that could not be written is counted, because the caps then do not see that request.
+#[tokio::test]
+async fn a_usage_row_that_could_not_be_written_is_counted() {
+    let mut st = test_state().await;
+    st.metrics = Arc::new(metrics::Metrics::new(Some("scrape-secret".to_string())));
+    let router = build_router(st.clone());
+    let base_url = mock_upstream().await;
+    let cookie = register(&router, "ada").await;
+    post_json(
+        &router,
+        "/api/connections",
+        &cookie,
+        json!({ "name": "test", "base_url": base_url, "default_model": "reports-usage" }),
+    )
+    .await;
+    let (_, created) = post_json(&router, "/api/keys", &cookie, json!({ "name": "k" })).await;
+    sqlx::query("DROP TABLE usage")
+        .execute(&st.pool)
+        .await
+        .unwrap();
+    let response = gateway_call(
+        &router,
+        created["key"].as_str().unwrap(),
+        json!({ "messages": [{ "role": "user", "content": "hi" }] }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let (_, scrape) = get_text(&router, "/metrics", Some("Bearer scrape-secret")).await;
+    assert!(
+        scrape
+            .lines()
+            .any(|l| l == "dreamgate_usage_write_failures_total 1"),
+        "{scrape}"
+    );
+
+    // A stream's row is written by its own task, which counts a row it could not write as well.
+    let response = gateway_call(
+        &router,
+        created["key"].as_str().unwrap(),
+        json!({ "stream": true, "messages": [{ "role": "user", "content": "hi" }] }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    response.into_body().collect().await.unwrap();
+    let mut scrape = String::new();
+    for _ in 0..50 {
+        scrape = get_text(&router, "/metrics", Some("Bearer scrape-secret"))
+            .await
+            .1;
+        if scrape
+            .lines()
+            .any(|l| l == "dreamgate_usage_write_failures_total 2")
+        {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!("the stream's lost row was not counted:\n{scrape}");
 }
