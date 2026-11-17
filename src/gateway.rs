@@ -9,7 +9,7 @@ use serde_json::{Value, json};
 use sqlx::Row;
 use sqlx::sqlite::SqliteRow;
 
-use crate::api::error;
+use crate::api::{error, logged};
 use crate::limits::Admission;
 use crate::presence::{self, Active};
 use crate::registry::{self, Connection};
@@ -78,13 +78,29 @@ fn unknown_key() -> Response {
 // could not be read is not a limit that was not reached: letting the request through would let a
 // disabled account, or a key past its cap, reach an upstream whenever the database was slow. The
 // answer is 503 because the refusal is the gateway's and passes, so a client that retries is right to.
+#[track_caller]
 fn unreadable(err: sqlx::Error) -> Response {
-    tracing::error!("a key, its account or its limits could not be read: {err}");
-    error(
+    logged(
         StatusCode::SERVICE_UNAVAILABLE,
         "unavailable",
         "the gateway could not read this key's account and limits; try again",
+        err,
     )
+}
+
+// What a client is told about a failed upstream is its connection's name and the first line of the
+// error, without the address. The log is where an admin looks for why, so it gets the whole chain of
+// causes — refused, a name that did not resolve, a certificate, a timeout — which the first line
+// leaves out.
+fn upstream_failed(conn: &Connection, err: &(dyn std::error::Error + 'static)) {
+    let mut causes = err.to_string();
+    let mut source = err.source();
+    while let Some(cause) = source {
+        causes.push_str(": ");
+        causes.push_str(&cause.to_string());
+        source = cause.source();
+    }
+    tracing::warn!(connection = %conn.name, "upstream failed: {causes}");
 }
 
 // A disabled account cannot use a key at all. Both gateway endpoints read the account the same
@@ -546,7 +562,7 @@ pub async fn chat_completions(
         return blocked;
     }
 
-    let mut candidates = registry::candidates(&st, key.connection_id).await;
+    let candidates = registry::candidates(&st, key.connection_id).await;
     if candidates.is_empty() {
         return error(
             StatusCode::BAD_GATEWAY,
@@ -579,12 +595,8 @@ pub async fn chat_completions(
     let mut full: Vec<String> = Vec::new();
     let mut attempted = false;
 
-    // A connection whose last check failed is tried last rather than skipped. Health is only checked every 30
-    // seconds, so one marked down may be answering again, and skipping every connection that is marked down
-    // would send a request nowhere when all of them are. The sort is stable, so the connections that are not
-    // down keep their order — the key's own connection first, then priority — the ones that are down follow
-    // in that same order, and each is still tried once.
-    candidates.sort_by_key(|conn| conn.health == "down");
+    // The connections come in the order they are tried: the key's own first, then priority, with the ones
+    // marked down after the rest (`registry::candidates`). Each is tried once.
     for conn in &candidates {
         let Ok(slot) = st
             .limits
@@ -634,6 +646,7 @@ pub async fn chat_completions(
         let upstream = match sent {
             Ok(upstream) => upstream,
             Err(err) => {
+                upstream_failed(conn, &*err);
                 last_error = format!("{}: {err}", conn.name);
                 continue;
             }
@@ -669,7 +682,9 @@ pub async fn chat_completions(
         let bytes = match upstream.bytes().await {
             Ok(bytes) => bytes,
             Err(err) => {
-                last_error = format!("{}: {}", conn.name, err.without_url());
+                let err = err.without_url();
+                upstream_failed(conn, &err);
+                last_error = format!("{}: {err}", conn.name);
                 continue;
             }
         };
@@ -773,6 +788,15 @@ pub async fn chat_completions(
         },
     )
     .await;
+    // A connection that was full was passed over for one that then failed, which can be one marked down,
+    // tried last. The answer is what that one did, and the full ones are named beside it, so the client is
+    // not told only half of why nothing answered.
+    if !full.is_empty() {
+        last_error = format!(
+            "{last_error}; at their limit of requests at once: {}",
+            full.join(", ")
+        );
+    }
     error(StatusCode::BAD_GATEWAY, "upstream_unavailable", last_error)
 }
 
@@ -834,10 +858,12 @@ pub async fn list_models(AxumState(st): AxumState<State>, headers: HeaderMap) ->
             let bytes = match upstream.bytes().await {
                 Ok(bytes) => bytes,
                 Err(err) => {
+                    let err = err.without_url();
+                    upstream_failed(&conn, &err);
                     return error(
                         StatusCode::BAD_GATEWAY,
                         "upstream_unavailable",
-                        format!("{}: {}", conn.name, err.without_url()),
+                        format!("{}: {err}", conn.name),
                     );
                 }
             };
@@ -851,10 +877,14 @@ pub async fn list_models(AxumState(st): AxumState<State>, headers: HeaderMap) ->
             out.into_response()
         }
         // As on the completion path, the connection is named and its address is not.
-        Err(err) => error(
-            StatusCode::BAD_GATEWAY,
-            "upstream_unavailable",
-            format!("{}: {}", conn.name, err.without_url()),
-        ),
+        Err(err) => {
+            let err = err.without_url();
+            upstream_failed(&conn, &err);
+            error(
+                StatusCode::BAD_GATEWAY,
+                "upstream_unavailable",
+                format!("{}: {err}", conn.name),
+            )
+        }
     }
 }

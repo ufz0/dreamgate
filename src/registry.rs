@@ -67,11 +67,16 @@ pub async fn candidates(st: &State, preferred: Option<i64>) -> Vec<Connection> {
         let position = all.iter().position(|c| c.id == id);
         if let Some(index) = position {
             let preferred_conn = all.remove(index);
-            let mut ordered = vec![preferred_conn];
-            ordered.extend(all);
-            return ordered;
+            all.insert(0, preferred_conn);
         }
     }
+    // A connection whose last check failed is put last rather than left out. Health is only checked
+    // every 30 seconds, so one marked down may be answering again, and leaving out every connection
+    // that is marked down would send a request nowhere when all of them are. The sort is stable, so
+    // the connections that are not down keep their order — the key's own connection first, then
+    // priority — and the ones that are down follow in that same order. Both gateway endpoints read
+    // this one order: a completion tries each in turn, and the model list asks the first.
+    all.sort_by_key(|conn| conn.health == "down");
     all
 }
 
@@ -120,18 +125,25 @@ pub async fn list(AxumState(st): AxumState<State>, caller: Caller) -> Response {
     .fetch_all(&st.pool)
     .await
     .unwrap_or_default();
-    // An upstream key is a secret, so it is returned to an admin alone. The rest of the row is
-    // what any signed-in account needs for the gate readout and the model list.
+    // An upstream key is a secret, so it is returned to an admin alone, and so is the address: it
+    // names an internal host and port, and can carry a credential of its own in its query or its
+    // user part. The rest of the row is what any signed-in account needs for the gate readout and
+    // the model list.
     let admin = caller.role == "admin";
     let out: Vec<serde_json::Value> = rows
         .iter()
         .map(|row| {
             let c = row_to_connection(row);
             let api_key = if admin { c.api_key.clone() } else { None };
+            let base_url = if admin {
+                Some(c.base_url.clone())
+            } else {
+                None
+            };
             json!({
                 "id": c.id,
                 "name": c.name,
-                "base_url": c.base_url,
+                "base_url": base_url,
                 "api_key": api_key,
                 "default_model": c.default_model,
                 "enabled": c.enabled,

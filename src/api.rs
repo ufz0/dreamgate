@@ -20,16 +20,29 @@ pub fn error(status: StatusCode, kind: &str, message: impl Into<String>) -> Resp
 // reference, with the place in the code that answered, so the one can be found from the other.
 #[track_caller]
 pub fn server_error(err: impl Display) -> Response {
+    logged(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "server_error",
+        "something went wrong on the server",
+        err,
+    )
+}
+
+// The same answer for a failure that has a status and a sentence of its own, such as the gateway
+// refusing a request whose limits it could not read, so every failure that is logged can be found
+// from what the client was told.
+#[track_caller]
+pub fn logged(status: StatusCode, kind: &str, sentence: &str, err: impl Display) -> Response {
     let mut reference = Uuid::new_v4().simple().to_string();
     reference.truncate(8);
     tracing::error!(
         reference = %reference,
         at = %Location::caller(),
-        "answered as a server error: {err}"
+        "answered as {kind}: {err}"
     );
     error(
-        StatusCode::INTERNAL_SERVER_ERROR,
-        "server_error",
-        format!("something went wrong on the server (logged as reference {reference})"),
+        status,
+        kind,
+        format!("{sentence} (logged as reference {reference})"),
     )
 }

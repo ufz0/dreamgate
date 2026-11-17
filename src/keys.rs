@@ -138,8 +138,25 @@ pub async fn create(
     .await;
     match result {
         Ok(row) => Json(json!({ "id": row.get::<i64, _>("id"), "key": key })).into_response(),
+        Err(sqlx::Error::Database(db))
+            if body.connection_id.is_some() && db.is_foreign_key_violation() =>
+        {
+            no_such_connection()
+        }
         Err(err) => server_error(err),
     }
+}
+
+// A key bound to a connection that does not exist is a mistake in what was sent, not a failure of
+// the server: the connection may have been deleted in another tab while the form was open. The
+// account a key is made for is the caller's own, so when a connection was named, it is the one the
+// reference failed on.
+fn no_such_connection() -> Response {
+    error(
+        StatusCode::BAD_REQUEST,
+        "invalid_request",
+        "no connection with that id",
+    )
 }
 
 pub async fn update(
@@ -184,6 +201,11 @@ pub async fn update(
     .await;
     match result {
         Ok(_) => Json(json!({ "ok": true })).into_response(),
+        Err(sqlx::Error::Database(db))
+            if body.connection_id.is_some() && db.is_foreign_key_violation() =>
+        {
+            no_such_connection()
+        }
         Err(err) => server_error(err),
     }
 }

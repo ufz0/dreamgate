@@ -550,21 +550,23 @@ function renderOverview(arrived) {
   renderFeed(arrived);
 }
 
-function topConnection() {
+// The connection the gateway tries first for a key, in the order it uses: the key's own connection
+// while it is enabled, then the rest by priority, with every connection marked down after the ones
+// that are not, in that same order. A key bound to a connection marked down therefore starts with
+// another one that is not, and one marked down comes first only when every one is.
+function firstConnection(key) {
   const enabled = state.connections.filter((c) => c.enabled).sort((a, b) => a.priority - b.priority);
-  // Same order the gateway uses: highest priority, with every connection that is down tried
-  // after the ones that are not, so the first it tries is the first that is not down, or the
-  // first of all when every one is down.
-  return enabled.find((c) => c.health !== 'down') || enabled[0] || null;
+  const bound = key && key.connection_id ? enabled.find((c) => c.id === key.connection_id) : null;
+  const ordered = bound ? [bound, ...enabled.filter((c) => c !== bound)] : enabled;
+  return ordered.find((c) => c.health !== 'down') || ordered[0] || null;
 }
 
 function renderGate() {
   // The path shown has to be the path a request actually took, so the key comes from the
-  // last event and the connection from that key's binding.
+  // last event and the connection from the order the gateway tries for that key.
   const last = state.events[0];
   const key = last ? state.keys.find((k) => k.name === last.key) : null;
-  const bound = key && key.connection_id ? state.connections.find((c) => c.id === key.connection_id && c.enabled) : null;
-  const conn = bound || topConnection();
+  const conn = firstConnection(key);
   $('gate-key').textContent = last ? keyLabel(last) : (state.keys.length ? state.keys[0].name : 'no key yet');
   // The name is clamped to the width of a leg, and the chip sits beside it rather than inside it, so a
   // long name is cut short and the health still shows.

@@ -367,9 +367,12 @@ pub async fn login(
             };
             // Two first sign-ins at once both read that there is no password. Only the write that
             // still finds none sets it, and the other is answered as what it now is: a password
-            // that does not match.
+            // that does not match. The write also has to find the account still enabled and not
+            // held, because an admin can change either while the password is being hashed, and a
+            // sign-in that lands after that is not let in on what it read before.
             match sqlx::query(
-                "UPDATE users SET password_hash = ? WHERE id = ? AND password_hash IS NULL",
+                "UPDATE users SET password_hash = ? \
+                 WHERE id = ? AND password_hash IS NULL AND enabled = 1 AND pending = 0",
             )
             .bind(&hash)
             .bind(id)

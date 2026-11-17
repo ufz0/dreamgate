@@ -1434,6 +1434,128 @@ async fn a_full_connection_passes_the_request_on_to_one_marked_down() {
     );
 }
 
+// The model list reads the same order a completion does, so a connection marked down is not the one it
+// asks while another is up: the Sandbox reads its models from here, and would have none while chat works.
+#[tokio::test]
+async fn the_model_list_asks_a_connection_that_is_up_before_one_marked_down() {
+    let st = test_state().await;
+    let router = build_router(st.clone());
+    let base_url = mock_upstream().await;
+    let cookie = register(&router, "ada").await;
+
+    let (_, dead) = post_json(
+        &router,
+        "/api/connections",
+        &cookie,
+        json!({ "name": "dead", "base_url": "http://127.0.0.1:1", "priority": 0 }),
+    )
+    .await;
+    let (_, up) = post_json(
+        &router,
+        "/api/connections",
+        &cookie,
+        json!({ "name": "up", "base_url": base_url, "priority": 1 }),
+    )
+    .await;
+    mark_health(&st.pool, &dead, "down").await;
+    mark_health(&st.pool, &up, "ok").await;
+    let (_, created) =
+        post_json(&router, "/api/keys", &cookie, json!({ "name": "test key" })).await;
+
+    let response = models_call(&router, created["key"].as_str().unwrap()).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(json_body(response).await["data"][0]["id"], "test-model");
+}
+
+// When the connection that is up is full and the one marked down then fails, the answer is that failure,
+// with the full connection named beside it rather than left out.
+#[tokio::test]
+async fn a_failure_after_a_full_connection_names_the_full_one_as_well() {
+    let st = test_state().await;
+    let router = build_router(st.clone());
+    let base_url = mock_upstream().await;
+    let cookie = register(&router, "ada").await;
+
+    let (_, busy) = post_json(
+        &router,
+        "/api/connections",
+        &cookie,
+        json!({ "name": "busy", "base_url": base_url, "default_model": "reports-usage", "priority": 0, "max_concurrent": 1 }),
+    )
+    .await;
+    let (_, dead) = post_json(
+        &router,
+        "/api/connections",
+        &cookie,
+        json!({ "name": "dead", "base_url": "http://127.0.0.1:1", "priority": 1 }),
+    )
+    .await;
+    mark_health(&st.pool, &busy, "ok").await;
+    mark_health(&st.pool, &dead, "down").await;
+    let (_, created) =
+        post_json(&router, "/api/keys", &cookie, json!({ "name": "test key" })).await;
+    let _busy_slot = st
+        .limits
+        .for_connection(busy["id"].as_i64().unwrap(), Some(1))
+        .try_acquire_owned()
+        .unwrap();
+
+    let response = gateway_call(
+        &router,
+        created["key"].as_str().unwrap(),
+        json!({ "model": "m", "messages": [{ "role": "user", "content": "hi" }] }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    let message = json_body(response).await["error"]["message"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(message.starts_with("dead: "), "{message}");
+    assert!(
+        message.ends_with("at their limit of requests at once: busy"),
+        "{message}"
+    );
+    let usage = recorded_usage(&st.pool).await;
+    assert_eq!(
+        usage.len(),
+        1,
+        "a request that reached a connection is recorded"
+    );
+    assert_eq!(usage[0]["status"], 502);
+}
+
+// A key bound to a connection that does not exist is a mistake in what was sent, so it is answered as one
+// rather than as a failure of the server, whether the key is being made or changed.
+#[tokio::test]
+async fn a_key_bound_to_a_connection_that_does_not_exist_is_told_so() {
+    let st = test_state().await;
+    let router = build_router(st.clone());
+    let cookie = register(&router, "ada").await;
+
+    let (status, body) = post_json(
+        &router,
+        "/api/keys",
+        &cookie,
+        json!({ "name": "orphan", "connection_id": 4242 }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["error"]["message"], "no connection with that id");
+
+    let (_, created) = post_json(&router, "/api/keys", &cookie, json!({ "name": "plain" })).await;
+    let (status, body) = send_json(
+        &router,
+        http::Method::PATCH,
+        &format!("/api/keys/{}", created["id"]),
+        &cookie,
+        json!({ "connection_id": 4242 }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["error"]["message"], "no connection with that id");
+}
+
 // A key holder is told which connection failed, not where it is: the HTTP client's error ends in the
 // full upstream address, which names an internal host and port, and any credential an upstream takes
 // in its query string.
@@ -1462,14 +1584,7 @@ async fn a_failed_upstream_is_named_without_its_address() {
     )
     .await;
     assert_eq!(completion.status(), StatusCode::BAD_GATEWAY);
-    let models = call(
-        &router,
-        Request::get("/v1/models")
-            .header("authorization", format!("Bearer {key}"))
-            .body(Body::empty())
-            .unwrap(),
-    )
-    .await;
+    let models = models_call(&router, &key).await;
     assert_eq!(models.status(), StatusCode::BAD_GATEWAY);
 
     for response in [completion, models] {
@@ -2522,7 +2637,11 @@ async fn a_limit_that_cannot_be_read_refuses_the_request_rather_than_letting_it_
             StatusCode::SERVICE_UNAVAILABLE,
             "a limit that could not be read is not taken as one that was not reached"
         );
-        assert_eq!(json_body(response).await["error"]["type"], "unavailable");
+        let body = json_body(response).await;
+        assert_eq!(body["error"]["type"], "unavailable");
+        let message = body["error"]["message"].as_str().unwrap();
+        assert!(message.contains("logged as reference"), "{message}");
+        assert!(!message.contains("usage"), "no table name: {message}");
     }
 }
 
@@ -3698,15 +3817,21 @@ async fn only_an_admin_can_change_a_connection_and_read_the_key_it_carries() {
     let id = created["id"].as_i64().unwrap();
 
     // The page shows a connection to every account, because the gate readout and the model list
-    // need it. The key it carries is a secret, so that part goes to an admin alone.
+    // need it. The key it carries is a secret, and its address names an internal host, so those
+    // parts go to an admin alone.
     let member_view = get_json(&router, "/api/connections", &member).await;
     assert_eq!(
         member_view["connections"][0]["name"], "test",
         "the connection itself is still readable"
     );
     assert!(member_view["connections"][0]["api_key"].is_null());
+    assert!(member_view["connections"][0]["base_url"].is_null());
     let admin_view = get_json(&router, "/api/connections", &admin).await;
     assert_eq!(admin_view["connections"][0]["api_key"], "upstream-secret");
+    assert_eq!(
+        admin_view["connections"][0]["base_url"],
+        "http://127.0.0.1:1"
+    );
 
     // Adding, removing and checking a connection is admin-only in the page, so the rule has to be
     // on the routes as well rather than only on the view.
