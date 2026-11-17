@@ -25,7 +25,11 @@ username, the email column is dropped, a password column that was required is re
 left empty, the approval flag is added, the `max_concurrent` column is added to connections and left
 empty for the rows written before it, and existing accounts keep their limits and are enabled by
 default. A connection row with no `max_concurrent` keeps its meaning: it never stated a capability, so
-the default applies to it, which is not the same as a capability of one.
+the default applies to it, which is not the same as a capability of one. A table that has to be rebuilt
+for this is rebuilt in one transaction, so a start that stops partway, on a full disk or in a crash,
+leaves the database as it was and the next start migrates it again; a new table that an older start left
+beside the old one when it stopped is dropped and made again from the old one, which still holds every
+row. The indexes on the usage table are made after the migration, so a rebuild does not leave them out.
 
 Environment variables:
 
@@ -415,7 +419,9 @@ rebuild of that table — and which fields a recorded row carries when an engine
 timings against when it reports nothing, including a usage block that reports no token counts and is
 therefore estimated, and the migration of a database
 written with the old columns (a display name, an email, a
-lifetime cap), or with usage rows that were taken with the key, to the current shape.
+lifetime cap), or with usage rows that were taken with the key, to the current shape, with every index on the
+usage table in place after that table is rebuilt, a rebuild that fails partway leaving the table as it was and
+foreign keys on, and a rebuild left half-done by an earlier start run again with the rows keeping their values.
 
 The concurrency tests (`tests/concurrency.rs`) run the gateway against a mock upstream that counts how many
 requests it is working on at once, and check that requests are answered at the same time rather than one after

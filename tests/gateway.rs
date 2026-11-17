@@ -26,6 +26,8 @@ async fn test_state() -> State {
     for statement in db::SCHEMA {
         sqlx::query(*statement).execute(&pool).await.unwrap();
     }
+    // As `db::connect` does it: the migration is what makes the indexes.
+    db::migrate(&pool).await.unwrap();
 
     // Far above what any test in this file sends, so a test is not shaped by admission: as a result the main
     // suite only exercises it in the one test that fills a connection on purpose, through the capability that
@@ -2897,6 +2899,368 @@ async fn a_database_that_takes_usage_with_a_deleted_key_is_moved_to_the_current_
         .await
         .unwrap();
     assert_eq!(usage_count(&pool, 1).await, 0);
+}
+
+async fn usage_indexes(pool: &SqlitePool) -> Vec<String> {
+    sqlx::query(
+        "SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = 'usage' ORDER BY name",
+    )
+    .fetch_all(pool)
+    .await
+    .unwrap()
+    .into_iter()
+    .map(|row| row.get::<String, _>("name"))
+    .collect()
+}
+
+async fn table_exists(pool: &SqlitePool, table: &str) -> bool {
+    sqlx::query("SELECT COUNT(*) AS n FROM sqlite_master WHERE type = 'table' AND name = ?")
+        .bind(table)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+        .get::<i64, _>("n")
+        > 0
+}
+
+async fn key_action(pool: &SqlitePool) -> String {
+    sqlx::query(
+        "SELECT \"on_delete\" AS action FROM pragma_foreign_key_list('usage') WHERE \"table\" = 'api_keys'",
+    )
+    .fetch_one(pool)
+    .await
+    .unwrap()
+    .get::<String, _>("action")
+}
+
+// Rebuilding the usage table drops its indexes with it, and the start that rebuilt it used to make
+// only the one on the key again, so every per-account query read the whole table until the next start.
+#[tokio::test]
+async fn the_usage_indexes_are_in_place_after_the_table_is_rebuilt() {
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
+        .unwrap();
+    for statement in db::SCHEMA {
+        sqlx::query(*statement).execute(&pool).await.unwrap();
+    }
+
+    // A usage table that still takes its rows with the key, with the indexes a database written then
+    // has on it.
+    sqlx::query("DROP TABLE usage")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "CREATE TABLE usage (
+            id INTEGER PRIMARY KEY,
+            api_key_id INTEGER NOT NULL REFERENCES api_keys(id) ON DELETE CASCADE,
+            user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            connection_id INTEGER REFERENCES connections(id) ON DELETE SET NULL,
+            model TEXT,
+            prompt_tokens INTEGER NOT NULL,
+            completion_tokens INTEGER NOT NULL,
+            total_tokens INTEGER NOT NULL,
+            latency_ms INTEGER NOT NULL,
+            status INTEGER NOT NULL,
+            streamed INTEGER NOT NULL DEFAULT 0,
+            estimated INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL
+        )",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    for statement in [
+        "CREATE INDEX idx_usage_created ON usage (created_at)",
+        "CREATE INDEX idx_usage_key ON usage (api_key_id)",
+        "CREATE INDEX idx_usage_user ON usage (user_id)",
+    ] {
+        sqlx::query(statement).execute(&pool).await.unwrap();
+    }
+    sqlx::query("INSERT INTO users (id, username, password_hash, role, created_at) VALUES (1, 'ada', 'hash', 'admin', '2026-01-01T00:00:00Z')")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO api_keys (id, user_id, name, key, created_at) VALUES (1, 1, 'key', 'dreamgate_test', '2026-01-01T00:00:00Z')")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO usage (api_key_id, user_id, model, prompt_tokens, completion_tokens, total_tokens, latency_ms, status, created_at) VALUES (1, 1, 'test-model', 11, 7, 18, 5, 200, '2026-01-01T00:00:00Z')")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    db::migrate(&pool).await.unwrap();
+
+    assert_eq!(key_action(&pool).await, "SET NULL", "the table was rebuilt");
+    assert_eq!(
+        usage_indexes(&pool).await.join(","),
+        "idx_usage_created,idx_usage_key,idx_usage_user"
+    );
+    // A per-account query reads through its index rather than the whole table.
+    let plan = sqlx::query("EXPLAIN QUERY PLAN SELECT COUNT(*) FROM usage WHERE user_id = 1")
+        .fetch_all(&pool)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|row| row.get::<String, _>("detail"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert!(plan.contains("idx_usage_user"), "{plan}");
+    assert_eq!(usage_count(&pool, 1).await, 1);
+
+    // Running it again on a table that is already current leaves them as they are.
+    db::migrate(&pool).await.unwrap();
+    assert_eq!(
+        usage_indexes(&pool).await.join(","),
+        "idx_usage_created,idx_usage_key,idx_usage_user"
+    );
+}
+
+// A start that was interrupted while it rebuilt a table, before the rebuilds were one transaction,
+// left the new table beside the old one: empty when the copy failed, full when it stopped after the
+// copy. The old table still holds every row, so the rebuild runs again from it rather than failing on
+// a table that already exists.
+#[tokio::test]
+async fn a_rebuild_left_unfinished_by_an_earlier_start_is_run_again() {
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
+        .unwrap();
+
+    // Accounts with a display name, an email and a lifetime cap, and usage rows that go with their key.
+    sqlx::query(
+        "CREATE TABLE users (
+            id INTEGER PRIMARY KEY,
+            name TEXT NOT NULL UNIQUE,
+            email TEXT NOT NULL UNIQUE,
+            password_hash TEXT NOT NULL,
+            role TEXT NOT NULL DEFAULT 'user',
+            token_cap INTEGER,
+            created_at TEXT NOT NULL
+        )",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    for statement in db::SCHEMA {
+        sqlx::query(*statement).execute(&pool).await.unwrap();
+    }
+    sqlx::query("DROP TABLE usage")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "CREATE TABLE usage (
+            id INTEGER PRIMARY KEY,
+            api_key_id INTEGER NOT NULL REFERENCES api_keys(id) ON DELETE CASCADE,
+            user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            connection_id INTEGER REFERENCES connections(id) ON DELETE SET NULL,
+            model TEXT,
+            prompt_tokens INTEGER NOT NULL,
+            completion_tokens INTEGER NOT NULL,
+            total_tokens INTEGER NOT NULL,
+            latency_ms INTEGER NOT NULL,
+            status INTEGER NOT NULL,
+            streamed INTEGER NOT NULL DEFAULT 0,
+            estimated INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL
+        )",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query("INSERT INTO users (name, email, password_hash, role, token_cap, created_at) VALUES ('ada', 'ada@example.com', 'hash', 'admin', 500, '2026-01-01T00:00:00Z')")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO api_keys (user_id, name, key, created_at) VALUES (1, 'key', 'dreamgate_test', '2026-01-01T00:00:00Z')")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO usage (api_key_id, user_id, model, prompt_tokens, completion_tokens, total_tokens, latency_ms, status, estimated, created_at) VALUES (1, 1, 'test-model', 11, 7, 18, 5, 200, 1, '2026-01-01T00:00:00Z')")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO sessions (token, user_id, created_at) VALUES ('session', 1, '2026-01-01T00:00:00Z')")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    // What the interrupted start left: the copy of the accounts it finished, and the usage table it
+    // made before the copy into it failed.
+    sqlx::query(
+        "CREATE TABLE users_new (
+            id INTEGER PRIMARY KEY,
+            username TEXT NOT NULL UNIQUE,
+            password_hash TEXT,
+            role TEXT NOT NULL DEFAULT 'user',
+            daily_token_cap INTEGER,
+            enabled INTEGER NOT NULL DEFAULT 1,
+            pending INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL
+        )",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO users_new (id, username, password_hash, role, daily_token_cap, enabled, pending, created_at) \
+         SELECT id, name, password_hash, role, token_cap, 1, 0, created_at FROM users",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "CREATE TABLE usage_new (
+            id INTEGER PRIMARY KEY,
+            api_key_id INTEGER REFERENCES api_keys(id) ON DELETE SET NULL,
+            user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            connection_id INTEGER REFERENCES connections(id) ON DELETE SET NULL,
+            model TEXT,
+            prompt_tokens INTEGER NOT NULL,
+            completion_tokens INTEGER NOT NULL,
+            total_tokens INTEGER NOT NULL,
+            cached_tokens INTEGER,
+            prompt_ms INTEGER,
+            generation_ms INTEGER,
+            latency_ms INTEGER NOT NULL,
+            status INTEGER NOT NULL,
+            streamed INTEGER NOT NULL DEFAULT 0,
+            estimated INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL
+        )",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    db::migrate(&pool).await.unwrap();
+
+    assert!(!table_exists(&pool, "users_new").await);
+    assert!(!table_exists(&pool, "usage_new").await);
+    assert_eq!(
+        user_columns(&pool).await.join(","),
+        "created_at,daily_token_cap,enabled,id,password_hash,pending,role,username"
+    );
+    assert_eq!(key_action(&pool).await, "SET NULL");
+
+    // The account and its row keep their values, once each.
+    assert_eq!(count(&pool, "users").await, 1);
+    let account =
+        sqlx::query("SELECT id, username, role, daily_token_cap, enabled, pending FROM users")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(account.get::<i64, _>("id"), 1);
+    assert_eq!(account.get::<String, _>("username"), "ada");
+    assert_eq!(account.get::<String, _>("role"), "admin");
+    assert_eq!(account.get::<i64, _>("daily_token_cap"), 500);
+    assert_eq!(account.get::<i64, _>("enabled"), 1);
+    assert_eq!(account.get::<i64, _>("pending"), 0);
+    assert_eq!(count(&pool, "usage").await, 1);
+    let usage = sqlx::query(
+        "SELECT api_key_id, user_id, model, prompt_tokens, completion_tokens, total_tokens, \
+         latency_ms, status, estimated, created_at FROM usage",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(usage.get::<Option<i64>, _>("api_key_id"), Some(1));
+    assert_eq!(usage.get::<i64, _>("user_id"), 1);
+    assert_eq!(usage.get::<String, _>("model"), "test-model");
+    assert_eq!(usage.get::<i64, _>("prompt_tokens"), 11);
+    assert_eq!(usage.get::<i64, _>("completion_tokens"), 7);
+    assert_eq!(usage.get::<i64, _>("total_tokens"), 18);
+    assert_eq!(usage.get::<i64, _>("latency_ms"), 5);
+    assert_eq!(usage.get::<i64, _>("status"), 200);
+    assert_eq!(
+        usage.get::<i64, _>("estimated"),
+        1,
+        "an estimate is still marked as one"
+    );
+    assert_eq!(usage.get::<String, _>("created_at"), "2026-01-01T00:00:00Z");
+    assert_eq!(count(&pool, "api_keys").await, 1);
+    assert_eq!(count(&pool, "sessions").await, 1);
+    assert_eq!(
+        usage_indexes(&pool).await.join(","),
+        "idx_usage_created,idx_usage_key,idx_usage_user"
+    );
+}
+
+// Two accounts the old table let share a display name cannot both become a username, so the copy into
+// the rebuilt table fails. What is tested is what that failure leaves: the table as it was, nothing
+// beside it, and a connection with foreign keys on, so the next start meets the same database and fails
+// for the same reason rather than on a table an earlier start left behind.
+#[tokio::test]
+async fn a_rebuild_that_fails_partway_leaves_the_table_as_it_was() {
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
+        .unwrap();
+    sqlx::query(
+        "CREATE TABLE users (
+            id INTEGER PRIMARY KEY,
+            email TEXT NOT NULL UNIQUE,
+            name TEXT NOT NULL,
+            password_hash TEXT NOT NULL,
+            role TEXT NOT NULL DEFAULT 'user',
+            created_at TEXT NOT NULL,
+            daily_token_cap INTEGER
+        )",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    for statement in db::SCHEMA {
+        sqlx::query(*statement).execute(&pool).await.unwrap();
+    }
+    sqlx::query("INSERT INTO users (email, name, password_hash, role, created_at, daily_token_cap) VALUES ('ada@example.com', 'ada', 'hash', 'admin', '2026-01-01T00:00:00Z', 500)")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO users (email, name, password_hash, role, created_at) VALUES ('ada@example.org', 'ada', 'hash', 'user', '2026-01-02T00:00:00Z')")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO sessions (token, user_id, created_at) VALUES ('session', 1, '2026-01-01T00:00:00Z')")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    for _ in 0..2 {
+        let err = db::migrate(&pool).await.unwrap_err();
+        assert!(err.to_string().contains("UNIQUE"), "{err}");
+
+        assert!(!table_exists(&pool, "users_new").await);
+        assert_eq!(
+            user_columns(&pool).await.join(","),
+            "created_at,daily_token_cap,email,id,name,password_hash,role"
+        );
+        assert_eq!(count(&pool, "users").await, 2);
+        assert_eq!(
+            sqlx::query("SELECT daily_token_cap FROM users WHERE id = 1")
+                .fetch_one(&pool)
+                .await
+                .unwrap()
+                .get::<i64, _>("daily_token_cap"),
+            500
+        );
+        assert_eq!(count(&pool, "sessions").await, 1);
+        assert_eq!(
+            sqlx::query("PRAGMA foreign_keys")
+                .fetch_one(&pool)
+                .await
+                .unwrap()
+                .get::<i64, _>(0),
+            1,
+            "the connection went back to the pool with foreign keys on"
+        );
+    }
 }
 
 #[tokio::test]
