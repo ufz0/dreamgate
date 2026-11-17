@@ -240,6 +240,8 @@ main {
 .readout-pair { display: flex; flex-wrap: wrap; gap: 24px; }
 .readout-pair > div { flex: 1 1 240px; }
 
+/* The label names which side of the request a figure counts, so it reads before the number. */
+.readout-label { margin: 0 0 2px; color: var(--text-muted); font-size: 13px; font-weight: 600; }
 .readout { margin: 0 0 4px; font: 400 34px/1.2 var(--font-mono); font-variant-numeric: tabular-nums; color: var(--text); }
 .readout-note { margin: 0 0 20px; color: var(--text-muted); font-size: 13px; }
 
@@ -261,13 +263,15 @@ main {
 /* Live traffic */
 
 /* The head names the columns of the rows under it, so it shares their grid. It scrolls in the same box as
-   the rows and sticks to its top, so it stays in place and a scrollbar narrows both alike. */
+   the rows and sticks to its top, so it stays in place and a scrollbar narrows both alike. The input and
+   the output are a column each, wide enough for "Output tokens" on one line. The key and the model share
+   what is left, so on a narrow window neither shrinks to nothing and the counts stay in view. */
 .feed-scroll { max-height: 300px; overflow: auto; }
 .feed { list-style: none; margin: 0; padding: 0; }
 
 .feed li, .feed-head {
   display: grid;
-  grid-template-columns: 64px 140px minmax(0, 1fr) 44px 64px;
+  grid-template-columns: 64px minmax(64px, 1fr) minmax(48px, 3fr) 44px 88px 88px;
   gap: 12px;
   padding: 5px 0;
   border-bottom: 1px solid var(--border);
@@ -321,7 +325,9 @@ main {
 
 /* Tables */
 
-.table { overflow-x: auto; }
+/* A table scrolls sideways inside its own box. The box is positioned, so the hidden Actions header,
+   which is absolutely positioned, scrolls with it rather than widening the page. */
+.table { overflow-x: auto; position: relative; }
 
 table { width: 100%; border-collapse: collapse; }
 
@@ -588,7 +594,10 @@ input:focus-visible, select:focus-visible, textarea:focus-visible, button:focus-
   .shell[data-drawer="open"] .scrim { display: block; }
   .scrim { display: none; position: fixed; inset: 0; background: rgba(0, 0, 0, .35); z-index: 1; }
   .entry { grid-template-columns: 1fr; padding: 24px; }
-  .feed li, .feed-head { grid-template-columns: 56px 100px minmax(0, 1fr) 40px 56px; }
+  /* Six columns fit a phone only with less room between them: these fit the 320px a 360px phone leaves
+     inside main's padding. On a narrower screen the feed scrolls sideways, as the tables do, rather than
+     cutting the key and the model to nothing. */
+  .feed li, .feed-head { grid-template-columns: 56px minmax(41px, 1fr) minmax(41px, 1fr) 40px 56px 56px; gap: 6px; min-width: 320px; }
 }
 
 @media (prefers-reduced-motion: reduce) {

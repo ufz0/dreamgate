@@ -1395,6 +1395,124 @@ async fn the_keys_list_is_the_callers_own_and_only_an_admin_can_read_the_others(
 }
 
 #[tokio::test]
+async fn the_key_account_and_model_figures_carry_the_input_and_the_output_apart() {
+    let st = test_state().await;
+    let router = build_router(st.clone());
+    let base_url = mock_upstream().await;
+    let admin = register(&router, "ada").await;
+    post_json(
+        &router,
+        "/api/connections",
+        &admin,
+        json!({ "name": "test", "base_url": base_url, "default_model": "reports-usage" }),
+    )
+    .await;
+    open_registration(&router, &admin).await;
+    no_approval(&router, &admin).await;
+    let member = register(&router, "ben").await;
+    // An account an admin made has no usage, and still has a row.
+    post_json(&router, "/api/users", &admin, json!({ "username": "cy" })).await;
+
+    // The mock reports 11 tokens in and 7 out for every request.
+    let (_, used) = post_json(&router, "/api/keys", &admin, json!({ "name": "used" })).await;
+    post_json(&router, "/api/keys", &admin, json!({ "name": "unused" })).await;
+    let (_, member_key) = post_json(
+        &router,
+        "/api/keys",
+        &member,
+        json!({ "name": "member key" }),
+    )
+    .await;
+    for key in [&used, &used, &member_key] {
+        gateway_call(
+            &router,
+            key["key"].as_str().unwrap(),
+            json!({ "messages": [{ "role": "user", "content": "hi" }] }),
+        )
+        .await;
+    }
+
+    let own = get_json(&router, "/api/keys", &admin).await;
+    let named = |list: &Value, name: &str| {
+        list["keys"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|key| key["name"] == name)
+            .cloned()
+            .unwrap()
+    };
+    let key = named(&own, "used");
+    assert_eq!(key["prompt_tokens"], 22);
+    assert_eq!(key["completion_tokens"], 14);
+    assert_eq!(key["tokens"], 36, "the total a key's cap counts stays");
+    let idle = named(&own, "unused");
+    assert_eq!(
+        (&idle["prompt_tokens"], &idle["completion_tokens"]),
+        (&json!(0), &json!(0)),
+        "a key that has not been used reads zero on both sides, not null"
+    );
+    let others = get_json(&router, "/api/keys/others", &admin).await;
+    let theirs = named(&others, "member key");
+    assert_eq!(theirs["prompt_tokens"], 11);
+    assert_eq!(theirs["completion_tokens"], 7);
+
+    let summary = get_json(&router, "/api/stats/summary", &admin).await;
+    let models = summary["models"].as_array().unwrap();
+    assert_eq!(models.len(), 1);
+    assert_eq!(models[0]["prompt_tokens"], 33);
+    assert_eq!(models[0]["completion_tokens"], 21);
+    assert_eq!(models[0]["tokens"], 54);
+    let member_summary = get_json(&router, "/api/stats/summary", &member).await;
+    assert_eq!(
+        member_summary["models"][0]["prompt_tokens"], 11,
+        "a member's models are their own"
+    );
+    assert_eq!(member_summary["models"][0]["completion_tokens"], 7);
+
+    // A recorded request outlives its key, so the account's split stands when the key goes.
+    let (status, _) = send_json(
+        &router,
+        http::Method::DELETE,
+        &format!("/api/keys/{}", used["id"]),
+        &admin,
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let summary = get_json(&router, "/api/stats/summary", &admin).await;
+    let account = |name: &str| {
+        summary["users"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|user| user["username"] == name)
+            .cloned()
+            .unwrap()
+    };
+    let ada = account("ada");
+    assert_eq!(ada["prompt_tokens"], 22);
+    assert_eq!(ada["completion_tokens"], 14);
+    assert_eq!(
+        ada["used_today"], 36,
+        "the day figure is the input and the output together, as the daily limit counts it"
+    );
+    let ben = account("ben");
+    assert_eq!(ben["prompt_tokens"], 11);
+    assert_eq!(ben["completion_tokens"], 7);
+    let cy = account("cy");
+    assert_eq!(
+        (
+            &cy["prompt_tokens"],
+            &cy["completion_tokens"],
+            &cy["used_today"]
+        ),
+        (&json!(0), &json!(0), &json!(0)),
+        "an account with no usage reads zero on both sides, not null"
+    );
+}
+
+#[tokio::test]
 async fn deleting_a_key_leaves_the_usage_recorded_for_it() {
     let st = test_state().await;
     let router = build_router(st.clone());
@@ -1508,6 +1626,11 @@ async fn per_key_token_cap_blocks_the_next_request() {
     )
     .await;
     assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    // The cap counts the input and the output together, so the refusal says so.
+    assert_eq!(
+        json_body(response).await["error"]["message"],
+        "key 'capped' has reached its token cap of 10 input and output tokens"
+    );
 }
 
 #[tokio::test]
@@ -1557,6 +1680,10 @@ async fn account_daily_limit_blocks_the_next_request() {
     )
     .await;
     assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(
+        json_body(response).await["error"]["message"],
+        "account 'ada' has used its daily token limit of 15 input and output tokens"
+    );
 }
 
 #[tokio::test]
@@ -2745,7 +2872,7 @@ async fn the_session_cookie_is_marked_secure_only_when_the_request_arrived_over_
 // an OpenAI-shaped server does, so a stream is still running for long enough to be watched from the page.
 // It holds the stream open for a second after the usage chunk, four progress ticks, as an upstream that
 // sends its end separately can, so the counts it reported are seen in flight before the row.
-async fn slow_upstream(words: usize, delay_ms: u64) -> String {
+async fn slow_upstream(words: usize, delay_ms: u64, input_first: bool) -> String {
     let chat = move || async move {
         let body = stream::unfold(0usize, move |sent| async move {
             if sent > words {
@@ -2753,7 +2880,11 @@ async fn slow_upstream(words: usize, delay_ms: u64) -> String {
                 return None;
             }
             tokio::time::sleep(Duration::from_millis(delay_ms)).await;
-            let line = if sent < words {
+            // Some engines report the input in their first chunk and what they generated only in the last,
+            // so the mock can send the input's count with the first word.
+            let line = if sent == 0 && input_first {
+                json!({ "choices": [{ "delta": { "content": "word0" } }], "usage": { "prompt_tokens": 11 } })
+            } else if sent < words {
                 json!({ "choices": [{ "delta": { "content": format!("word{sent}") } }] })
             } else {
                 json!({ "choices": [], "usage": { "prompt_tokens": 11, "completion_tokens": 42 } })
@@ -2831,7 +2962,7 @@ impl Live {
 async fn a_stream_in_flight_is_on_the_live_stream_and_its_row_takes_its_place() {
     let st = test_state().await;
     let router = build_router(st.clone());
-    let base_url = slow_upstream(40, 50).await;
+    let base_url = slow_upstream(40, 50, false).await;
     let cookie = register(&router, "ada").await;
     post_json(
         &router,
@@ -2889,10 +3020,15 @@ async fn a_stream_in_flight_is_on_the_live_stream_and_its_row_takes_its_place() 
                             !reported,
                             "the count went back to an estimate after the upstream reported one"
                         );
+                        assert_eq!(
+                            progress["prompt_estimated"], true,
+                            "the input is the gateway's estimate until the upstream reports it"
+                        );
                         estimates.push(progress["completion_tokens"].as_i64().unwrap());
                     } else {
                         assert_eq!(progress["prompt_tokens"], 11);
                         assert_eq!(progress["completion_tokens"], 42);
+                        assert_eq!(progress["prompt_estimated"], false);
                         reported = true;
                     }
                     cleared = false;
@@ -2937,6 +3073,74 @@ async fn a_stream_in_flight_is_on_the_live_stream_and_its_row_takes_its_place() 
     assert_eq!(usage["event"]["completion_tokens"], 42);
 }
 
+// The feed shows the input and what was generated in columns of their own, so each says on its own whether
+// it is the gateway's estimate. An upstream that reports the input in its first chunk has the input shown as
+// reported while the generated count is still an estimate, rather than both waiting for the last chunk.
+#[tokio::test]
+async fn a_stream_that_reports_its_input_first_shows_it_as_reported_while_the_rest_is_estimated() {
+    let st = test_state().await;
+    let router = build_router(st.clone());
+    let base_url = slow_upstream(20, 50, true).await;
+    let cookie = register(&router, "ada").await;
+    post_json(
+        &router,
+        "/api/connections",
+        &cookie,
+        json!({ "name": "slow", "base_url": base_url }),
+    )
+    .await;
+    let (_, created) = post_json(&router, "/api/keys", &cookie, json!({ "name": "watched" })).await;
+    let key = created["key"].as_str().unwrap().to_string();
+
+    let mut live = Live::open(&router, &cookie).await;
+    assert_eq!(live.next().await["type"], "snapshot");
+
+    let answer = {
+        let router = router.clone();
+        tokio::spawn(async move {
+            let response = gateway_call(
+                &router,
+                &key,
+                json!({ "model": "slow-model", "stream": true, "messages": [{ "role": "user", "content": "hi" }] }),
+            )
+            .await;
+            response.into_body().collect().await.unwrap().to_bytes()
+        })
+    };
+
+    let mut input_first = false;
+    loop {
+        let event = live.next().await;
+        if event["type"] == "usage" {
+            break;
+        }
+        if event["type"] != "progress" {
+            continue;
+        }
+        let Some(progress) = event["streams"].as_array().unwrap().first() else {
+            continue;
+        };
+        if progress["prompt_estimated"] == false && progress["estimated"] == true {
+            assert_eq!(
+                progress["prompt_tokens"], 11,
+                "the input shown as reported is the upstream's count"
+            );
+            input_first = true;
+        }
+        if progress["prompt_estimated"] == true {
+            assert!(
+                !input_first,
+                "the input went back to an estimate after the upstream reported it"
+            );
+        }
+    }
+    answer.await.unwrap();
+    assert!(
+        input_first,
+        "the input was seen as reported while the generated count was still an estimate"
+    );
+}
+
 // Another account's stream is part of the platform total, which anyone signed in sees, but the stream
 // itself, its key and its model, is listed for an admin alone, as the rest of the usage is. A member is
 // told the stream's share of what is being generated and, when it ends, the row's figures and nothing else,
@@ -2945,7 +3149,7 @@ async fn a_stream_in_flight_is_on_the_live_stream_and_its_row_takes_its_place() 
 async fn another_accounts_stream_is_listed_for_an_admin_and_only_counted_for_a_member() {
     let st = test_state().await;
     let router = build_router(st.clone());
-    let base_url = slow_upstream(40, 50).await;
+    let base_url = slow_upstream(40, 50, false).await;
     let admin = register(&router, "ada").await;
     open_registration(&router, &admin).await;
     no_approval(&router, &admin).await;

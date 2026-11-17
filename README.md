@@ -200,28 +200,28 @@ Open it at the address above. It is a no-build single-page app with seven views 
 URL hash (`#/overview`, `#/activity`, `#/keys`, `#/connections`, `#/connect`, `#/sandbox`,
 `#/accounts`):
 
-- **Overview** — the gate readout (client → key → upstream, following the key and the
-  connection the last request actually used, which is not necessarily the first key), the tokens the
-  models generated as the headline figure for the whole gate, with the input tokens beside it as one
-  number and a note saying how much of that input came from a prompt cache when any engine reported
-  one. What was sent in is not counted as what was generated: an agentic client sends the whole
-  conversation again on every turn, so the input figure is mostly repeats. The same pair for this
-  account alone, so the generated figure is what this account produced and not what every account
-  produced, then the rest of its figures including today's split into input and generated, a
+- **Overview** — the gate readout (client → key → upstream, following the key and the connection the
+  last request actually used, which is not necessarily the first key, with that request's input and
+  output tokens), the tokens the models generated as the headline figure for the whole gate, with the
+  input tokens beside it as one number and a note saying how much of that input came from a prompt cache
+  when any engine reported one. What was sent in is not counted as what was generated: an agentic client
+  sends the whole conversation again on every turn, so the input figure is mostly repeats. The same pair
+  for this account alone, so the generated figure is what this account produced and not what every
+  account produced, then the rest of its figures including today's split into input and output, a
   "Right now" panel for who is online and generating, and the token rate per hour (input and output
   together, as it has always counted them) and requests per day for this account. Average prompt
   processing time and average generation speed appear only when an engine reported timings for some
   request, and the speed is measured over the rows whose counts an upstream reported rather than over
-  estimated ones; when nothing reported timings those rows are not shown. Totals across accounts are
-  in the Accounts view.
-- **Activity** — the last 50 recorded requests, newest first, plus usage by model for the eight
-  models with the most tokens: every account's for an admin, and otherwise this account's own. The
-  page says which.
-- **Keys** — create, copy, disable and delete keys, with per-key usage, and a note when a
-  key's binding points at a connection that is turned off. A key that is turned off stays listed and
-  reads dimmer than the keys that work. The table is this account's own keys for anyone; under it an
-  admin can pick another account, or all of them, and see those keys with the account each one
-  belongs to.
+  estimated ones; when nothing reported timings those rows are not shown. Totals across accounts are in
+  the Accounts view.
+- **Activity** — the last 50 recorded requests, newest first, with each one's input and output tokens,
+  plus usage by model for the eight models with the most tokens, input and output together, each split
+  into the two: every account's for an admin, and otherwise this account's own. The page says which.
+- **Keys** — create, copy, disable and delete keys, with per-key usage split into input and output
+  tokens (a key's token cap counts the two together), and a note when a key's binding points at a
+  connection that is turned off. A key that is turned off stays listed and reads dimmer than the keys
+  that work. The table is this account's own keys for anyone; under it an admin can pick another
+  account, or all of them, and see those keys with the account each one belongs to.
 - **Connections** — add and health-check upstreams. A connection that no check has reached yet reads
   "not checked yet" rather than down, here and in the gate readout on the Overview, because the gateway
   only skips one whose check failed. Admin-only, like the per-account figures, and that rule is on the
@@ -233,25 +233,35 @@ URL hash (`#/overview`, `#/activity`, `#/keys`, `#/connections`, `#/connect`, `#
   use, so the request is recorded like any other. Pick a key and a model from the connection's
   model list; the answer streams in as it arrives and the conversation stays in this page. A
   model that sends reasoning gets it as a separate section above the answer.
-- **Accounts** — per-account totals and everything an admin can do to an account: the daily
-  token limit, a new username, a new password, disable, delete, approve an account that is
-  waiting. Admin-only. This is also where an admin opens or closes self-registration, turns
-  approval on or off, and makes an account without opening registration.
+- **Accounts** — per-account totals split into input and output tokens, beside what the account used
+  today, which is the two together because that is what the daily limit counts, and everything an admin
+  can do to an account: the daily token limit, a new username, a new password, disable, delete, approve
+  an account that is waiting. Admin-only. This is also where an admin opens or closes self-registration,
+  turns approval on or off, and makes an account without opening registration.
 
-The dashboard reads `/api/stats/summary` and subscribes to `/api/live`, so the counters, the
-charts, the presence panel and the activity table update as traffic arrives — rows land in the
-current view without a reload. The only thing the page asks for on a timer is the presence panel, every
-30 seconds, because the five-minute online window passes with time as well as with traffic.
+Every token figure on the page says which side of a request it counts: input tokens, what was sent in;
+output tokens, what the model generated; or the two together, where a figure is measured against a limit or
+a chart has always counted both. A key's token cap and an account's daily limit say that they count both,
+and so does the message a request is refused with when it reaches either. The tables and the live traffic
+feed show the two sides as separate columns rather than one sum, and `/api/keys`, `/api/keys/others` and the
+per-account and per-model rows of `/api/stats/summary` carry `prompt_tokens` and `completion_tokens` beside
+the total they already had.
+
+The dashboard reads `/api/stats/summary` and subscribes to `/api/live`, so the counters, the charts, the
+presence panel, the activity table and an account's row in the Accounts view update as traffic arrives — rows
+land in the current view without a reload. The only thing the page asks for on a timer is the presence panel,
+every 30 seconds, because the five-minute online window passes with time as well as with traffic.
 
 A stream is on the page while it runs, not only once its row is written. The gateway keeps how far each
-stream in flight has got — the input and what it has generated so far, by the same estimate a row is given
-when nothing is reported, and the upstream's own count once it has reported the generated tokens — and
+stream in flight has got — the input and what it has generated so far, each by the same estimate a row is
+given when nothing is reported until the upstream has reported that count itself — and
 `/api/live` sends that to a page at most four times a second, and only when what that page would be sent has
 changed, however many streams are running. The two generated figures at the top of the Overview include it,
 and their notes say how much of the figure is still being generated and, while it is the gateway's count,
 that it is an estimate until the request is recorded; the live traffic feed shows each stream as a row marked
-live, above the recorded rows and within the same twelve, its tokens marked with a ~ while they are
-estimated. The other figures, the charts and the support panel move when the row is recorded.
+live, above the recorded rows and within the same twelve, its input and its output tokens each marked with a ~
+while that count is the gateway's estimate, because an upstream can report the input before what it generated.
+The other figures, the charts and the support panel move when the row is recorded.
 
 When the request finishes, the stream leaves the list in the same step that sends its row, so a page goes
 from one to the other in one repaint: the figure neither dips while the row is written nor counts the two
@@ -348,7 +358,9 @@ recording, estimation when the upstream reports nothing including reasoning text
 pass-through, that a client's reasoning level reaches the upstream unchanged, upstream failover,
 the round of health checks marking a connection that answers,
 the model recorded for a streamed request when nothing is pinned to a key or a connection,
-per-key limits and their validation, the keys list being the caller's own with the other
+per-key limits and their validation, the per-key, per-account and per-model figures carrying the input and the
+output apart, including for a key or an account with no usage and after a key is deleted, the keys list being the
+caller's own with the other
 accounts read by an admin alone, per-account daily token limits including the day
 boundary and the admin-only rule for setting one, the admin/user scoping of the stats
 queries and the split between a caller's own figures and the platform total, a taken username named when registering, including one held for approval, with any other failure
@@ -358,7 +370,8 @@ account made by an admin with no password until its first sign-in, the account a
 rename, new password, approve, delete) and what they do to a sign-in, a key and the recorded usage,
 that deleting a key leaves the rows recorded for it and the
 counters standing, the presence counts while a request is in flight, a stream's progress reaching the live
-stream while it runs, moving from the estimate to what the upstream reported, and leaving it only when its row
+stream while it runs, moving from the estimate to what the upstream reported, with the input marked as reported
+on its own when an upstream reports it first, and leaving it only when its row
 arrives, which names the stream it settles, another account's stream listed for an admin and only counted for a
 member, who is sent its row's figures and nothing else, the connections routes being
 admin-only with the key a connection carries returned to an admin alone, the model list refusing a

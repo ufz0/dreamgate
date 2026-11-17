@@ -36,7 +36,8 @@ pub struct Presence {
 
 // A stream in flight and how far it has got. The counts are the gateway's own estimate, the same one a
 // row is given when nothing is reported, until the upstream reports its own, which most only do in their
-// last chunk; `estimated` says which of the two they are.
+// last chunk; `estimated` says which of the two the generated count is, and `prompt_estimated` says the
+// same of the input, because an upstream can report the input before it reports what it generated.
 #[derive(Clone, Serialize)]
 pub struct Progress {
     pub stream: u64,
@@ -46,6 +47,7 @@ pub struct Progress {
     pub prompt_tokens: i64,
     pub completion_tokens: i64,
     pub estimated: bool,
+    pub prompt_estimated: bool,
     pub started_at: String,
 }
 
@@ -87,6 +89,7 @@ pub fn start_stream(
             prompt_tokens,
             completion_tokens: 0,
             estimated: true,
+            prompt_estimated: true,
             started_at: crate::clock::now(),
         },
     );
@@ -102,22 +105,35 @@ impl InFlight {
         self.stream
     }
 
-    pub fn update(&self, prompt_tokens: i64, completion_tokens: i64, estimated: bool) {
+    pub fn update(
+        &self,
+        prompt_tokens: i64,
+        completion_tokens: i64,
+        prompt_estimated: bool,
+        estimated: bool,
+    ) {
         let mut guard = self.st.presence.lock().expect("presence lock");
         let presence = &mut *guard;
         let Some(progress) = presence.streams.get_mut(&self.stream) else {
             return;
         };
-        let next = (prompt_tokens, completion_tokens, estimated);
+        let next = (
+            prompt_tokens,
+            completion_tokens,
+            prompt_estimated,
+            estimated,
+        );
         if (
             progress.prompt_tokens,
             progress.completion_tokens,
+            progress.prompt_estimated,
             progress.estimated,
         ) != next
         {
             (
                 progress.prompt_tokens,
                 progress.completion_tokens,
+                progress.prompt_estimated,
                 progress.estimated,
             ) = next;
             presence.version += 1;
