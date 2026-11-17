@@ -374,7 +374,7 @@ fn drain_buffer(buffer: &mut Vec<u8>, generated: &mut String, report: &mut Repor
 
 async fn record(st: &State, row: &UsageRow) {
     if let Err(err) = usage::record(st, row).await {
-        tracing::warn!("usage record failed: {err}");
+        tracing::error!("usage record failed: {err}");
     }
 }
 
@@ -498,7 +498,7 @@ fn stream_body(
         let event = match usage::write(&ctx.st, &row).await {
             Ok(event) => Some(event),
             Err(err) => {
-                tracing::warn!("usage record failed: {err}");
+                tracing::error!("usage record failed: {err}");
                 None
             }
         };

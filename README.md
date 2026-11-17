@@ -46,6 +46,10 @@ Environment variables:
   applied to a stream: a stream has no known end and is bounded by silence instead.
 - `DREAMGATE_STREAM_STALL_SECS` — how long a stream may go without producing anything before it is closed as a
   dead connection, default 120
+- `RUST_LOG` — which log lines are printed to standard output, in the usual form (`warn`, `dreamgate=debug`),
+  default `info`. At that level a request prints nothing; what does print is an error or a warning, such as a
+  usage row that could not be written, which the key caps and daily limits then do not count either, a stream
+  closed for going quiet, or a database statement that took longer than a second
 
 ## Using it
 
@@ -452,8 +456,8 @@ single-threaded runtime would measure one worker rather than the gateway. There 
 Rust, so what stands in its place is that shared state is only reachable through types the compiler requires to
 be `Send` and `Sync`, plus running the concurrency tests repeatedly. The environment variables themselves are
 read in `src/main.rs`, which is the composition root and nothing in the suite reaches it, so the pool size is not
-exercised by a test; the one thing tested there is the dashboard address the startup line names, a unit test
-beside the function that picks it. The two time bounds are exercised, because the tests build the client and the state through
+exercised by a test; the things tested there are the dashboard address the startup line names and the log
+filter chosen from `RUST_LOG`, set or not, each a unit test beside the function that picks it. The two time bounds are exercised, because the tests build the client and the state through
 the same functions the gateway uses; the connect timeout and the number of connections kept idle are read through
 that builder but no test asserts what they do. The pool and the busy timeout are exercised through `db::connect`
 against a shared-cache in-memory database, which is not the same mechanism as writer contention on a file.

@@ -2,11 +2,13 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::Path;
 
 use dreamgate::{build_router, db, limits, live, registry, state};
+use tracing_subscriber::EnvFilter;
+use tracing_subscriber::filter::LevelFilter;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .with_env_filter(log_filter(std::env::var("RUST_LOG").ok().as_deref()))
         .init();
 
     let database =
@@ -64,6 +66,17 @@ fn dashboard_address(bound: SocketAddr) -> SocketAddr {
     SocketAddr::new(loopback, bound.port())
 }
 
+// Left to the subscriber, an unset RUST_LOG prints errors alone, so a usage row that could not be
+// written, which the key caps and daily limits then do not count either, and a stream closed for going
+// quiet were never printed. The default is info instead: the warnings print, and nothing here or in the
+// libraries logs at info on every request. RUST_LOG decides when it is set, in its usual form; a value
+// that is empty, or has nothing in it that can be read, leaves the default.
+fn log_filter(rust_log: Option<&str>) -> EnvFilter {
+    EnvFilter::builder()
+        .with_default_directive(LevelFilter::INFO.into())
+        .parse_lossy(rust_log.unwrap_or_default())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -82,6 +95,24 @@ mod tests {
                 dashboard_address(bound).to_string(),
                 named,
                 "bound to {bound}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_log_filter_is_info_unless_rust_log_names_another() {
+        for (rust_log, filter) in [
+            (None, "info"),
+            (Some(""), "info"),
+            (Some("dreamgate=loud"), "info"),
+            (Some("warn"), "warn"),
+            (Some("debug"), "debug"),
+            (Some("dreamgate=trace"), "dreamgate=trace"),
+        ] {
+            assert_eq!(
+                log_filter(rust_log).to_string(),
+                filter,
+                "RUST_LOG={rust_log:?}"
             );
         }
     }
