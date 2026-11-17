@@ -33,6 +33,7 @@ pub const SCHEMA: &[&str] = &[
         health TEXT NOT NULL DEFAULT 'unknown',
         last_checked_at TEXT,
         max_concurrent INTEGER,
+        models TEXT,
         created_at TEXT NOT NULL
     )",
     "CREATE TABLE IF NOT EXISTS api_keys (
@@ -261,6 +262,7 @@ pub async fn migrate(pool: &SqlitePool) -> Result<(), sqlx::Error> {
     // table.
     add_usage_columns(pool).await?;
     add_connection_limit(pool).await?;
+    add_connection_models(pool).await?;
     relax_key_reference(pool).await?;
     for statement in INDEXES {
         sqlx::query(*statement).execute(pool).await?;
@@ -293,6 +295,19 @@ async fn add_connection_limit(pool: &SqlitePool) -> Result<(), sqlx::Error> {
         return Ok(());
     }
     sqlx::query("ALTER TABLE connections ADD COLUMN max_concurrent INTEGER")
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+// The models a connection listed at its last check, as a JSON array of their ids, so a request can be sent to
+// a connection that serves its model. Null means no list has been read, which says nothing about what the
+// connection serves, so a row written before the change keeps its meaning: not known.
+async fn add_connection_models(pool: &SqlitePool) -> Result<(), sqlx::Error> {
+    if has_column(pool, "connections", "models").await? {
+        return Ok(());
+    }
+    sqlx::query("ALTER TABLE connections ADD COLUMN models TEXT")
         .execute(pool)
         .await?;
     Ok(())

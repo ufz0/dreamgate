@@ -871,7 +871,7 @@ async fn forward(st: State, headers: HeaderMap, body: Value, endpoint: Endpoint)
         Err(blocked) => return *blocked,
     };
 
-    let candidates = registry::candidates(&st, key.connection_id).await;
+    let mut candidates = registry::candidates(&st, key.connection_id).await;
     if candidates.is_empty() {
         return error(
             StatusCode::BAD_GATEWAY,
@@ -881,6 +881,15 @@ async fn forward(st: State, headers: HeaderMap, body: Value, endpoint: Endpoint)
     }
     let wants_stream = endpoint.wants_stream(&body);
     let requested = body.get("model").and_then(Value::as_str);
+    // An upstream's answer is passed on as it is, a 404 for a model it does not have included, so the order is
+    // what decides whether a request for a model reaches one that serves it. A connection whose last list does
+    // not name the model it would be sent is tried after the others rather than left out, because a list is
+    // only read every 30 seconds and some servers answer to any name. The sort is stable, so the order within
+    // each part is the one `registry::candidates` gave.
+    candidates.sort_by_key(|conn| {
+        resolve_model(endpoint, key.model.as_deref(), conn, requested)
+            .is_some_and(|model| conn.lists_without(&model))
+    });
     // The request is admitted as a whole, before anything is asked of a connection, and the slots are held for
     // as long as it runs. Nothing is queued here: a connection that is full is skipped, so one slow
     // connection cannot hold unrelated requests behind it. Admitting once, at the start, is also what keeps a
@@ -1159,6 +1168,24 @@ async fn forward(st: State, headers: HeaderMap, body: Value, endpoint: Endpoint)
     error(StatusCode::BAD_GATEWAY, "upstream_unavailable", last_error)
 }
 
+// The models the connections listed at their last checks, each once, in the order a request tries them, so a
+// model is named after the connection a request for it reaches first. A connection whose list has not been
+// read is left out, because what it serves is not known; nothing is made up for it. Only what the lists say is
+// written, the id and the connection, and none of the dates or owners an upstream gives, which differ between
+// upstreams for the same model.
+fn merged_models(candidates: &[registry::Connection]) -> Response {
+    let mut seen = std::collections::HashSet::new();
+    let mut data = Vec::new();
+    for conn in candidates {
+        for model in conn.models.iter().flatten() {
+            if seen.insert(model.as_str()) {
+                data.push(json!({ "id": model, "object": "model", "owned_by": conn.name }));
+            }
+        }
+    }
+    Json(json!({ "object": "list", "data": data })).into_response()
+}
+
 pub async fn list_models(AxumState(st): AxumState<State>, headers: HeaderMap) -> Response {
     if st.shutdown.phase() != Phase::Running {
         return shutting_down();
@@ -1191,17 +1218,19 @@ pub async fn list_models(AxumState(st): AxumState<State>, headers: HeaderMap) ->
         Ok(None) => return unknown_key(),
         Err(err) => return unreadable(err),
     }
-    let Some(conn) = registry::candidates(&st, key.connection_id)
-        .await
-        .first()
-        .cloned()
-    else {
+    let candidates = registry::candidates(&st, key.connection_id).await;
+    let Some(conn) = candidates.first().cloned() else {
         return error(
             StatusCode::BAD_GATEWAY,
             "no_upstream",
             "no enabled connection is available for this key",
         );
     };
+    if candidates.iter().any(|conn| conn.models.is_some()) {
+        return merged_models(&candidates);
+    }
+    // No list has been read yet, before the first round of checks or from upstreams whose list is not in the
+    // OpenAI shape, so the first connection is asked, as it was before the lists were kept.
     // The model list is a single answer, not a stream, so the same deadline covers it as covers any single
     // answer, as the client's total deadline did before this change.
     let result = st

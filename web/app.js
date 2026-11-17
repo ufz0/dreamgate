@@ -863,7 +863,7 @@ function renderConnections() {
             <td><span class="clamp">${esc(connection.base_url)}</span></td>
             <td>${esc(connection.default_model || 'the model the client asks for')}</td>
             <td class="num">${esc(connection.priority)}</td>
-            <td>${healthChip(connection.health)}</td>
+            <td>${healthChip(connection.health)} ${modelsNote(connection.models)}</td>
             <td class="num">
               <button class="link" data-check="${connection.id}">Check health</button>
               <button class="link danger" data-drop="${connection.id}">Remove</button>
@@ -872,6 +872,14 @@ function renderConnections() {
         )
         .join('')
     : `<tr><td colspan="6">No connection yet. Add one above. Any endpoint that speaks the OpenAI API works, including llama.cpp, Ollama and vLLM.</td></tr>`;
+}
+
+// What the last check read of a connection's model list, which is what a request for a model is routed by.
+// A list that was never read is said to be unknown rather than shown as empty.
+function modelsNote(models) {
+  if (!Array.isArray(models)) return '<span class="muted" title="No model list has been read from this connection yet">models unknown</span>';
+  const label = models.length === 1 ? '1 model' : `${nf.format(models.length)} models`;
+  return `<span class="muted" title="${esc(models.join(', '))}">${label}</span>`;
 }
 
 // Connect a client

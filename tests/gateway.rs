@@ -1908,6 +1908,15 @@ async fn the_connection_limit_is_added_to_a_database_written_before_it() {
         None,
         "a connection written before the change reads as nothing stated"
     );
+    let models = sqlx::query("SELECT models FROM connections")
+        .fetch_one(&pool)
+        .await
+        .unwrap()
+        .get::<Option<String>, _>("models");
+    assert_eq!(
+        models, None,
+        "a connection written before its list was kept reads as no list read"
+    );
 
     // Running it again on a table that is already current changes nothing.
     db::migrate(&pool).await.unwrap();
@@ -5253,4 +5262,236 @@ async fn an_embedding_sent_as_messages_is_estimated_from_them() {
         assert_eq!(row["estimated"], true);
         assert!(row["prompt_tokens"].as_i64().unwrap() > 0, "{row}");
     }
+}
+
+async fn set_models(pool: &SqlitePool, connection: &Value, models: Option<Value>) {
+    sqlx::query("UPDATE connections SET models = ? WHERE id = ?")
+        .bind(models.map(|models| models.to_string()))
+        .bind(connection["id"].as_i64().unwrap())
+        .execute(pool)
+        .await
+        .unwrap();
+}
+
+async fn connection_named(router: &Router, cookie: &str, name: &str) -> Value {
+    let listed = get_json(router, "/api/connections", cookie).await;
+    listed["connections"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|connection| connection["name"] == name)
+        .cloned()
+        .unwrap()
+}
+
+// A model list in a shape other than OpenAI's, which the check cannot read.
+async fn unlisted_upstream() -> String {
+    let app = Router::new().route(
+        "/v1/models",
+        get(|| async { Json(json!({ "models": [{ "name": "elsewhere" }] })) }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    format!("http://{addr}")
+}
+
+// The health check keeps the list a connection answers with. A list in another shape is not read as a list of
+// nothing but as no list, and a connection that does not answer keeps the list it gave last.
+#[tokio::test]
+async fn a_health_check_keeps_the_model_list_it_read() {
+    let st = test_state().await;
+    let router = build_router(st.clone());
+    let base_url = mock_upstream().await;
+    let unlisted = unlisted_upstream().await;
+    let cookie = register(&router, "ada").await;
+    for (name, url) in [
+        ("listed", base_url.as_str()),
+        ("unlisted", unlisted.as_str()),
+        ("dead", "http://127.0.0.1:1"),
+    ] {
+        post_json(
+            &router,
+            "/api/connections",
+            &cookie,
+            json!({ "name": name, "base_url": url }),
+        )
+        .await;
+    }
+    let dead = connection_named(&router, &cookie, "dead").await;
+    set_models(&st.pool, &dead, Some(json!(["kept"]))).await;
+
+    for name in ["listed", "unlisted", "dead"] {
+        let id = connection_named(&router, &cookie, name).await["id"].clone();
+        post_json(
+            &router,
+            &format!("/api/connections/{id}/check"),
+            &cookie,
+            json!({}),
+        )
+        .await;
+    }
+    let listed = connection_named(&router, &cookie, "listed").await;
+    assert_eq!(listed["health"], "ok");
+    assert_eq!(listed["models"], json!(["test-model"]));
+    let unlisted = connection_named(&router, &cookie, "unlisted").await;
+    assert_eq!(unlisted["health"], "ok");
+    assert_eq!(unlisted["models"], Value::Null);
+    let dead = connection_named(&router, &cookie, "dead").await;
+    assert_eq!(dead["health"], "down");
+    assert_eq!(dead["models"], json!(["kept"]));
+}
+
+async fn routed_to(router: &Router, pool: &SqlitePool, key: &str, model: &str) -> i64 {
+    let before = sqlx::query("SELECT COUNT(*) AS n FROM usage")
+        .fetch_one(pool)
+        .await
+        .unwrap()
+        .get::<i64, _>("n");
+    let response = gateway_call(
+        router,
+        key,
+        json!({ "model": model, "messages": [{ "role": "user", "content": "hi" }] }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let row = sqlx::query("SELECT connection_id FROM usage ORDER BY id LIMIT 1 OFFSET ?")
+        .bind(before)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    row.get::<i64, _>("connection_id")
+}
+
+// A request goes first to a connection whose list names the model it would be sent, ahead of one earlier in
+// priority whose list does not. A connection whose list was never read keeps its place, a model no list names
+// keeps the order as it was, a key's own model is the one matched, and a model Ollama lists under its tag is
+// found by its name alone.
+#[tokio::test]
+async fn a_request_goes_first_to_a_connection_that_lists_its_model() {
+    let st = test_state().await;
+    let router = build_router(st.clone());
+    let base_url = mock_upstream().await;
+    let cookie = register(&router, "ada").await;
+    let (_, first) = post_json(
+        &router,
+        "/api/connections",
+        &cookie,
+        json!({ "name": "first", "base_url": base_url, "priority": 0 }),
+    )
+    .await;
+    let (_, second) = post_json(
+        &router,
+        "/api/connections",
+        &cookie,
+        json!({ "name": "second", "base_url": base_url, "priority": 1 }),
+    )
+    .await;
+    let (first_id, second_id) = (
+        first["id"].as_i64().unwrap(),
+        second["id"].as_i64().unwrap(),
+    );
+    set_models(&st.pool, &first, Some(json!(["a-model", "other:7b"]))).await;
+    set_models(&st.pool, &second, Some(json!(["b-model", "llama3:latest"]))).await;
+    let (_, created) = post_json(&router, "/api/keys", &cookie, json!({ "name": "k" })).await;
+    let key = created["key"].as_str().unwrap();
+
+    assert_eq!(
+        routed_to(&router, &st.pool, key, "b-model").await,
+        second_id
+    );
+    assert_eq!(routed_to(&router, &st.pool, key, "a-model").await, first_id);
+    assert_eq!(routed_to(&router, &st.pool, key, "llama3").await, second_id);
+    assert_eq!(
+        routed_to(&router, &st.pool, key, "nowhere").await,
+        first_id,
+        "a model no list names is sent in the order of priority"
+    );
+
+    let (_, pinned) = post_json(
+        &router,
+        "/api/keys",
+        &cookie,
+        json!({ "name": "pinned", "model": "a-model" }),
+    )
+    .await;
+    assert_eq!(
+        routed_to(
+            &router,
+            &st.pool,
+            pinned["key"].as_str().unwrap(),
+            "b-model"
+        )
+        .await,
+        first_id,
+        "the key's own model is the one sent, so it is the one matched"
+    );
+
+    set_models(&st.pool, &first, None).await;
+    assert_eq!(
+        routed_to(&router, &st.pool, key, "b-model").await,
+        first_id,
+        "a connection whose list was never read is not moved back"
+    );
+}
+
+// The model list is the lists the connections gave, each model once and named after the first connection a
+// request for it reaches, a key's own connection first. A connection whose list was never read is left out.
+#[tokio::test]
+async fn the_model_list_merges_the_lists_the_connections_gave() {
+    let st = test_state().await;
+    let router = build_router(st.clone());
+    let base_url = mock_upstream().await;
+    let cookie = register(&router, "ada").await;
+    let mut connections = Vec::new();
+    for (name, priority) in [("first", 0), ("second", 1), ("unread", 2)] {
+        let (_, created) = post_json(
+            &router,
+            "/api/connections",
+            &cookie,
+            json!({ "name": name, "base_url": base_url, "priority": priority }),
+        )
+        .await;
+        connections.push(created);
+    }
+    set_models(&st.pool, &connections[0], Some(json!(["m1", "m2"]))).await;
+    set_models(&st.pool, &connections[1], Some(json!(["m2", "m3"]))).await;
+
+    let listed = |body: Value| -> Vec<(String, String)> {
+        body["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|entry| {
+                (
+                    entry["id"].as_str().unwrap().to_string(),
+                    entry["owned_by"].as_str().unwrap().to_string(),
+                )
+            })
+            .collect()
+    };
+    let (_, created) = post_json(&router, "/api/keys", &cookie, json!({ "name": "k" })).await;
+    let response = models_call(&router, created["key"].as_str().unwrap()).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = json_body(response).await;
+    assert_eq!(body["object"], "list");
+    assert_eq!(
+        listed(body),
+        [("m1", "first"), ("m2", "first"), ("m3", "second")]
+            .map(|(id, by)| (id.to_string(), by.to_string()))
+    );
+
+    let (_, bound) = post_json(
+        &router,
+        "/api/keys",
+        &cookie,
+        json!({ "name": "bound", "connection_id": connections[1]["id"] }),
+    )
+    .await;
+    let response = models_call(&router, bound["key"].as_str().unwrap()).await;
+    assert_eq!(
+        listed(json_body(response).await),
+        [("m2", "second"), ("m3", "second"), ("m1", "first")]
+            .map(|(id, by)| (id.to_string(), by.to_string()))
+    );
 }

@@ -2,7 +2,7 @@ use axum::extract::{Path, State as AxumState};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Json, Response};
 use serde::Deserialize;
-use serde_json::json;
+use serde_json::{Value, json};
 use sqlx::Row;
 use std::sync::Arc;
 use std::time::Duration;
@@ -28,6 +28,40 @@ pub struct Connection {
     // What the connection says it can take at once. Null means it never said, which is not the same as a
     // limit of one: an unstated capability is admitted by the default rather than by a guess.
     pub max_concurrent: Option<i64>,
+    // The ids of the models the connection listed at its last check that could read its list. None means no
+    // list has been read, which is not the same as a list with nothing in it.
+    pub models: Option<Vec<String>>,
+}
+
+impl Connection {
+    // Whether the connection's list was read and does not name the model. A list that was never read says
+    // nothing about what the connection serves, so it never counts against it.
+    pub fn lists_without(&self, model: &str) -> bool {
+        self.models
+            .as_ref()
+            .is_some_and(|models| !models.iter().any(|listed| same_model(listed, model)))
+    }
+}
+
+// Ollama lists a model under its tag and answers to its name without one, which it reads as `:latest`, so the
+// two are the same model here.
+fn same_model(listed: &str, asked: &str) -> bool {
+    listed == asked
+        || listed.strip_suffix(":latest") == Some(asked)
+        || asked.strip_suffix(":latest") == Some(listed)
+}
+
+// The ids in an OpenAI-shaped model list. A body in any other shape is not a list of nothing but one that was
+// not read, so it gives none rather than an empty list.
+fn model_ids(body: &Value) -> Option<Vec<String>> {
+    let entries = body.get("data")?.as_array()?;
+    Some(
+        entries
+            .iter()
+            .filter_map(|entry| entry.get("id").and_then(Value::as_str))
+            .map(str::to_string)
+            .collect(),
+    )
 }
 
 fn row_to_connection(row: &sqlx::sqlite::SqliteRow) -> Connection {
@@ -42,6 +76,9 @@ fn row_to_connection(row: &sqlx::sqlite::SqliteRow) -> Connection {
         health: row.get::<String, _>("health"),
         last_checked_at: row.get::<Option<String>, _>("last_checked_at"),
         max_concurrent: row.get::<Option<i64>, _>("max_concurrent"),
+        models: row
+            .get::<Option<String>, _>("models")
+            .and_then(|text| serde_json::from_str(&text).ok()),
     }
 }
 
@@ -70,7 +107,7 @@ pub async fn health_readings(st: &State) -> Result<Vec<(i64, String, String)>, s
 pub async fn candidates(st: &State, preferred: Option<i64>) -> Vec<Connection> {
     let rows = sqlx::query(
         "SELECT id, name, base_url, api_key, default_model, enabled, priority, health, last_checked_at, \
-         max_concurrent FROM connections WHERE enabled = 1 ORDER BY priority ASC, id ASC",
+         max_concurrent, models FROM connections WHERE enabled = 1 ORDER BY priority ASC, id ASC",
     )
     .fetch_all(&st.pool)
     .await
@@ -88,7 +125,8 @@ pub async fn candidates(st: &State, preferred: Option<i64>) -> Vec<Connection> {
     // that is marked down would send a request nowhere when all of them are. The sort is stable, so
     // the connections that are not down keep their order — the key's own connection first, then
     // priority — and the ones that are down follow in that same order. Every gateway endpoint reads
-    // this one order: a request tries each in turn, and the model list asks the first.
+    // this one order: a request tries each in turn, after moving back the ones whose list does not
+    // name its model, and the model list names each model after the first connection that lists it.
     all.sort_by_key(|conn| conn.health == "down");
     all
 }
@@ -105,17 +143,41 @@ pub async fn check(st: &State, connection: &Connection) -> StatusCode {
         .timeout(Duration::from_secs(10))
         .send()
         .await;
-    let status = match result {
-        Ok(resp) => resp.status(),
-        Err(_) => StatusCode::BAD_GATEWAY,
+    let (status, body) = match result {
+        Ok(resp) => {
+            let status = resp.status();
+            let body = if status.is_success() {
+                resp.json::<Value>().await.ok()
+            } else {
+                None
+            };
+            (status, body)
+        }
+        Err(_) => (StatusCode::BAD_GATEWAY, None),
     };
-    let health = if status.is_success() { "ok" } else { "down" };
-    let _ = sqlx::query("UPDATE connections SET health = ?, last_checked_at = ? WHERE id = ?")
-        .bind(health)
-        .bind(crate::clock::now())
-        .bind(connection.id)
-        .execute(&st.pool)
-        .await;
+    if !status.is_success() {
+        // A connection that did not answer keeps the list it gave last: it is tried after the others while it
+        // is down, and when it answers again it most likely serves what it served before.
+        let _ =
+            sqlx::query("UPDATE connections SET health = 'down', last_checked_at = ? WHERE id = ?")
+                .bind(crate::clock::now())
+                .bind(connection.id)
+                .execute(&st.pool)
+                .await;
+        return status;
+    }
+    let models = body
+        .as_ref()
+        .and_then(model_ids)
+        .map(|ids| Value::from(ids).to_string());
+    let _ = sqlx::query(
+        "UPDATE connections SET health = 'ok', last_checked_at = ?, models = ? WHERE id = ?",
+    )
+    .bind(crate::clock::now())
+    .bind(models)
+    .bind(connection.id)
+    .execute(&st.pool)
+    .await;
     status
 }
 
@@ -133,7 +195,7 @@ pub struct CreateConnection {
 pub async fn list(AxumState(st): AxumState<State>, caller: Caller) -> Response {
     let rows = sqlx::query(
         "SELECT id, name, base_url, api_key, default_model, enabled, priority, health, last_checked_at, \
-         max_concurrent FROM connections ORDER BY priority ASC, id ASC",
+         max_concurrent, models FROM connections ORDER BY priority ASC, id ASC",
     )
     .fetch_all(&st.pool)
     .await
@@ -164,6 +226,7 @@ pub async fn list(AxumState(st): AxumState<State>, caller: Caller) -> Response {
                 "health": c.health,
                 "last_checked_at": c.last_checked_at,
                 "max_concurrent": c.max_concurrent,
+                "models": c.models,
             })
         })
         .collect();
@@ -270,7 +333,7 @@ pub async fn health_check(
     }
     let row = sqlx::query(
         "SELECT id, name, base_url, api_key, default_model, enabled, priority, health, last_checked_at, \
-         max_concurrent FROM connections WHERE id = ?",
+         max_concurrent, models FROM connections WHERE id = ?",
     )
     .bind(id)
     .fetch_optional(&st.pool)
@@ -310,7 +373,7 @@ async fn rounds(st: State) {
     loop {
         let rows = sqlx::query(
             "SELECT id, name, base_url, api_key, default_model, enabled, priority, health, last_checked_at, \
-             max_concurrent FROM connections WHERE enabled = 1",
+             max_concurrent, models FROM connections WHERE enabled = 1",
         )
         .fetch_all(&st.pool)
         .await
