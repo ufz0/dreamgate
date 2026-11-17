@@ -4588,16 +4588,33 @@ async fn metrics_count_answers_refusals_tokens_and_failed_upstreams() {
         StatusCode::UNAUTHORIZED
     );
     assert_eq!(recorded_usage(&st.pool).await.len(), 2);
+    // A stream's row is written by the stream task rather than by the handler, so it is counted as well.
+    let response = gateway_call(
+        &router,
+        free["key"].as_str().unwrap(),
+        json!({ "stream": true, "messages": [{ "role": "user", "content": "hi" }] }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    response.into_body().collect().await.unwrap();
+    for _ in 0..50 {
+        if recorded_usage(&st.pool).await.len() == 3 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(recorded_usage(&st.pool).await.len(), 3);
 
     let (_, scrape) = get_text(&router, "/metrics", Some("Bearer scrape-secret")).await;
     for line in [
-        "dreamgate_responses_total{route=\"/v1/chat/completions\",status=\"200\",type=\"\"} 2",
+        "dreamgate_responses_total{route=\"/v1/chat/completions\",status=\"200\",type=\"\"} 3",
         "dreamgate_responses_total{route=\"/v1/chat/completions\",status=\"401\",type=\"invalid_api_key\"} 1",
         "dreamgate_upstream_failures_total{connection=\"dead\"} 1",
-        "dreamgate_tokens_total{direction=\"input\",source=\"reported\"} 22",
-        "dreamgate_tokens_total{direction=\"output\",source=\"reported\"} 14",
+        "dreamgate_tokens_total{direction=\"input\",source=\"reported\"} 33",
+        "dreamgate_tokens_total{direction=\"output\",source=\"reported\"} 21",
         "dreamgate_tokens_total{direction=\"input\",source=\"estimated\"} 0",
         "dreamgate_request_duration_seconds_count{streamed=\"false\"} 2",
+        "dreamgate_request_duration_seconds_count{streamed=\"true\"} 1",
         "dreamgate_usage_write_failures_total 0",
         "dreamgate_in_flight 0",
         "dreamgate_in_flight_limit 1024",

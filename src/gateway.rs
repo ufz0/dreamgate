@@ -516,10 +516,13 @@ fn stream_body(
             stream: Some(stream),
         };
         // The stream stays on the list while its row is written, and leaves it in the step that sends the
-        // row's event, so a page goes from one to the other without a moment showing neither.
+        // row's event, so a page goes from one to the other without a moment showing neither. The row is
+        // counted for `/metrics` here as well, because it does not go through `record`.
+        ctx.st.metrics.recorded(&row);
         let event = match usage::write(&ctx.st, &row).await {
             Ok(event) => Some(event),
             Err(err) => {
+                ctx.st.metrics.usage_write_failure();
                 tracing::error!("usage record failed: {err}");
                 None
             }
