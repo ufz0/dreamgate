@@ -368,6 +368,12 @@ What an unauthenticated request can reach is the entry screen: `POST /api/regist
   answered as a key that no longer exists.
 - Every statement takes its values as parameters; the only text put into a statement is a scope clause
   that comes from the code. Every value the page prints from the API is escaped on the way into the DOM.
+- A name that is taken is named: a username when an account is registered, made or renamed, and a
+  connection's name when one is added. Any other failure inside the server is answered as `server_error`
+  with a short reference, and what the database said is written to the log under that reference rather
+  than sent to the client, so a table, a constraint or the driver's text does not reach it. An upstream
+  that fails is named by its connection rather than by its address, so an internal host and port, or a
+  credential in a connection's address, does not reach a key holder.
 
 One thing this pass left as it is, and a public release should decide on it first. An account an admin
 makes has no password until its first sign-in, so whoever signs in with that username first is the one
@@ -377,10 +383,8 @@ there is still none, so the one that lands second is answered exactly as a wrong
 password that stays is the one whose sign-in was let in. Whether registration is open, the role, and
 whether a new account waits for approval are decided by the statement that inserts the account rather
 than by counting the accounts first, so registrations at the same moment on an empty instance make one
-admin, and the others are answered as registration being closed. A taken username is named when an
-account is registered; other error responses pass the driver text through, so a constraint name (a
-duplicate connection name, for instance) can still reach a client, and bcrypt only reads the first 72
-bytes of a password.
+admin, and the others are answered as registration being closed. Left as it is as well: bcrypt only
+reads the first 72 bytes of a password.
 
 ## Tests
 
@@ -396,6 +400,7 @@ pass-through, that a client's reasoning level reaches the upstream unchanged, th
 reaches the upstream without one and is recorded as `unknown`, upstream failover,
 a connection marked down being tried after the ones that are not rather than skipped, including when every
 connection is marked down, and a connection that is full passing the request on to one marked down,
+an upstream that fails named by its connection and not by its address at both gateway endpoints,
 the round of health checks marking a connection that answers,
 the model recorded for a streamed request when nothing is pinned to a key or a connection,
 per-key limits and their validation, the per-key, per-account and per-model figures carrying the input and the
@@ -418,7 +423,9 @@ stream while it runs, moving from the estimate to what the upstream reported, wi
 on its own when an upstream reports it first, and leaving it only when its row
 arrives, which names the stream it settles, another account's stream listed for an admin and only counted for a
 member, who is sent its row's figures and nothing else, the connections routes being
-admin-only with the key a connection carries returned to an admin alone, the model list refusing a
+admin-only with the key a connection carries returned to an admin alone, a duplicate connection name named,
+with a database that refuses a connection or an account answered as a server error with a reference and none
+of the driver's text, the model list refusing a
 disabled account the same way the completion path does, a request refused rather than let through when its
 key's per-minute count, its cap or its account's day cannot be read, both gateway endpoints refusing a key
 whose account cannot be read and answering one whose account is gone as unknown, sign-in attempts being

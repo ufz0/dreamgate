@@ -1,10 +1,9 @@
 use axum::extract::State as AxumState;
-use axum::http::StatusCode;
 use axum::response::{IntoResponse, Json, Response};
 use serde_json::json;
 use sqlx::{Column, Row};
 
-use crate::api::error;
+use crate::api::server_error;
 use crate::auth::Caller;
 use crate::state::State;
 
@@ -238,11 +237,7 @@ async fn build_summary(st: &State, caller: &Caller) -> Result<serde_json::Value,
 pub async fn summary(AxumState(st): AxumState<State>, caller: Caller) -> Response {
     match build_summary(&st, &caller).await {
         Ok(summary) => Json(summary).into_response(),
-        Err(err) => error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "server_error",
-            err.to_string(),
-        ),
+        Err(err) => server_error(err),
     }
 }
 
@@ -267,11 +262,7 @@ pub async fn recent(AxumState(st): AxumState<State>, caller: Caller) -> Response
     let rows = match query.fetch_all(&st.pool).await {
         Ok(rows) => rows,
         Err(err) => {
-            return error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "server_error",
-                err.to_string(),
-            );
+            return server_error(err);
         }
     };
     let events: Vec<serde_json::Value> = rows

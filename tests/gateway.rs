@@ -1434,6 +1434,54 @@ async fn a_full_connection_passes_the_request_on_to_one_marked_down() {
     );
 }
 
+// A key holder is told which connection failed, not where it is: the HTTP client's error ends in the
+// full upstream address, which names an internal host and port, and any credential an upstream takes
+// in its query string.
+#[tokio::test]
+async fn a_failed_upstream_is_named_without_its_address() {
+    let st = test_state().await;
+    let router = build_router(st.clone());
+    let admin = register(&router, "ada").await;
+
+    // Nothing listens on port 1, so the request fails at the transport level.
+    let (status, _) = post_json(
+        &router,
+        "/api/connections",
+        &admin,
+        json!({ "name": "dead", "base_url": "http://127.0.0.1:1/?token=upstream-secret" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (_, created) = post_json(&router, "/api/keys", &admin, json!({ "name": "test key" })).await;
+    let key = created["key"].as_str().unwrap().to_string();
+
+    let completion = gateway_call(
+        &router,
+        &key,
+        json!({ "model": "m", "messages": [{ "role": "user", "content": "hi" }] }),
+    )
+    .await;
+    assert_eq!(completion.status(), StatusCode::BAD_GATEWAY);
+    let models = call(
+        &router,
+        Request::get("/v1/models")
+            .header("authorization", format!("Bearer {key}"))
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(models.status(), StatusCode::BAD_GATEWAY);
+
+    for response in [completion, models] {
+        let body = json_body(response).await;
+        let message = body["error"]["message"].as_str().unwrap().to_string();
+        assert!(message.starts_with("dead: "), "{message}");
+        for part in ["127.0.0.1", "upstream-secret", "token", "http"] {
+            assert!(!message.contains(part), "{message}");
+        }
+    }
+}
+
 // The round of health checks is started by the binary rather than by a route, so no other test reaches
 // it. A connection is created without a check, so its row reads unknown until a round has looked at it.
 #[tokio::test]
@@ -1576,6 +1624,69 @@ async fn a_connection_can_state_its_capability_or_leave_it_out_but_not_state_zer
     .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["connections"][0]["max_concurrent"], json!(null));
+}
+
+// A name that is taken means something to the admin who typed it, so it is named; anything else the
+// database refuses is a server error with a reference, and the driver's text, which names tables and
+// constraints, stays in the log.
+#[tokio::test]
+async fn a_duplicate_connection_name_is_named_and_no_database_failure_carries_the_driver_text() {
+    let st = test_state().await;
+    let router = build_router(st.clone());
+    let admin = register(&router, "ada").await;
+
+    let (status, _) = post_json(
+        &router,
+        "/api/connections",
+        &admin,
+        json!({ "name": "local", "base_url": "http://127.0.0.1:8080" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    // The name is trimmed before it is stored, and the trimmed name is the one reported.
+    let (status, body) = post_json(
+        &router,
+        "/api/connections",
+        &admin,
+        json!({ "name": " local ", "base_url": "http://127.0.0.1:8081" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(
+        body["error"]["message"],
+        "a connection named local already exists"
+    );
+
+    // Triggers that refuse every insert stand in for a database that cannot take the row. Neither
+    // failure is a taken name, and neither answer carries what the database said.
+    for table in ["connections", "users"] {
+        let sql = format!(
+            "CREATE TRIGGER refuse_{table} BEFORE INSERT ON {table} \
+             BEGIN SELECT RAISE(ABORT, 'refused by trigger on {table}'); END"
+        );
+        sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
+            .execute(&st.pool)
+            .await
+            .unwrap();
+    }
+    let (connection_status, connection) = post_json(
+        &router,
+        "/api/connections",
+        &admin,
+        json!({ "name": "another", "base_url": "http://127.0.0.1:8082" }),
+    )
+    .await;
+    let (account_status, account) =
+        post_json(&router, "/api/users", &admin, json!({ "username": "ben" })).await;
+    for (status, body) in [(connection_status, connection), (account_status, account)] {
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(body["error"]["type"], "server_error");
+        let message = body["error"]["message"].as_str().unwrap();
+        assert!(message.contains("reference"), "{message}");
+        for part in ["trigger", "already", "constraint", "connections", "users"] {
+            assert!(!message.contains(part), "{message}");
+        }
+    }
 }
 
 #[tokio::test]

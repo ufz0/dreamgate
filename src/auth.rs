@@ -12,7 +12,7 @@ use serde_json::json;
 use sqlx::Row;
 use uuid::Uuid;
 
-use crate::api::error;
+use crate::api::{error, server_error};
 use crate::state::State;
 
 pub const COOKIE_NAME: &str = "dg_session";
@@ -83,11 +83,7 @@ pub async fn require_session(
     {
         Ok(row) => row,
         Err(err) => {
-            return error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "server_error",
-                err.to_string(),
-            );
+            return server_error(err);
         }
     };
     let Some(row) = row else {
@@ -226,7 +222,7 @@ pub async fn register(
     let hash = match hash_password(&body.password).await {
         Ok(hash) => hash,
         Err(err) => {
-            return error(StatusCode::INTERNAL_SERVER_ERROR, "server_error", err);
+            return server_error(err);
         }
     };
 
@@ -265,11 +261,7 @@ pub async fn register(
             );
         }
         Err(err) => {
-            return error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "server_error",
-                err.to_string(),
-            );
+            return server_error(err);
         }
     };
     let id = row.get::<i64, _>("id");
@@ -282,11 +274,7 @@ pub async fn register(
     let token = match create_session(&st, id).await {
         Ok(token) => token,
         Err(err) => {
-            return error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "server_error",
-                err.to_string(),
-            );
+            return server_error(err);
         }
     };
     let resp = Json(json!({ "id": id, "username": username, "role": role })).into_response();
@@ -321,11 +309,7 @@ pub async fn login(
     {
         Ok(row) => row,
         Err(err) => {
-            return error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "server_error",
-                err.to_string(),
-            );
+            return server_error(err);
         }
     };
     // The same answer for an account that does not exist and a password that does not match, so a
@@ -378,7 +362,7 @@ pub async fn login(
             let hash = match hash_password(&body.password).await {
                 Ok(hash) => hash,
                 Err(err) => {
-                    return error(StatusCode::INTERNAL_SERVER_ERROR, "server_error", err);
+                    return server_error(err);
                 }
             };
             // Two first sign-ins at once both read that there is no password. Only the write that
@@ -401,11 +385,7 @@ pub async fn login(
                     );
                 }
                 Err(err) => {
-                    return error(
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        "server_error",
-                        err.to_string(),
-                    );
+                    return server_error(err);
                 }
             }
         }
@@ -414,11 +394,7 @@ pub async fn login(
     let token = match create_session(&st, id).await {
         Ok(token) => token,
         Err(err) => {
-            return error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "server_error",
-                err.to_string(),
-            );
+            return server_error(err);
         }
     };
     let resp = Json(json!({

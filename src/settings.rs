@@ -5,7 +5,7 @@ use serde::Deserialize;
 use serde_json::json;
 use sqlx::Row;
 
-use crate::api::error;
+use crate::api::{error, server_error};
 use crate::auth::Caller;
 use crate::state::State;
 
@@ -107,11 +107,7 @@ pub async fn update(
         .execute(&st.pool)
         .await;
         if let Err(err) = result {
-            return error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "server_error",
-                err.to_string(),
-            );
+            return server_error(err);
         }
     }
     Json(json!({

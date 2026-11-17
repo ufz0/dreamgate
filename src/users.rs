@@ -5,7 +5,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use sqlx::Row;
 
-use crate::api::error;
+use crate::api::{error, server_error};
 use crate::auth::Caller;
 use crate::state::State;
 
@@ -57,8 +57,17 @@ pub async fn create(
     {
         Ok(row) => row,
         // A username that is already taken answers as a database error, so the response says which
-        // one it was rather than passing the driver text through.
-        Err(_) => return error(StatusCode::CONFLICT, "invalid_request", format!("the username {username} is already taken")),
+        // one it was rather than passing the driver text through. The username is the only unique
+        // column on users, so a unique violation can only mean that; a failure for any other reason
+        // is not dressed up as a taken name.
+        Err(sqlx::Error::Database(db)) if db.is_unique_violation() => {
+            return error(
+                StatusCode::CONFLICT,
+                "invalid_request",
+                format!("the username {username} is already taken"),
+            );
+        }
+        Err(err) => return server_error(err),
     };
     let id = row.get::<i64, _>("id");
     Json(json!({ "ok": true, "id": id, "username": username, "role": "user" })).into_response()
@@ -129,11 +138,7 @@ pub async fn update(
                 {
                     Ok(_) => changed.push(field.clone()),
                     Err(err) => {
-                        return error(
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            "server_error",
-                            err.to_string(),
-                        );
+                        return server_error(err);
                     }
                 }
             }
@@ -164,11 +169,7 @@ pub async fn update(
                 {
                     Ok(row) => row.get::<i64, _>("n") > 0,
                     Err(err) => {
-                        return error(
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            "server_error",
-                            err.to_string(),
-                        );
+                        return server_error(err);
                     }
                 };
                 if taken {
@@ -185,12 +186,17 @@ pub async fn update(
                     .await
                 {
                     Ok(_) => changed.push(field.clone()),
-                    Err(err) => {
+                    // The name can still be taken between the check and the write, and that is
+                    // answered the same way as when the check finds it.
+                    Err(sqlx::Error::Database(db)) if db.is_unique_violation() => {
                         return error(
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            "server_error",
-                            err.to_string(),
+                            StatusCode::CONFLICT,
+                            "conflict",
+                            format!("the username {username} is already taken"),
                         );
+                    }
+                    Err(err) => {
+                        return server_error(err);
                     }
                 }
             }
@@ -212,7 +218,7 @@ pub async fn update(
                 let hash = match crate::auth::hash_password(raw).await {
                     Ok(hash) => hash,
                     Err(err) => {
-                        return error(StatusCode::INTERNAL_SERVER_ERROR, "server_error", err);
+                        return server_error(err);
                     }
                 };
                 match sqlx::query("UPDATE users SET password_hash = ? WHERE id = ?")
@@ -223,11 +229,7 @@ pub async fn update(
                 {
                     Ok(_) => changed.push(field.clone()),
                     Err(err) => {
-                        return error(
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            "server_error",
-                            err.to_string(),
-                        );
+                        return server_error(err);
                     }
                 }
             }
@@ -256,11 +258,7 @@ pub async fn update(
                         changed.push(field.clone());
                     }
                     Err(err) => {
-                        return error(
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            "server_error",
-                            err.to_string(),
-                        );
+                        return server_error(err);
                     }
                 }
             }
@@ -280,11 +278,7 @@ pub async fn update(
                 {
                     Ok(_) => changed.push(field.clone()),
                     Err(err) => {
-                        return error(
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            "server_error",
-                            err.to_string(),
-                        );
+                        return server_error(err);
                     }
                 }
             }
@@ -336,11 +330,7 @@ pub async fn remove(
         .await
     {
         Ok(_) => Json(json!({ "ok": true, "id": id })).into_response(),
-        Err(err) => error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "server_error",
-            err.to_string(),
-        ),
+        Err(err) => server_error(err),
     }
 }
 

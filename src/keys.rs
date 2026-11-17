@@ -6,7 +6,7 @@ use serde_json::json;
 use sqlx::Row;
 use uuid::Uuid;
 
-use crate::api::error;
+use crate::api::{error, server_error};
 use crate::auth::Caller;
 use crate::state::State;
 
@@ -79,11 +79,7 @@ async fn key_rows(
 pub async fn list(AxumState(st): AxumState<State>, caller: Caller) -> Response {
     match key_rows(&st, "WHERE k.user_id = ?", caller.id).await {
         Ok(keys) => Json(json!({ "keys": keys })).into_response(),
-        Err(err) => error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "server_error",
-            err.to_string(),
-        ),
+        Err(err) => server_error(err),
     }
 }
 
@@ -98,11 +94,7 @@ pub async fn other_accounts(AxumState(st): AxumState<State>, caller: Caller) -> 
     }
     match key_rows(&st, "WHERE k.user_id != ?", caller.id).await {
         Ok(keys) => Json(json!({ "keys": keys })).into_response(),
-        Err(err) => error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "server_error",
-            err.to_string(),
-        ),
+        Err(err) => server_error(err),
     }
 }
 
@@ -146,11 +138,7 @@ pub async fn create(
     .await;
     match result {
         Ok(row) => Json(json!({ "id": row.get::<i64, _>("id"), "key": key })).into_response(),
-        Err(err) => error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "server_error",
-            err.to_string(),
-        ),
+        Err(err) => server_error(err),
     }
 }
 
@@ -196,11 +184,7 @@ pub async fn update(
     .await;
     match result {
         Ok(_) => Json(json!({ "ok": true })).into_response(),
-        Err(err) => error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "server_error",
-            err.to_string(),
-        ),
+        Err(err) => server_error(err),
     }
 }
 
@@ -234,10 +218,6 @@ pub async fn delete(
         .await;
     match result {
         Ok(_) => Json(json!({ "ok": true })).into_response(),
-        Err(err) => error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "server_error",
-            err.to_string(),
-        ),
+        Err(err) => server_error(err),
     }
 }

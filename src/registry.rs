@@ -10,7 +10,7 @@ use std::time::Duration;
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 
-use crate::api::error;
+use crate::api::{error, server_error};
 use crate::auth::Caller;
 use crate::state::State;
 
@@ -197,7 +197,15 @@ pub async fn create(
     .await;
     match row {
         Ok(row) => Json(json!({ "id": row.get::<i64, _>("id") })).into_response(),
-        Err(err) => error(StatusCode::CONFLICT, "invalid_request", err.to_string()),
+        // A name that is taken is named rather than answered with the driver text. The name is the
+        // only unique column on connections, so a unique violation here can only mean that; a failure
+        // for any other reason is not dressed up as a taken name.
+        Err(sqlx::Error::Database(db)) if db.is_unique_violation() => error(
+            StatusCode::CONFLICT,
+            "invalid_request",
+            format!("a connection named {name} already exists"),
+        ),
+        Err(err) => server_error(err),
     }
 }
 
@@ -219,11 +227,7 @@ pub async fn remove(
         .await;
     match result {
         Ok(_) => Json(json!({ "ok": true })).into_response(),
-        Err(err) => error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "server_error",
-            err.to_string(),
-        ),
+        Err(err) => server_error(err),
     }
 }
 

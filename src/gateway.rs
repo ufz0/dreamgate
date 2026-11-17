@@ -617,13 +617,19 @@ pub async fn chat_completions(
         if !wants_stream {
             request = request.timeout(st.limits.request_timeout());
         }
+        // The error is what the client is told, so the URL is taken out of it first: it names an internal
+        // host and port, and a credential when a connection carries one in its address. The connection is
+        // named instead.
         let sent = if wants_stream {
             tokio::time::timeout(st.limits.stream_stall(), request.send())
                 .await
                 .map_err(|_| BoxError::from("nothing arrived within the stall window"))
-                .and_then(|result| result.map_err(BoxError::from))
+                .and_then(|result| result.map_err(|err| BoxError::from(err.without_url())))
         } else {
-            request.send().await.map_err(BoxError::from)
+            request
+                .send()
+                .await
+                .map_err(|err| BoxError::from(err.without_url()))
         };
         let upstream = match sent {
             Ok(upstream) => upstream,
@@ -663,7 +669,7 @@ pub async fn chat_completions(
         let bytes = match upstream.bytes().await {
             Ok(bytes) => bytes,
             Err(err) => {
-                last_error = format!("{}: {err}", conn.name);
+                last_error = format!("{}: {}", conn.name, err.without_url());
                 continue;
             }
         };
@@ -831,7 +837,7 @@ pub async fn list_models(AxumState(st): AxumState<State>, headers: HeaderMap) ->
                     return error(
                         StatusCode::BAD_GATEWAY,
                         "upstream_unavailable",
-                        format!("{}: {err}", conn.name),
+                        format!("{}: {}", conn.name, err.without_url()),
                     );
                 }
             };
@@ -844,10 +850,11 @@ pub async fn list_models(AxumState(st): AxumState<State>, headers: HeaderMap) ->
             *out.body_mut() = Body::from(bytes);
             out.into_response()
         }
+        // As on the completion path, the connection is named and its address is not.
         Err(err) => error(
             StatusCode::BAD_GATEWAY,
             "upstream_unavailable",
-            format!("{}: {err}", conn.name),
+            format!("{}: {}", conn.name, err.without_url()),
         ),
     }
 }
