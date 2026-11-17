@@ -10,7 +10,7 @@ use std::time::Duration;
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 
-use crate::api::error;
+use crate::api::{error, server_error};
 use crate::auth::Caller;
 use crate::state::State;
 
@@ -67,11 +67,16 @@ pub async fn candidates(st: &State, preferred: Option<i64>) -> Vec<Connection> {
         let position = all.iter().position(|c| c.id == id);
         if let Some(index) = position {
             let preferred_conn = all.remove(index);
-            let mut ordered = vec![preferred_conn];
-            ordered.extend(all);
-            return ordered;
+            all.insert(0, preferred_conn);
         }
     }
+    // A connection whose last check failed is put last rather than left out. Health is only checked
+    // every 30 seconds, so one marked down may be answering again, and leaving out every connection
+    // that is marked down would send a request nowhere when all of them are. The sort is stable, so
+    // the connections that are not down keep their order — the key's own connection first, then
+    // priority — and the ones that are down follow in that same order. Both gateway endpoints read
+    // this one order: a completion tries each in turn, and the model list asks the first.
+    all.sort_by_key(|conn| conn.health == "down");
     all
 }
 
@@ -120,18 +125,25 @@ pub async fn list(AxumState(st): AxumState<State>, caller: Caller) -> Response {
     .fetch_all(&st.pool)
     .await
     .unwrap_or_default();
-    // An upstream key is a secret, so it is returned to an admin alone. The rest of the row is
-    // what any signed-in account needs for the gate readout and the model list.
+    // An upstream key is a secret, so it is returned to an admin alone, and so is the address: it
+    // names an internal host and port, and can carry a credential of its own in its query or its
+    // user part. The rest of the row is what any signed-in account needs for the gate readout and
+    // the model list.
     let admin = caller.role == "admin";
     let out: Vec<serde_json::Value> = rows
         .iter()
         .map(|row| {
             let c = row_to_connection(row);
             let api_key = if admin { c.api_key.clone() } else { None };
+            let base_url = if admin {
+                Some(c.base_url.clone())
+            } else {
+                None
+            };
             json!({
                 "id": c.id,
                 "name": c.name,
-                "base_url": c.base_url,
+                "base_url": base_url,
                 "api_key": api_key,
                 "default_model": c.default_model,
                 "enabled": c.enabled,
@@ -197,7 +209,15 @@ pub async fn create(
     .await;
     match row {
         Ok(row) => Json(json!({ "id": row.get::<i64, _>("id") })).into_response(),
-        Err(err) => error(StatusCode::CONFLICT, "invalid_request", err.to_string()),
+        // A name that is taken is named rather than answered with the driver text. The name is the
+        // only unique column on connections, so a unique violation here can only mean that; a failure
+        // for any other reason is not dressed up as a taken name.
+        Err(sqlx::Error::Database(db)) if db.is_unique_violation() => error(
+            StatusCode::CONFLICT,
+            "invalid_request",
+            format!("a connection named {name} already exists"),
+        ),
+        Err(err) => server_error(err),
     }
 }
 
@@ -219,11 +239,7 @@ pub async fn remove(
         .await;
     match result {
         Ok(_) => Json(json!({ "ok": true })).into_response(),
-        Err(err) => error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "server_error",
-            err.to_string(),
-        ),
+        Err(err) => server_error(err),
     }
 }
 
@@ -263,8 +279,9 @@ const MAX_HEALTH_CHECKS_AT_ONCE: usize = 8;
 
 // The rounds run for the life of the process and nothing waits on them, so a panic in one would end
 // health checking without a word: every connection would keep the health it had, and one marked down
-// would stay skipped. A round that stops is started again after the usual wait instead, and the reason
-// is logged. It runs in a JoinSet so that dropping this task, as a test does, takes the round with it.
+// would stay at the back of the order. A round that stops is started again after the usual wait instead,
+// and the reason is logged. It runs in a JoinSet so that dropping this task, as a test does, takes the
+// round with it.
 pub async fn health_checker(st: State) {
     loop {
         let mut round = JoinSet::new();

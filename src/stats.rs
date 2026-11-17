@@ -1,10 +1,9 @@
 use axum::extract::State as AxumState;
-use axum::http::StatusCode;
 use axum::response::{IntoResponse, Json, Response};
 use serde_json::json;
 use sqlx::{Column, Row};
 
-use crate::api::error;
+use crate::api::server_error;
 use crate::auth::Caller;
 use crate::state::State;
 
@@ -146,8 +145,10 @@ async fn grouped(
 
 // Accounts with no usage still appear, because that is where an admin sets a limit. The day
 // figure is what a daily limit is measured against, so it is reported next to it, as the input and
-// the output together the way the limit counts them. Ordered by username rather than by usage so a
-// new account is never pushed off the page it is set on.
+// the output together the way the limit counts them. Every account is listed, with no cap, because this
+// is the only list the page has to act on one: an account left off it could not be approved, limited,
+// disabled, renamed or deleted. Ordered by username rather than by usage, so a row stays where it is as
+// traffic arrives and a new account is found where its name sorts.
 async fn accounts(st: &State) -> Result<Vec<serde_json::Value>, sqlx::Error> {
     let rows = sqlx::query(
         "SELECT u.id, u.username, u.enabled, u.pending, u.daily_token_cap, COUNT(r.id) AS requests, \
@@ -155,7 +156,7 @@ async fn accounts(st: &State) -> Result<Vec<serde_json::Value>, sqlx::Error> {
                 COALESCE(SUM(r.prompt_tokens), 0) AS prompt_tokens, \
                 COALESCE(SUM(r.completion_tokens), 0) AS completion_tokens, \
                 COALESCE(SUM(CASE WHEN strftime('%Y-%m-%d', r.created_at) = date('now') THEN r.total_tokens ELSE 0 END), 0) AS used_today \
-         FROM users u LEFT JOIN usage r ON r.user_id = u.id GROUP BY u.id ORDER BY u.username LIMIT 20",
+         FROM users u LEFT JOIN usage r ON r.user_id = u.id GROUP BY u.id ORDER BY u.username",
     )
     .fetch_all(&st.pool)
     .await?;
@@ -236,21 +237,19 @@ async fn build_summary(st: &State, caller: &Caller) -> Result<serde_json::Value,
 pub async fn summary(AxumState(st): AxumState<State>, caller: Caller) -> Response {
     match build_summary(&st, &caller).await {
         Ok(summary) => Json(summary).into_response(),
-        Err(err) => error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "server_error",
-            err.to_string(),
-        ),
+        Err(err) => server_error(err),
     }
 }
 
 pub async fn recent(AxumState(st): AxumState<State>, caller: Caller) -> Response {
     let scoped = caller.role != "admin";
     // A recorded request outlives the key it came in on, so the key is looked up rather than
-    // assumed to still be there; the page says which rows have no key left.
+    // assumed to still be there; the page says which rows have no key left. The estimated flag goes out
+    // with the counts, so a row the gateway counted itself is not shown as one the upstream reported.
     let sql = format!(
         "SELECT r.id, k.name AS key_name, u.username AS user_name, r.model, r.prompt_tokens, \
-                r.completion_tokens, r.total_tokens, r.latency_ms, r.status, r.streamed, r.created_at \
+                r.completion_tokens, r.total_tokens, r.latency_ms, r.status, r.streamed, r.estimated, \
+                r.created_at \
          FROM usage r LEFT JOIN api_keys k ON k.id = r.api_key_id JOIN users u ON u.id = r.user_id \
          {scope} ORDER BY r.id DESC LIMIT 50",
         scope = if scoped { "WHERE r.user_id = ?" } else { "" }
@@ -263,11 +262,7 @@ pub async fn recent(AxumState(st): AxumState<State>, caller: Caller) -> Response
     let rows = match query.fetch_all(&st.pool).await {
         Ok(rows) => rows,
         Err(err) => {
-            return error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "server_error",
-                err.to_string(),
-            );
+            return server_error(err);
         }
     };
     let events: Vec<serde_json::Value> = rows
@@ -284,6 +279,7 @@ pub async fn recent(AxumState(st): AxumState<State>, caller: Caller) -> Response
                 "latency_ms": row.get::<i64, _>("latency_ms"),
                 "status": row.get::<i64, _>("status"),
                 "streamed": row.get::<i64, _>("streamed") != 0,
+                "estimated": row.get::<i64, _>("estimated") != 0,
                 "created_at": row.get::<String, _>("created_at"),
             })
         })

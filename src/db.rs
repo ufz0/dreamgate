@@ -1,9 +1,10 @@
 use std::str::FromStr;
 use std::time::Duration;
 
+use sqlx::Connection;
 use sqlx::Executor;
 use sqlx::Row;
-use sqlx::sqlite::{Sqlite, SqliteConnectOptions, SqlitePool, SqlitePoolOptions};
+use sqlx::sqlite::{Sqlite, SqliteConnectOptions, SqliteConnection, SqlitePool, SqlitePoolOptions};
 
 pub const SCHEMA: &[&str] = &[
     "CREATE TABLE IF NOT EXISTS users (
@@ -68,6 +69,13 @@ pub const SCHEMA: &[&str] = &[
         key TEXT PRIMARY KEY,
         value TEXT NOT NULL
     )",
+];
+
+// The indexes are made at the end of the migration rather than with the tables: a table that is
+// rebuilt loses its indexes with it, and an index on a column that a migration adds could not be made
+// on a database written before that column. Made last, every one of them is in place once the
+// migration has run, whichever tables it rebuilt.
+const INDEXES: &[&str] = &[
     "CREATE INDEX IF NOT EXISTS idx_usage_created ON usage (created_at)",
     "CREATE INDEX IF NOT EXISTS idx_usage_key ON usage (api_key_id)",
     "CREATE INDEX IF NOT EXISTS idx_usage_user ON usage (user_id)",
@@ -176,7 +184,11 @@ pub async fn migrate(pool: &SqlitePool) -> Result<(), sqlx::Error> {
     // table.
     add_usage_columns(pool).await?;
     add_connection_limit(pool).await?;
-    relax_key_reference(pool).await
+    relax_key_reference(pool).await?;
+    for statement in INDEXES {
+        sqlx::query(*statement).execute(pool).await?;
+    }
+    Ok(())
 }
 
 // What an engine reported about a request is stored beside the token counts: the part of the prompt
@@ -226,11 +238,11 @@ async fn relax_key_reference(pool: &SqlitePool) -> Result<(), sqlx::Error> {
         return Ok(());
     }
 
-    let mut conn = pool.acquire().await?;
-    sqlx::query("PRAGMA foreign_keys = OFF")
-        .execute(conn.as_mut())
-        .await?;
-    sqlx::query(
+    // Both shapes have the same columns, so the rows move as they are, including what an engine
+    // reported about a request.
+    rebuild_table(
+        pool,
+        "usage",
         "CREATE TABLE usage_new (
             id INTEGER PRIMARY KEY,
             api_key_id INTEGER REFERENCES api_keys(id) ON DELETE SET NULL,
@@ -249,12 +261,6 @@ async fn relax_key_reference(pool: &SqlitePool) -> Result<(), sqlx::Error> {
             estimated INTEGER NOT NULL DEFAULT 0,
             created_at TEXT NOT NULL
         )",
-    )
-    .execute(conn.as_mut())
-    .await?;
-    // Both shapes have the same columns, so the rows move as they are, including what an engine
-    // reported about a request.
-    sqlx::query(
         "INSERT INTO usage_new (id, api_key_id, user_id, connection_id, model, prompt_tokens, \
                 completion_tokens, total_tokens, cached_tokens, prompt_ms, generation_ms, latency_ms, \
                 status, streamed, estimated, created_at) \
@@ -262,53 +268,40 @@ async fn relax_key_reference(pool: &SqlitePool) -> Result<(), sqlx::Error> {
                 total_tokens, cached_tokens, prompt_ms, generation_ms, latency_ms, status, streamed, \
                 estimated, created_at FROM usage",
     )
-    .execute(conn.as_mut()).await?;
-    sqlx::query("DROP TABLE usage")
-        .execute(conn.as_mut())
-        .await?;
-    sqlx::query("ALTER TABLE usage_new RENAME TO usage")
-        .execute(conn.as_mut())
-        .await?;
-    // Dropping the table drops the index on the key with it, so that one is made again.
-    sqlx::query("CREATE INDEX IF NOT EXISTS idx_usage_key ON usage (api_key_id)")
-        .execute(conn.as_mut())
-        .await?;
-    sqlx::query("PRAGMA foreign_keys = ON")
-        .execute(conn.as_mut())
-        .await?;
-    Ok(())
+    .await
 }
 
-// Foreign keys are switched off for the copy because dropping the table the sessions, keys and
-// usage rows point at takes them with it; the account rows keep their ids, so those references
-// still resolve against the rebuilt table.
+// The sessions, keys and usage rows point at the accounts, and the account rows keep their ids, so
+// those references still resolve against the rebuilt table.
 async fn rebuild_accounts(pool: &SqlitePool) -> Result<(), sqlx::Error> {
-    let mut conn = pool.acquire().await?;
-    let source_name = if has_column(conn.as_mut(), "users", "name").await? {
+    let source_name = if has_column(pool, "users", "name").await? {
         "name"
     } else {
         "username"
     };
-    let source_cap = if has_column(conn.as_mut(), "users", "token_cap").await? {
+    let source_cap = if has_column(pool, "users", "token_cap").await? {
         "token_cap"
     } else {
         "daily_token_cap"
     };
     // A table that never had these gets the defaults; a table that has them keeps what is stored.
-    let source_enabled = if has_column(conn.as_mut(), "users", "enabled").await? {
+    let source_enabled = if has_column(pool, "users", "enabled").await? {
         "enabled"
     } else {
         "1"
     };
-    let source_pending = if has_column(conn.as_mut(), "users", "pending").await? {
+    let source_pending = if has_column(pool, "users", "pending").await? {
         "pending"
     } else {
         "0"
     };
-    sqlx::query("PRAGMA foreign_keys = OFF")
-        .execute(conn.as_mut())
-        .await?;
-    sqlx::query(
+    let copy = format!(
+        "INSERT INTO users_new (id, username, password_hash, role, daily_token_cap, enabled, pending, created_at) \
+         SELECT id, {source_name}, password_hash, role, {source_cap}, {source_enabled}, {source_pending}, created_at FROM users"
+    );
+    rebuild_table(
+        pool,
+        "users",
         "CREATE TABLE users_new (
             id INTEGER PRIMARY KEY,
             username TEXT NOT NULL UNIQUE,
@@ -319,26 +312,67 @@ async fn rebuild_accounts(pool: &SqlitePool) -> Result<(), sqlx::Error> {
             pending INTEGER NOT NULL DEFAULT 0,
             created_at TEXT NOT NULL
         )",
+        &copy,
     )
-    .execute(conn.as_mut())
-    .await?;
-    let copy = format!(
-        "INSERT INTO users_new (id, username, password_hash, role, daily_token_cap, enabled, pending, created_at) \
-         SELECT id, {source_name}, password_hash, role, {source_cap}, {source_enabled}, {source_pending}, created_at FROM users"
-    );
-    sqlx::query(sqlx::AssertSqlSafe(copy.as_str()))
+    .await
+}
+
+// SQLite cannot change a constraint on a table that exists, so a table is rebuilt the way its
+// documentation sets out: a new table is made beside the old one, the rows are copied into it, the old
+// one is dropped and the new one takes its name, all in one transaction. A start that fails partway,
+// on a full disk during the copy or in a crash between the drop and the rename, leaves the old table
+// as it was, and the next start runs the rebuild again from the beginning. Done as separate
+// statements, the first left an empty new table that every later start failed to make again, and the
+// second left the accounts in a table nothing reads, with an empty one made in its place. A new table
+// that an interrupted start left behind is dropped first: while the old table stands, it is the one
+// that holds every row.
+//
+// Foreign keys are switched off around the transaction, because inside one the pragma does nothing,
+// and dropping the table the other rows point at would otherwise take them with it. The copy keeps
+// every id, so it cannot break a reference, and the check of the references that the procedure ends
+// with is left out: all it could find is a reference broken before the start, by a row deleted by
+// hand, and refusing to start over that would lock out a database that works. A transaction that
+// fails is rolled back as it is dropped, before the connection runs anything else, so foreign keys are
+// switched back on either way: the rest of the application relies on ON DELETE CASCADE.
+async fn rebuild_table(
+    pool: &SqlitePool,
+    table: &str,
+    create: &str,
+    copy: &str,
+) -> Result<(), sqlx::Error> {
+    let mut conn = pool.acquire().await?;
+    sqlx::query("PRAGMA foreign_keys = OFF")
         .execute(conn.as_mut())
         .await?;
-    sqlx::query("DROP TABLE users")
+    let rebuilt = replace_table(conn.as_mut(), table, create, copy).await;
+    let restored = sqlx::query("PRAGMA foreign_keys = ON")
         .execute(conn.as_mut())
-        .await?;
-    sqlx::query("ALTER TABLE users_new RENAME TO users")
-        .execute(conn.as_mut())
-        .await?;
-    // The rest of the application relies on ON DELETE CASCADE, so this connection goes back with
-    // foreign keys on.
-    sqlx::query("PRAGMA foreign_keys = ON")
-        .execute(conn.as_mut())
-        .await?;
+        .await;
+    rebuilt?;
+    restored?;
     Ok(())
+}
+
+async fn replace_table(
+    conn: &mut SqliteConnection,
+    table: &str,
+    create: &str,
+    copy: &str,
+) -> Result<(), sqlx::Error> {
+    let leftover = format!("DROP TABLE IF EXISTS {table}_new");
+    let drop = format!("DROP TABLE {table}");
+    let rename = format!("ALTER TABLE {table}_new RENAME TO {table}");
+    let mut tx = conn.begin().await?;
+    for statement in [
+        leftover.as_str(),
+        create,
+        copy,
+        drop.as_str(),
+        rename.as_str(),
+    ] {
+        sqlx::query(sqlx::AssertSqlSafe(statement))
+            .execute(&mut *tx)
+            .await?;
+    }
+    tx.commit().await
 }

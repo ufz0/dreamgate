@@ -6,7 +6,7 @@ use serde_json::json;
 use sqlx::Row;
 use uuid::Uuid;
 
-use crate::api::error;
+use crate::api::{error, server_error};
 use crate::auth::Caller;
 use crate::state::State;
 
@@ -79,11 +79,7 @@ async fn key_rows(
 pub async fn list(AxumState(st): AxumState<State>, caller: Caller) -> Response {
     match key_rows(&st, "WHERE k.user_id = ?", caller.id).await {
         Ok(keys) => Json(json!({ "keys": keys })).into_response(),
-        Err(err) => error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "server_error",
-            err.to_string(),
-        ),
+        Err(err) => server_error(err),
     }
 }
 
@@ -98,11 +94,7 @@ pub async fn other_accounts(AxumState(st): AxumState<State>, caller: Caller) -> 
     }
     match key_rows(&st, "WHERE k.user_id != ?", caller.id).await {
         Ok(keys) => Json(json!({ "keys": keys })).into_response(),
-        Err(err) => error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "server_error",
-            err.to_string(),
-        ),
+        Err(err) => server_error(err),
     }
 }
 
@@ -146,12 +138,30 @@ pub async fn create(
     .await;
     match result {
         Ok(row) => Json(json!({ "id": row.get::<i64, _>("id"), "key": key })).into_response(),
-        Err(err) => error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "server_error",
-            err.to_string(),
-        ),
+        Err(err) => write_failed(&st, body.connection_id, err).await,
     }
+}
+
+// A key bound to a connection that does not exist is a mistake in what was sent, not a failure of
+// the server: the connection may have been deleted in another tab while the form was open. Which
+// reference failed is read rather than assumed, because the account a key belongs to can be deleted
+// in the same moment, and that is not the person's mistake.
+async fn write_failed(st: &State, connection_id: Option<i64>, err: sqlx::Error) -> Response {
+    let reference = matches!(&err, sqlx::Error::Database(db) if db.is_foreign_key_violation());
+    if let (true, Some(id)) = (reference, connection_id) {
+        let found = sqlx::query("SELECT 1 FROM connections WHERE id = ?")
+            .bind(id)
+            .fetch_optional(&st.pool)
+            .await;
+        if matches!(found, Ok(None)) {
+            return error(
+                StatusCode::BAD_REQUEST,
+                "invalid_request",
+                "no connection with that id",
+            );
+        }
+    }
+    server_error(err)
 }
 
 pub async fn update(
@@ -196,11 +206,7 @@ pub async fn update(
     .await;
     match result {
         Ok(_) => Json(json!({ "ok": true })).into_response(),
-        Err(err) => error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "server_error",
-            err.to_string(),
-        ),
+        Err(err) => write_failed(&st, body.connection_id, err).await,
     }
 }
 
@@ -234,10 +240,6 @@ pub async fn delete(
         .await;
     match result {
         Ok(_) => Json(json!({ "ok": true })).into_response(),
-        Err(err) => error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "server_error",
-            err.to_string(),
-        ),
+        Err(err) => server_error(err),
     }
 }

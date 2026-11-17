@@ -9,7 +9,7 @@ use serde_json::{Value, json};
 use sqlx::Row;
 use sqlx::sqlite::SqliteRow;
 
-use crate::api::error;
+use crate::api::{error, logged};
 use crate::limits::Admission;
 use crate::presence::{self, Active};
 use crate::registry::{self, Connection};
@@ -45,17 +45,15 @@ fn virtual_key(headers: &HeaderMap) -> Option<String> {
         .map(|v| v.trim().to_string())
 }
 
-async fn lookup_key(st: &State, raw: &str) -> Option<KeyInfo> {
+async fn lookup_key(st: &State, raw: &str) -> Result<Option<KeyInfo>, sqlx::Error> {
     let row = sqlx::query(
         "SELECT id, user_id, name, connection_id, model, enabled, rpm_limit, token_cap \
          FROM api_keys WHERE key = ?",
     )
     .bind(raw)
     .fetch_optional(&st.pool)
-    .await
-    .ok()
-    .flatten()?;
-    Some(KeyInfo {
+    .await?;
+    Ok(row.map(|row| KeyInfo {
         id: row.get::<i64, _>("id"),
         user_id: row.get::<i64, _>("user_id"),
         name: row.get::<String, _>("name"),
@@ -64,18 +62,56 @@ async fn lookup_key(st: &State, raw: &str) -> Option<KeyInfo> {
         enabled: row.get::<i64, _>("enabled") != 0,
         rpm_limit: row.get::<Option<i64>, _>("rpm_limit"),
         token_cap: row.get::<Option<i64>, _>("token_cap"),
-    })
+    }))
+}
+
+fn unknown_key() -> Response {
+    error(
+        StatusCode::UNAUTHORIZED,
+        "invalid_api_key",
+        "unknown virtual key",
+    )
+}
+
+// The key, its account and its limits are read on every request, and a read that fails (a write
+// holding the database past the busy timeout, a disk that fails) refuses the request. A limit that
+// could not be read is not a limit that was not reached: letting the request through would let a
+// disabled account, or a key past its cap, reach an upstream whenever the database was slow. The
+// answer is 503 because the refusal is the gateway's and passes, so a client that retries is right to.
+#[track_caller]
+fn unreadable(err: sqlx::Error) -> Response {
+    logged(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "unavailable",
+        "the gateway could not read this key's account and limits; try again",
+        err,
+    )
+}
+
+// What a client is told about a failed upstream is its connection's name and the first line of the
+// error, without the address. The log is where an admin looks for why, so it gets the whole chain of
+// causes — refused, a name that did not resolve, a certificate, a timeout — which the first line
+// leaves out.
+fn upstream_failed(conn: &Connection, err: &(dyn std::error::Error + 'static)) {
+    let mut causes = err.to_string();
+    let mut source = err.source();
+    while let Some(cause) = source {
+        causes.push_str(": ");
+        causes.push_str(&cause.to_string());
+        source = cause.source();
+    }
+    tracing::warn!(connection = %conn.name, "upstream failed: {causes}");
 }
 
 // A disabled account cannot use a key at all. Both gateway endpoints read the account the same
-// way, so a key on its own cannot reach an upstream for an account that is turned off.
-async fn account_row(st: &State, user_id: i64) -> Option<SqliteRow> {
+// way, so a key on its own cannot reach an upstream for an account that is turned off. Deleting an
+// account deletes its keys with it, so a key whose account is gone is a key that is being deleted,
+// and both endpoints answer it the way they answer a key that no longer exists.
+async fn account_row(st: &State, user_id: i64) -> Result<Option<SqliteRow>, sqlx::Error> {
     sqlx::query("SELECT username, enabled, daily_token_cap FROM users WHERE id = ?")
         .bind(user_id)
         .fetch_optional(&st.pool)
         .await
-        .ok()
-        .flatten()
 }
 
 fn disabled_account(row: &SqliteRow) -> Option<Response> {
@@ -91,15 +127,17 @@ fn disabled_account(row: &SqliteRow) -> Option<Response> {
 
 async fn enforce_limits(st: &State, key: &KeyInfo) -> Option<Response> {
     if let Some(limit) = key.rpm_limit {
-        let recent = sqlx::query(
+        let recent = match sqlx::query(
             "SELECT COUNT(*) AS n FROM usage WHERE api_key_id = ? \
              AND strftime('%Y-%m-%d %H:%M:%S', created_at) >= datetime('now', '-1 minute')",
         )
         .bind(key.id)
         .fetch_one(&st.pool)
         .await
-        .map(|row| row.get::<i64, _>("n"))
-        .unwrap_or(0);
+        {
+            Ok(row) => row.get::<i64, _>("n"),
+            Err(err) => return Some(unreadable(err)),
+        };
         if recent >= limit {
             return Some(error(
                 StatusCode::TOO_MANY_REQUESTS,
@@ -112,14 +150,16 @@ async fn enforce_limits(st: &State, key: &KeyInfo) -> Option<Response> {
         }
     }
     if let Some(cap) = key.token_cap {
-        let used = sqlx::query(
+        let used = match sqlx::query(
             "SELECT COALESCE(SUM(total_tokens), 0) AS used FROM usage WHERE api_key_id = ?",
         )
         .bind(key.id)
         .fetch_one(&st.pool)
         .await
-        .map(|row| row.get::<i64, _>("used"))
-        .unwrap_or(0);
+        {
+            Ok(row) => row.get::<i64, _>("used"),
+            Err(err) => return Some(unreadable(err)),
+        };
         if used >= cap {
             return Some(error(
                 StatusCode::TOO_MANY_REQUESTS,
@@ -135,20 +175,26 @@ async fn enforce_limits(st: &State, key: &KeyInfo) -> Option<Response> {
     // all. The account limit counts the current day only and resets at 00:00 UTC, matching the
     // UTC text the usage rows are stored as. It is checked after the key cap, so a key cannot
     // be used to work around it.
-    let account = account_row(st, key.user_id).await?;
+    let account = match account_row(st, key.user_id).await {
+        Ok(Some(account)) => account,
+        Ok(None) => return Some(unknown_key()),
+        Err(err) => return Some(unreadable(err)),
+    };
     if let Some(blocked) = disabled_account(&account) {
         return Some(blocked);
     }
     if let Some(cap) = account.get::<Option<i64>, _>("daily_token_cap") {
-        let used = sqlx::query(
+        let used = match sqlx::query(
             "SELECT COALESCE(SUM(total_tokens), 0) AS used FROM usage \
              WHERE user_id = ? AND strftime('%Y-%m-%d', created_at) = date('now')",
         )
         .bind(key.user_id)
         .fetch_one(&st.pool)
         .await
-        .map(|row| row.get::<i64, _>("used"))
-        .unwrap_or(0);
+        {
+            Ok(row) => row.get::<i64, _>("used"),
+            Err(err) => return Some(unreadable(err)),
+        };
         if used >= cap {
             return Some(error(
                 StatusCode::TOO_MANY_REQUESTS,
@@ -163,16 +209,24 @@ async fn enforce_limits(st: &State, key: &KeyInfo) -> Option<Response> {
     None
 }
 
-fn resolve_model(key_model: Option<&str>, conn: &Connection, requested: Option<&str>) -> String {
+fn resolve_model(
+    key_model: Option<&str>,
+    conn: &Connection,
+    requested: Option<&str>,
+) -> Option<String> {
     key_model
         .map(String::from)
         .or_else(|| conn.default_model.clone())
-        .unwrap_or_else(|| requested.unwrap_or("unknown").to_string())
+        .or_else(|| requested.map(String::from))
 }
 
-fn build_payload(body: &Value, model: &str) -> Value {
+fn build_payload(body: &Value, model: Option<&str>) -> Value {
     let mut payload = body.clone();
-    payload["model"] = Value::String(model.to_string());
+    // When nothing names a model the body keeps what the client sent, so the upstream answers with its own
+    // default rather than with a name nobody chose.
+    if let Some(model) = model {
+        payload["model"] = Value::String(model.to_string());
+    }
     // Upstreams that support stream_options report real usage at the end of the
     // stream; without it the gateway has to estimate completion tokens.
     if body.get("stream").and_then(Value::as_bool).unwrap_or(false)
@@ -336,7 +390,7 @@ fn drain_buffer(buffer: &mut Vec<u8>, generated: &mut String, report: &mut Repor
 
 async fn record(st: &State, row: &UsageRow) {
     if let Err(err) = usage::record(st, row).await {
-        tracing::warn!("usage record failed: {err}");
+        tracing::error!("usage record failed: {err}");
     }
 }
 
@@ -422,6 +476,8 @@ fn stream_body(
                     }
                 }
                 Err(err) => {
+                    let err = err.without_url();
+                    upstream_failed(&ctx.conn, &err);
                     let _ = tx.send(Err(BoxError::from(err))).await;
                     break;
                 }
@@ -460,7 +516,7 @@ fn stream_body(
         let event = match usage::write(&ctx.st, &row).await {
             Ok(event) => Some(event),
             Err(err) => {
-                tracing::warn!("usage record failed: {err}");
+                tracing::error!("usage record failed: {err}");
                 None
             }
         };
@@ -489,12 +545,10 @@ pub async fn chat_completions(
             "missing Authorization: Bearer <virtual key>",
         );
     };
-    let Some(key) = lookup_key(&st, &raw).await else {
-        return error(
-            StatusCode::UNAUTHORIZED,
-            "invalid_api_key",
-            "unknown virtual key",
-        );
+    let key = match lookup_key(&st, &raw).await {
+        Ok(Some(key)) => key,
+        Ok(None) => return unknown_key(),
+        Err(err) => return unreadable(err),
     };
     if !key.enabled {
         return error(
@@ -543,10 +597,9 @@ pub async fn chat_completions(
     let mut full: Vec<String> = Vec::new();
     let mut attempted = false;
 
+    // The connections come in the order they are tried: the key's own first, then priority, with the ones
+    // marked down after the rest (`registry::candidates`). Each is tried once.
     for conn in &candidates {
-        if conn.health == "down" && candidates.len() > 1 {
-            continue;
-        }
         let Ok(slot) = st
             .limits
             .for_connection(conn.id, conn.max_concurrent)
@@ -557,7 +610,10 @@ pub async fn chat_completions(
         };
         let model = resolve_model(key.model.as_deref(), conn, requested);
         let url = registry::endpoint(&conn.base_url, "chat/completions");
-        let payload = build_payload(&body, &model);
+        let payload = build_payload(&body, model.as_deref());
+        // The row and the stream in flight name the model the gateway sent, and say unknown when it sent none.
+        // The upstream's answer says which model it used, but that is not read here.
+        let model = model.unwrap_or_else(|| String::from("unknown"));
         attempted = true;
         let mut request = st
             .http
@@ -575,17 +631,24 @@ pub async fn chat_completions(
         if !wants_stream {
             request = request.timeout(st.limits.request_timeout());
         }
+        // The error is what the client is told, so the URL is taken out of it first: it names an internal
+        // host and port, and a credential when a connection carries one in its address. The connection is
+        // named instead.
         let sent = if wants_stream {
             tokio::time::timeout(st.limits.stream_stall(), request.send())
                 .await
                 .map_err(|_| BoxError::from("nothing arrived within the stall window"))
-                .and_then(|result| result.map_err(BoxError::from))
+                .and_then(|result| result.map_err(|err| BoxError::from(err.without_url())))
         } else {
-            request.send().await.map_err(BoxError::from)
+            request
+                .send()
+                .await
+                .map_err(|err| BoxError::from(err.without_url()))
         };
         let upstream = match sent {
             Ok(upstream) => upstream,
             Err(err) => {
+                upstream_failed(conn, &*err);
                 last_error = format!("{}: {err}", conn.name);
                 continue;
             }
@@ -621,6 +684,8 @@ pub async fn chat_completions(
         let bytes = match upstream.bytes().await {
             Ok(bytes) => bytes,
             Err(err) => {
+                let err = err.without_url();
+                upstream_failed(conn, &err);
                 last_error = format!("{}: {err}", conn.name);
                 continue;
             }
@@ -725,6 +790,15 @@ pub async fn chat_completions(
         },
     )
     .await;
+    // A connection that was full was passed over for one that then failed, which can be one marked down,
+    // tried last. The answer is what that one did, and the full ones are named beside it, so the client is
+    // not told only half of why nothing answered.
+    if !full.is_empty() {
+        last_error = format!(
+            "{last_error}; at their limit of requests at once: {}",
+            full.join(", ")
+        );
+    }
     error(StatusCode::BAD_GATEWAY, "upstream_unavailable", last_error)
 }
 
@@ -736,12 +810,10 @@ pub async fn list_models(AxumState(st): AxumState<State>, headers: HeaderMap) ->
             "missing Authorization: Bearer <virtual key>",
         );
     };
-    let Some(key) = lookup_key(&st, &raw).await else {
-        return error(
-            StatusCode::UNAUTHORIZED,
-            "invalid_api_key",
-            "unknown virtual key",
-        );
+    let key = match lookup_key(&st, &raw).await {
+        Ok(Some(key)) => key,
+        Ok(None) => return unknown_key(),
+        Err(err) => return unreadable(err),
     };
     if !key.enabled {
         return error(
@@ -750,12 +822,14 @@ pub async fn list_models(AxumState(st): AxumState<State>, headers: HeaderMap) ->
             "this key is disabled",
         );
     }
-    if let Some(blocked) = account_row(&st, key.user_id)
-        .await
-        .as_ref()
-        .and_then(disabled_account)
-    {
-        return blocked;
+    match account_row(&st, key.user_id).await {
+        Ok(Some(account)) => {
+            if let Some(blocked) = disabled_account(&account) {
+                return blocked;
+            }
+        }
+        Ok(None) => return unknown_key(),
+        Err(err) => return unreadable(err),
     }
     let Some(conn) = registry::candidates(&st, key.connection_id)
         .await
@@ -786,6 +860,8 @@ pub async fn list_models(AxumState(st): AxumState<State>, headers: HeaderMap) ->
             let bytes = match upstream.bytes().await {
                 Ok(bytes) => bytes,
                 Err(err) => {
+                    let err = err.without_url();
+                    upstream_failed(&conn, &err);
                     return error(
                         StatusCode::BAD_GATEWAY,
                         "upstream_unavailable",
@@ -802,10 +878,15 @@ pub async fn list_models(AxumState(st): AxumState<State>, headers: HeaderMap) ->
             *out.body_mut() = Body::from(bytes);
             out.into_response()
         }
-        Err(err) => error(
-            StatusCode::BAD_GATEWAY,
-            "upstream_unavailable",
-            format!("{}: {err}", conn.name),
-        ),
+        // As on the completion path, the connection is named and its address is not.
+        Err(err) => {
+            let err = err.without_url();
+            upstream_failed(&conn, &err);
+            error(
+                StatusCode::BAD_GATEWAY,
+                "upstream_unavailable",
+                format!("{}: {err}", conn.name),
+            )
+        }
     }
 }

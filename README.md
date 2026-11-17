@@ -25,7 +25,12 @@ username, the email column is dropped, a password column that was required is re
 left empty, the approval flag is added, the `max_concurrent` column is added to connections and left
 empty for the rows written before it, and existing accounts keep their limits and are enabled by
 default. A connection row with no `max_concurrent` keeps its meaning: it never stated a capability, so
-the default applies to it, which is not the same as a capability of one.
+the default applies to it, which is not the same as a capability of one. A table that has to be rebuilt
+for this is rebuilt in one transaction, so a start that stops partway, on a full disk or in a crash,
+leaves that table as it was, and the next start migrates whatever is still in an older shape; each step
+reads the shape before it acts, so one that already finished is not run again. A new table that an older start left
+beside the old one when it stopped is dropped and made again from the old one, which still holds every
+row. The indexes on the usage table are made after the migration, so a rebuild does not leave them out.
 
 Environment variables:
 
@@ -42,6 +47,12 @@ Environment variables:
   applied to a stream: a stream has no known end and is bounded by silence instead.
 - `DREAMGATE_STREAM_STALL_SECS` — how long a stream may go without producing anything before it is closed as a
   dead connection, default 120
+- `RUST_LOG` — which log lines are printed to standard output, in the usual form (`warn`,
+  `info,dreamgate=debug`; a target named on its own, such as `dreamgate=debug`, turns every other one off),
+  default `info`. At that level a request that goes well prints nothing; what does print is an error or a
+  warning, such as a usage row that could not be written, which the key caps and daily limits then do not count
+  either, an upstream that failed, with the whole chain of causes the client is not sent, a stream closed for
+  going quiet, a failure answered with a reference, or a database statement that took longer than a second
 
 ## Using it
 
@@ -82,6 +93,15 @@ Nothing else in the request body is changed, so a reasoning level a client sends
 or whatever the upstream calls it — reaches the runtime exactly as the client wrote it. DreamGate does
 not pick a level itself; it only routes and counts.
 
+When nothing names a model — none pinned to the key, no default model on the connection, and none in the
+request — the request goes out without one, exactly as the client sent it, and the upstream answers with its
+own default. DreamGate does not put a name of its own in its place. The row for such a request, when a
+connection answered it, whatever the status, records the model as `unknown`, because what is recorded is the
+model the gateway sent, not the one the upstream answered with. A request that no connection answered, because
+every one it was sent to failed before answering, records the model the key pins or the request names, which
+here is none: its row has no model, the Activity table shows it as no model, and the usage by model counts it
+under `unknown`.
+
 An estimate counts everything the model produced, not only the answer. Reasoning models put their
 working in `reasoning_content` (or `reasoning`) beside the reply, and that text is counted as
 generated. So are the arguments of a tool call, whether an upstream sends them as a JSON string or
@@ -92,8 +112,13 @@ its own section above the answer when an upstream sends it.
 Requests are recorded with the key, user, model, token counts, latency and status — except a request that
 was turned away at a concurrency limit before reaching a connection, which is not recorded because nothing
 crossed the gate — and connections are health-checked every 30 seconds, at most eight at a time. A key with no
-connection routes to any enabled connection by priority, and a connection that is down or fails at the
-transport level falls over to the next one.
+connection routes to any enabled connection by priority, a key bound to a connection tries that one first while
+it is enabled and the others by priority after it, and a connection that fails at the transport level falls over
+to the next one. A connection whose last check marked it down is not skipped but tried last: the connections that
+are not marked down are tried first, then the ones that are, each in that same order, and no connection is tried
+twice for one request. A check is only every 30 seconds, so a connection marked down may be answering again, and
+a request still reaches one when every connection is marked down. The model list, `GET /v1/models`, reads the
+same order and asks the first connection in it, without falling over to the next.
 
 A recorded row also carries what the engine said about the request itself, when it said anything:
 the part of the prompt served from its cache, and how long reading the prompt took against how long
@@ -139,9 +164,15 @@ that number, because a limit is only useful if it is what the runtime can actual
 Nothing is queued by admission: a request that cannot be admitted is answered at once, so a connection that
 is full does not hold unrelated requests behind it — it is skipped, the key falls over to its next connection
 as it always did, and a request that finds every connection it could use full is answered as an overload, 429
-`connection_full`. A request that finds the gateway as a whole full is answered with 503 `overloaded`. Either
-answer is not recorded as usage, because nothing crossed the gate; a request that did reach a connection and
-failed there is recorded as it always was. An admission that answered by queueing would hide the queue behind
+`connection_full`. A connection marked down is one a request could use, tried after the others, so when every
+connection that is not marked down is full and one that is has a free slot, the request is sent there. If that
+connection is down in fact, the answer is the 502 of a request that was sent and got no answer, recorded
+like any other — its estimated input counts toward the key's cap and the account's day — rather than the 429
+the request would otherwise have been given, and it can take up to the connect timeout, or longer for a host
+that accepts and never answers, to find that out; the connections that were full are named in that answer
+beside the one that failed. A request that finds the gateway as a whole full is answered with 503 `overloaded`.
+Neither 429 nor 503 is recorded as usage, because nothing crossed the gate; a request that was sent to a
+connection and failed there is recorded as it always was. An admission that answered by queueing would hide the queue behind
 a long latency, so the overload is visible to the client and a client that wants the request processed retries.
 Admission is checked after the key and the account lookups, which is what the rest of the path has always
 done — a request turned away at a limit still reads those two rows and still marks its account as generating
@@ -224,10 +255,10 @@ URL hash (`#/overview`, `#/activity`, `#/keys`, `#/connections`, `#/connect`, `#
   account, or all of them, and see those keys with the account each one belongs to.
 - **Connections** — add and health-check upstreams. A connection that no check has reached yet reads
   "not checked yet" rather than down, here and in the gate readout on the Overview, because the gateway
-  only skips one whose check failed. Admin-only, like the per-account figures, and that rule is on the
-  routes as well as on the page. The key a connection carries is returned to an admin alone; every
-  signed-in account still sees the connection itself, because the gate readout and the model list need
-  it.
+  only puts one whose check failed behind the others. Admin-only, like the per-account figures, and that
+  rule is on the routes as well as on the page. The key a connection carries is returned to an admin
+  alone, and so is its address; every signed-in account still sees the connection itself — its name, health,
+  priority and default model — because the gate readout and the model list need it.
 - **Connect a client** — the base URL, a key picker, a copyable curl request.
 - **Sandbox** — chat with any model a connection serves, through the same gateway the clients
   use, so the request is recorded like any other. Pick a key and a model from the connection's
@@ -247,6 +278,13 @@ feed show the two sides as separate columns rather than one sum, and `/api/keys`
 per-account and per-model rows of `/api/stats/summary` carry `prompt_tokens` and `completion_tokens` beside
 the total they already had.
 
+A recorded row whose counts the gateway estimated, because the upstream reported none, is marked the way a
+stream's estimate is: its input and its output tokens each carry a ~ in the Activity table, the live traffic
+feed and the gate readout on the Overview, and say on hover that the upstream did not report them. The row has
+one flag for both counts, `estimated`, and `/api/stats/recent` and the row's event on `/api/live` carry it
+beside them. The token totals add estimated and reported rows together and do not say how much of a total is
+estimated.
+
 The dashboard reads `/api/stats/summary` and subscribes to `/api/live`, so the counters, the charts, the
 presence panel, the activity table and an account's row in the Accounts view update as traffic arrives — rows
 land in the current view without a reload. The only thing the page asks for on a timer is the presence panel,
@@ -258,7 +296,8 @@ given when nothing is reported until the upstream has reported that count itself
 `/api/live` sends that to a page at most four times a second, and only when what that page would be sent has
 changed, however many streams are running. The two generated figures at the top of the Overview include it,
 and their notes say how much of the figure is still being generated and, while it is the gateway's count,
-that it is an estimate until the request is recorded; the live traffic feed shows each stream as a row marked
+that it is an estimate until the upstream reports it, and the recorded row stays one when the upstream never
+does; the live traffic feed shows each stream as a row marked
 live, above the recorded rows and within the same twelve, its input and its output tokens each marked with a ~
 while that count is the gateway's estimate, because an upstream can report the input before what it generated.
 The other figures, the charts and the support panel move when the row is recorded.
@@ -333,19 +372,40 @@ What an unauthenticated request can reach is the entry screen: `POST /api/regist
   registration is closed the answer is 403 before the name is checked against the accounts. A state-changing request
   from another site carries no session cookie, so a cross-site form cannot act as the signed-in account.
 - Adding, removing or checking a connection is an admin action in the API as well as in the page, and
-  the key a connection carries is returned to an admin alone. A disabled account is refused at both
+  the key a connection carries and its address are returned to an admin alone, because an address names an
+  internal host and port and can carry a credential of its own. A disabled account is refused at both
   gateway endpoints, not only at the completion path.
+- A key, its account and its limits are read from the database on every request, and a read that fails — a
+  write holding the database past the busy timeout, a disk that fails — answers 503 `unavailable` with a short
+  reference and is logged under it, rather than letting the request through unchecked: a limit that could not
+  be read is not a limit that was not reached. Deleting an account deletes its keys, so a key whose account is already gone is
+  answered as a key that no longer exists.
 - Every statement takes its values as parameters; the only text put into a statement is a scope clause
   that comes from the code. Every value the page prints from the API is escaped on the way into the DOM.
+- A name that is taken is named: a username when an account is registered, made or renamed, and a
+  connection's name when one is added. A key made or changed with a connection that does not exist is
+  answered 400 "no connection with that id". Where a handler answers a failure inside the server, it answers
+  `server_error` with a short reference (or, at the gateway, the 503 above), and what the database said is
+  written to the log under that reference rather than sent to the client, so a table, a constraint or the
+  driver's text does not reach it. Some reads still answer a failure as if they had found nothing — for
+  example the connections list as empty, the gateway's own read of the connections as no enabled connection,
+  the registration setting as its default, and an account, a key or a connection to act on as not found —
+  which is a gap to close rather than a promise. An upstream that fails is named by its connection rather than by its address,
+  so an internal host and port, or a credential in a connection's address, does not reach a key holder; the
+  whole error, with its causes, is logged as a warning under the connection's name.
 
-Two things this pass left as they are, and a public release should decide on them first. An account an
-admin makes has no password until its first sign-in, so whoever signs in with that username first is the
-one who sets it — the intended feature, but a guessed username can be claimed by anyone who reaches the
-instance. And the role is decided by counting rows before the insert, so two first sign-ins at the same
-moment on an empty instance can both be told they own it. A taken username is named when an account is
-registered; other error responses pass the driver text through, so a constraint name (a duplicate
-connection name, for instance) can still reach a client, and bcrypt only reads the first 72 bytes of a
-password.
+Two things are left as they are, and a public release should decide on them first. An account an admin
+makes has no password until its first sign-in, so whoever signs in with that username first is the one
+who sets it — the intended feature, but a guessed username can be claimed by anyone who reaches the
+instance. And bcrypt only reads the first 72 bytes of a password.
+
+The moments around a first account are settled. Two first sign-ins at the same moment do not both get in:
+the password is written only where there is still none, and only while the account is still enabled and not
+held, so the one that lands second, or one that lands after an admin turned the account off, is answered
+exactly as a wrong password is, and the password that stays is the one whose sign-in was let in. Whether
+registration is open, the role, and whether a new account waits for approval are decided by the statement
+that inserts the account rather than by counting the accounts first, so registrations at the same moment on
+an empty instance make one admin, and the others are answered as registration being closed.
 
 ## Tests
 
@@ -354,8 +414,15 @@ cargo test
 ```
 
 The suite runs the gateway against a mock OpenAI-compatible upstream and covers usage
-recording, estimation when the upstream reports nothing including reasoning text, SSE
-pass-through, that a client's reasoning level reaches the upstream unchanged, upstream failover,
+recording, estimation when the upstream reports nothing including reasoning text, the `estimated` flag a
+recorded row carries in `/api/stats/recent` and in its event on `/api/live`, true for a row the gateway
+estimated and false for one the upstream reported, answered at once or streamed, SSE
+pass-through, that a client's reasoning level reaches the upstream unchanged, that a request naming no model
+reaches the upstream without one and is recorded as `unknown`, upstream failover,
+a connection marked down being tried after the ones that are not rather than skipped, including when every
+connection is marked down, and a connection that is full passing the request on to one marked down,
+with a failure there naming the full one beside it, the model list asking a connection that is up before one
+marked down, an upstream that fails named by its connection and not by its address at both gateway endpoints,
 the round of health checks marking a connection that answers,
 the model recorded for a streamed request when nothing is pinned to a key or a connection,
 per-key limits and their validation, the per-key, per-account and per-model figures carrying the input and the
@@ -363,10 +430,14 @@ output apart, including for a key or an account with no usage and after a key is
 caller's own with the other
 accounts read by an admin alone, per-account daily token limits including the day
 boundary and the admin-only rule for setting one, the admin/user scoping of the stats
-queries and the split between a caller's own figures and the platform total, a taken username named when registering, including one held for approval, with any other failure
+queries and the split between a caller's own figures and the platform total, every account listed for an admin
+however many there are, including one past the twentieth by name that is waiting for approval, a taken username named when registering, including one held for approval, with any other failure
 answered as a server error, the registration setting being read before sign in and closed by default after the
 first account, approval being on by default and blocking a sign-in until an admin grants it, an
-account made by an admin with no password until its first sign-in, the account actions (disable,
+account made by an admin with no password until its first sign-in, the account races, run against several
+database connections at once: many registrations at the same moment on an empty instance making one admin
+that is not held for approval, and two first sign-ins at the same moment on an account an admin made letting
+one in, with the other answered as a wrong password and the stored password the one that was let in, the account actions (disable,
 rename, new password, approve, delete) and what they do to a sign-in, a key and the recorded usage,
 that deleting a key leaves the rows recorded for it and the
 counters standing, the presence counts while a request is in flight, a stream's progress reaching the live
@@ -374,8 +445,14 @@ stream while it runs, moving from the estimate to what the upstream reported, wi
 on its own when an upstream reports it first, and leaving it only when its row
 arrives, which names the stream it settles, another account's stream listed for an admin and only counted for a
 member, who is sent its row's figures and nothing else, the connections routes being
-admin-only with the key a connection carries returned to an admin alone, the model list refusing a
-disabled account the same way the completion path does, sign-in attempts being bounded per account, a
+admin-only with the key a connection carries and its address returned to an admin alone, a key made or changed
+with a connection that does not exist answered as a mistake in what was sent, a duplicate connection name named,
+with a database that refuses a connection or an account answered as a server error with a reference and none
+of the driver's text, the model list refusing a
+disabled account the same way the completion path does, a request refused rather than let through when its
+key's per-minute count, its cap or its account's day cannot be read, both gateway endpoints refusing a key
+whose account cannot be read and answering one whose account is gone as unknown, sign-in attempts being
+bounded per account, a
 session refused past the window the cookie lasts, the cookie marked Secure only when the request came
 over TLS, the migration of a usage table written before the prompt cache and timing columns — the rows
 already there keep their values and read as unknown, and a value already reported is carried across the
@@ -383,7 +460,9 @@ rebuild of that table — and which fields a recorded row carries when an engine
 timings against when it reports nothing, including a usage block that reports no token counts and is
 therefore estimated, and the migration of a database
 written with the old columns (a display name, an email, a
-lifetime cap), or with usage rows that were taken with the key, to the current shape.
+lifetime cap), or with usage rows that were taken with the key, to the current shape, with every index on the
+usage table in place after that table is rebuilt, a rebuild that fails partway leaving the table as it was and
+foreign keys on, and a rebuild left half-done by an earlier start run again with the rows keeping their values.
 
 The concurrency tests (`tests/concurrency.rs`) run the gateway against a mock upstream that counts how many
 requests it is working on at once, and check that requests are answered at the same time rather than one after
@@ -414,8 +493,8 @@ single-threaded runtime would measure one worker rather than the gateway. There 
 Rust, so what stands in its place is that shared state is only reachable through types the compiler requires to
 be `Send` and `Sync`, plus running the concurrency tests repeatedly. The environment variables themselves are
 read in `src/main.rs`, which is the composition root and nothing in the suite reaches it, so the pool size is not
-exercised by a test; the one thing tested there is the dashboard address the startup line names, a unit test
-beside the function that picks it. The two time bounds are exercised, because the tests build the client and the state through
+exercised by a test; the things tested there are the dashboard address the startup line names and the log
+filter chosen from `RUST_LOG`, set or not, each a unit test beside the function that picks it. The two time bounds are exercised, because the tests build the client and the state through
 the same functions the gateway uses; the connect timeout and the number of connections kept idle are read through
 that builder but no test asserts what they do. The pool and the busy timeout are exercised through `db::connect`
 against a shared-cache in-memory database, which is not the same mechanism as writer contention on a file.

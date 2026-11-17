@@ -10,7 +10,7 @@ use axum::{
     routing::{get, post},
 };
 use dreamgate::{build_router, db, limits, live, presence, state::State};
-use futures_util::stream;
+use futures_util::{future::join_all, stream};
 use http_body_util::BodyExt;
 use serde_json::{Value, json};
 use sqlx::{Row, sqlite::SqlitePool, sqlite::SqlitePoolOptions};
@@ -26,11 +26,14 @@ async fn test_state() -> State {
     for statement in db::SCHEMA {
         sqlx::query(*statement).execute(&pool).await.unwrap();
     }
+    // As `db::connect` does it: the migration is what makes the indexes.
+    db::migrate(&pool).await.unwrap();
 
     // Far above what any test in this file sends, so a test is not shaped by admission: as a result the main
-    // suite never exercises it, including its interaction with the failover test. The tests that check admission
-    // build their own state in tests/concurrency.rs. The time bounds are the ones the gateway runs with,
-    // because the mock answers long before either of them.
+    // suite only exercises it in the one test that fills a connection on purpose, through the capability that
+    // connection states, to see where the request goes next. The tests that check admission itself build their
+    // own state in tests/concurrency.rs. The time bounds are the ones the gateway runs with, because the mock
+    // answers long before either of them.
     let limits = limits::Limits::new(
         1024,
         1024,
@@ -516,6 +519,66 @@ async fn a_taken_username_is_named_when_registering() {
             .unwrap()
             .contains("already taken")
     );
+}
+
+// The account races are between statements on different connections, which the single pooled connection of
+// `test_state` would put in a line by itself, so these tests run against a shared in-memory database with as many
+// connections as the gateway opens by default. Each test names its own database, because they run at once.
+async fn shared_state(name: &str) -> State {
+    let mut st = test_state().await;
+    st.pool = db::connect(
+        &format!("sqlite://file:{name}?mode=memory&cache=shared"),
+        db::DEFAULT_POOL_SIZE,
+    )
+    .await
+    .unwrap();
+    st
+}
+
+// The first account owns the instance. The role used to be decided by counting the accounts before a password
+// hash that takes tens of milliseconds, so registrations that arrived together all counted none and were all made
+// admin; the insert decides it now, in the same step as it writes.
+#[tokio::test]
+async fn registrations_at_once_on_an_empty_instance_make_one_admin() {
+    let st = shared_state("registrations_at_once").await;
+    let router = build_router(st.clone());
+
+    let names: Vec<String> = (0..12).map(|n| format!("racer{n}")).collect();
+    let answers = join_all(names.iter().map(|name| {
+        post_json(
+            &router,
+            "/api/register",
+            "",
+            json!({ "username": name, "password": "test-password" }),
+        )
+    }))
+    .await;
+
+    let admitted: Vec<&Value> = answers
+        .iter()
+        .filter(|(status, _)| *status == StatusCode::OK)
+        .map(|(_, body)| body)
+        .collect();
+    assert_eq!(admitted.len(), 1, "one registration owns the instance");
+    assert_eq!(admitted[0]["role"], "admin");
+    // The first account is not held for approval, because there is no one to approve it.
+    assert!(admitted[0]["pending"].is_null());
+    // Once there is an admin, registration is closed by default, and the others are told so.
+    for (status, body) in answers
+        .iter()
+        .filter(|(status, _)| *status != StatusCode::OK)
+    {
+        assert_eq!(*status, StatusCode::FORBIDDEN);
+        assert_eq!(body["error"]["type"], "registration_closed");
+    }
+    assert_eq!(count(&st.pool, "users").await, 1);
+    let admins =
+        sqlx::query("SELECT COUNT(*) AS n FROM users WHERE role = 'admin' AND pending = 0")
+            .fetch_one(&st.pool)
+            .await
+            .unwrap()
+            .get::<i64, _>("n");
+    assert_eq!(admins, 1);
 }
 
 #[tokio::test]
@@ -1054,6 +1117,72 @@ async fn reasoning_effort_is_forwarded_to_the_upstream_unchanged() {
     assert_eq!(sent["model"], "reasoning-model");
 }
 
+// Nothing names a model here: none is pinned to the key, the connection has no default and the request carries
+// none. The body reaches the upstream without one, as the client sent it, so the upstream answers with its own
+// default rather than with a name the gateway made up; the stream_options a stream is given is the only field
+// written.
+#[tokio::test]
+async fn a_request_that_names_no_model_reaches_the_upstream_without_one() {
+    let echo = Router::new().route("/v1/chat/completions", post(mock_echo));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base_url = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, echo).await.unwrap() });
+
+    let st = test_state().await;
+    let router = build_router(st.clone());
+    let cookie = register(&router, "ada").await;
+    post_json(
+        &router,
+        "/api/connections",
+        &cookie,
+        json!({ "name": "test", "base_url": base_url }),
+    )
+    .await;
+    let (_, created) =
+        post_json(&router, "/api/keys", &cookie, json!({ "name": "test key" })).await;
+    let key = created["key"].as_str().unwrap().to_string();
+    let messages = json!([{ "role": "user", "content": "hi" }]);
+
+    let response = gateway_call(&router, &key, json!({ "messages": messages })).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        json_body(response).await,
+        json!({ "messages": messages }),
+        "the body arrived as the client sent it"
+    );
+
+    // The echo answers a stream with the one body it was sent, and the gateway passes that through.
+    let response = gateway_call(
+        &router,
+        &key,
+        json!({ "messages": messages, "stream": true }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        json_body(response).await,
+        json!({ "messages": messages, "stream": true, "stream_options": { "include_usage": true } }),
+        "the stream arrived with stream_options added and nothing else"
+    );
+
+    // The rows name the model the gateway sent, so they say unknown when it sent none.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let usage = loop {
+        let usage = recorded_usage(&st.pool).await;
+        if usage.len() == 2 {
+            break usage;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the streamed request was not recorded"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
+    for row in &usage {
+        assert_eq!(row["model"], "unknown");
+    }
+}
+
 #[tokio::test]
 async fn records_the_model_the_client_asked_for_when_streaming() {
     let st = test_state().await;
@@ -1125,6 +1254,347 @@ async fn fails_over_to_a_healthy_connection() {
     let usage = recorded_usage(&st.pool).await;
     assert_eq!(usage[0]["connection_id"], healthy["id"]);
     assert_eq!(usage[0]["completion_tokens"], 7);
+}
+
+// The health a check would have written, set directly, so a test decides what the gateway reads without
+// waiting for a round.
+async fn mark_health(pool: &SqlitePool, connection: &Value, health: &str) {
+    sqlx::query("UPDATE connections SET health = ? WHERE id = ?")
+        .bind(health)
+        .bind(connection["id"].as_i64().unwrap())
+        .execute(pool)
+        .await
+        .unwrap();
+}
+
+// A check is only every 30 seconds, so a connection marked down may be answering again. When every connection
+// is marked down they are still tried in their order, rather than all skipped and the request answered as if
+// nothing could be reached.
+#[tokio::test]
+async fn connections_that_are_all_marked_down_are_still_tried() {
+    let st = test_state().await;
+    let router = build_router(st.clone());
+    let base_url = mock_upstream().await;
+    let cookie = register(&router, "ada").await;
+
+    // Nothing listens on port 1, so the first is down in fact; the second is marked down but answers.
+    let (_, dead) = post_json(
+        &router,
+        "/api/connections",
+        &cookie,
+        json!({ "name": "dead", "base_url": "http://127.0.0.1:1", "priority": 0 }),
+    )
+    .await;
+    let (_, stale) = post_json(
+        &router,
+        "/api/connections",
+        &cookie,
+        json!({ "name": "stale", "base_url": base_url, "default_model": "reports-usage", "priority": 1 }),
+    )
+    .await;
+    mark_health(&st.pool, &dead, "down").await;
+    mark_health(&st.pool, &stale, "down").await;
+    let (_, created) =
+        post_json(&router, "/api/keys", &cookie, json!({ "name": "test key" })).await;
+    let key = created["key"].as_str().unwrap().to_string();
+
+    let response = gateway_call(
+        &router,
+        &key,
+        json!({ "messages": [{ "role": "user", "content": "hi" }] }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let usage = recorded_usage(&st.pool).await;
+    assert_eq!(
+        usage.len(),
+        1,
+        "a request is one row, whichever connections it tried"
+    );
+    assert_eq!(usage[0]["connection_id"], stale["id"]);
+    assert_eq!(usage[0]["status"], 200);
+    assert_eq!(usage[0]["completion_tokens"], 7);
+}
+
+// Being tried last is what marked down means: a connection that is not marked down is asked first, even when
+// the one marked down has the better priority or is the one the key is bound to.
+#[tokio::test]
+async fn a_connection_that_is_up_is_tried_before_one_marked_down() {
+    let st = test_state().await;
+    let router = build_router(st.clone());
+    let base_url = mock_upstream().await;
+    let cookie = register(&router, "ada").await;
+
+    // Both answer, so the row says which one was asked first rather than which one was reachable.
+    let (_, stale) = post_json(
+        &router,
+        "/api/connections",
+        &cookie,
+        json!({ "name": "stale", "base_url": base_url, "default_model": "reports-usage", "priority": 0 }),
+    )
+    .await;
+    let (_, up) = post_json(
+        &router,
+        "/api/connections",
+        &cookie,
+        json!({ "name": "up", "base_url": base_url, "default_model": "reports-usage", "priority": 1 }),
+    )
+    .await;
+    mark_health(&st.pool, &stale, "down").await;
+    mark_health(&st.pool, &up, "ok").await;
+    let (_, free) = post_json(&router, "/api/keys", &cookie, json!({ "name": "free key" })).await;
+    let (_, bound) = post_json(
+        &router,
+        "/api/keys",
+        &cookie,
+        json!({ "name": "bound key", "connection_id": stale["id"] }),
+    )
+    .await;
+
+    for created in [&free, &bound] {
+        let response = gateway_call(
+            &router,
+            created["key"].as_str().unwrap(),
+            json!({ "messages": [{ "role": "user", "content": "hi" }] }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    let usage = recorded_usage(&st.pool).await;
+    assert_eq!(usage.len(), 2);
+    for row in &usage {
+        assert_eq!(row["connection_id"], up["id"]);
+    }
+}
+
+// A connection that is full is passed over as it always was, and one marked down is still a connection the
+// request can use, so it is asked rather than the request being answered as an overload. Only when it is full
+// as well is the request turned away, and then the answer names both.
+#[tokio::test]
+async fn a_full_connection_passes_the_request_on_to_one_marked_down() {
+    let st = test_state().await;
+    let router = build_router(st.clone());
+    let base_url = mock_upstream().await;
+    let cookie = register(&router, "ada").await;
+
+    let (_, busy) = post_json(
+        &router,
+        "/api/connections",
+        &cookie,
+        json!({ "name": "busy", "base_url": base_url, "default_model": "reports-usage", "priority": 0, "max_concurrent": 1 }),
+    )
+    .await;
+    let (_, stale) = post_json(
+        &router,
+        "/api/connections",
+        &cookie,
+        json!({ "name": "stale", "base_url": base_url, "default_model": "reports-usage", "priority": 1, "max_concurrent": 1 }),
+    )
+    .await;
+    mark_health(&st.pool, &busy, "ok").await;
+    mark_health(&st.pool, &stale, "down").await;
+    let (_, created) =
+        post_json(&router, "/api/keys", &cookie, json!({ "name": "test key" })).await;
+    let key = created["key"].as_str().unwrap().to_string();
+    let body = json!({ "messages": [{ "role": "user", "content": "hi" }] });
+
+    // The slot is taken from the semaphore the gateway admits by, so the connection is full without a request
+    // being held open on it.
+    let slot = |connection: &Value| {
+        st.limits
+            .for_connection(connection["id"].as_i64().unwrap(), Some(1))
+            .try_acquire_owned()
+            .unwrap()
+    };
+    let _busy_slot = slot(&busy);
+    let response = gateway_call(&router, &key, body.clone()).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let usage = recorded_usage(&st.pool).await;
+    assert_eq!(usage.len(), 1);
+    assert_eq!(usage[0]["connection_id"], stale["id"]);
+
+    let _stale_slot = slot(&stale);
+    let response = gateway_call(&router, &key, body).await;
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    let refused = json_body(response).await;
+    assert_eq!(refused["error"]["type"], "connection_full");
+    assert!(
+        refused["error"]["message"]
+            .as_str()
+            .unwrap()
+            .ends_with("busy, stale"),
+        "the answer names every connection that was full: {refused}"
+    );
+    assert_eq!(
+        recorded_usage(&st.pool).await.len(),
+        1,
+        "a request that reached no connection is not recorded"
+    );
+}
+
+// The model list reads the same order a completion does, so a connection marked down is not the one it
+// asks while another is up: the Sandbox reads its models from here, and would have none while chat works.
+#[tokio::test]
+async fn the_model_list_asks_a_connection_that_is_up_before_one_marked_down() {
+    let st = test_state().await;
+    let router = build_router(st.clone());
+    let base_url = mock_upstream().await;
+    let cookie = register(&router, "ada").await;
+
+    let (_, dead) = post_json(
+        &router,
+        "/api/connections",
+        &cookie,
+        json!({ "name": "dead", "base_url": "http://127.0.0.1:1", "priority": 0 }),
+    )
+    .await;
+    let (_, up) = post_json(
+        &router,
+        "/api/connections",
+        &cookie,
+        json!({ "name": "up", "base_url": base_url, "priority": 1 }),
+    )
+    .await;
+    mark_health(&st.pool, &dead, "down").await;
+    mark_health(&st.pool, &up, "ok").await;
+    let (_, created) =
+        post_json(&router, "/api/keys", &cookie, json!({ "name": "test key" })).await;
+
+    let response = models_call(&router, created["key"].as_str().unwrap()).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(json_body(response).await["data"][0]["id"], "test-model");
+}
+
+// When the connection that is up is full and the one marked down then fails, the answer is that failure,
+// with the full connection named beside it rather than left out.
+#[tokio::test]
+async fn a_failure_after_a_full_connection_names_the_full_one_as_well() {
+    let st = test_state().await;
+    let router = build_router(st.clone());
+    let base_url = mock_upstream().await;
+    let cookie = register(&router, "ada").await;
+
+    let (_, busy) = post_json(
+        &router,
+        "/api/connections",
+        &cookie,
+        json!({ "name": "busy", "base_url": base_url, "default_model": "reports-usage", "priority": 0, "max_concurrent": 1 }),
+    )
+    .await;
+    let (_, dead) = post_json(
+        &router,
+        "/api/connections",
+        &cookie,
+        json!({ "name": "dead", "base_url": "http://127.0.0.1:1", "priority": 1 }),
+    )
+    .await;
+    mark_health(&st.pool, &busy, "ok").await;
+    mark_health(&st.pool, &dead, "down").await;
+    let (_, created) =
+        post_json(&router, "/api/keys", &cookie, json!({ "name": "test key" })).await;
+    let _busy_slot = st
+        .limits
+        .for_connection(busy["id"].as_i64().unwrap(), Some(1))
+        .try_acquire_owned()
+        .unwrap();
+
+    let response = gateway_call(
+        &router,
+        created["key"].as_str().unwrap(),
+        json!({ "model": "m", "messages": [{ "role": "user", "content": "hi" }] }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    let message = json_body(response).await["error"]["message"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(message.starts_with("dead: "), "{message}");
+    assert!(
+        message.ends_with("at their limit of requests at once: busy"),
+        "{message}"
+    );
+    let usage = recorded_usage(&st.pool).await;
+    assert_eq!(
+        usage.len(),
+        1,
+        "a request that reached a connection is recorded"
+    );
+    assert_eq!(usage[0]["status"], 502);
+}
+
+// A key bound to a connection that does not exist is a mistake in what was sent, so it is answered as one
+// rather than as a failure of the server, whether the key is being made or changed.
+#[tokio::test]
+async fn a_key_bound_to_a_connection_that_does_not_exist_is_told_so() {
+    let st = test_state().await;
+    let router = build_router(st.clone());
+    let cookie = register(&router, "ada").await;
+
+    let (status, body) = post_json(
+        &router,
+        "/api/keys",
+        &cookie,
+        json!({ "name": "orphan", "connection_id": 4242 }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["error"]["message"], "no connection with that id");
+
+    let (_, created) = post_json(&router, "/api/keys", &cookie, json!({ "name": "plain" })).await;
+    let (status, body) = send_json(
+        &router,
+        http::Method::PATCH,
+        &format!("/api/keys/{}", created["id"]),
+        &cookie,
+        json!({ "connection_id": 4242 }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["error"]["message"], "no connection with that id");
+}
+
+// A key holder is told which connection failed, not where it is: the HTTP client's error ends in the
+// full upstream address, which names an internal host and port, and any credential an upstream takes
+// in its query string.
+#[tokio::test]
+async fn a_failed_upstream_is_named_without_its_address() {
+    let st = test_state().await;
+    let router = build_router(st.clone());
+    let admin = register(&router, "ada").await;
+
+    // Nothing listens on port 1, so the request fails at the transport level.
+    let (status, _) = post_json(
+        &router,
+        "/api/connections",
+        &admin,
+        json!({ "name": "dead", "base_url": "http://127.0.0.1:1/?token=upstream-secret" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (_, created) = post_json(&router, "/api/keys", &admin, json!({ "name": "test key" })).await;
+    let key = created["key"].as_str().unwrap().to_string();
+
+    let completion = gateway_call(
+        &router,
+        &key,
+        json!({ "model": "m", "messages": [{ "role": "user", "content": "hi" }] }),
+    )
+    .await;
+    assert_eq!(completion.status(), StatusCode::BAD_GATEWAY);
+    let models = models_call(&router, &key).await;
+    assert_eq!(models.status(), StatusCode::BAD_GATEWAY);
+
+    for response in [completion, models] {
+        let body = json_body(response).await;
+        let message = body["error"]["message"].as_str().unwrap().to_string();
+        assert!(message.starts_with("dead: "), "{message}");
+        for part in ["127.0.0.1", "upstream-secret", "token", "http"] {
+            assert!(!message.contains(part), "{message}");
+        }
+    }
 }
 
 // The round of health checks is started by the binary rather than by a route, so no other test reaches
@@ -1269,6 +1739,69 @@ async fn a_connection_can_state_its_capability_or_leave_it_out_but_not_state_zer
     .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["connections"][0]["max_concurrent"], json!(null));
+}
+
+// A name that is taken means something to the admin who typed it, so it is named; anything else the
+// database refuses is a server error with a reference, and the driver's text, which names tables and
+// constraints, stays in the log.
+#[tokio::test]
+async fn a_duplicate_connection_name_is_named_and_no_database_failure_carries_the_driver_text() {
+    let st = test_state().await;
+    let router = build_router(st.clone());
+    let admin = register(&router, "ada").await;
+
+    let (status, _) = post_json(
+        &router,
+        "/api/connections",
+        &admin,
+        json!({ "name": "local", "base_url": "http://127.0.0.1:8080" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    // The name is trimmed before it is stored, and the trimmed name is the one reported.
+    let (status, body) = post_json(
+        &router,
+        "/api/connections",
+        &admin,
+        json!({ "name": " local ", "base_url": "http://127.0.0.1:8081" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(
+        body["error"]["message"],
+        "a connection named local already exists"
+    );
+
+    // Triggers that refuse every insert stand in for a database that cannot take the row. Neither
+    // failure is a taken name, and neither answer carries what the database said.
+    for table in ["connections", "users"] {
+        let sql = format!(
+            "CREATE TRIGGER refuse_{table} BEFORE INSERT ON {table} \
+             BEGIN SELECT RAISE(ABORT, 'refused by trigger on {table}'); END"
+        );
+        sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
+            .execute(&st.pool)
+            .await
+            .unwrap();
+    }
+    let (connection_status, connection) = post_json(
+        &router,
+        "/api/connections",
+        &admin,
+        json!({ "name": "another", "base_url": "http://127.0.0.1:8082" }),
+    )
+    .await;
+    let (account_status, account) =
+        post_json(&router, "/api/users", &admin, json!({ "username": "ben" })).await;
+    for (status, body) in [(connection_status, connection), (account_status, account)] {
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(body["error"]["type"], "server_error");
+        let message = body["error"]["message"].as_str().unwrap();
+        assert!(message.contains("reference"), "{message}");
+        for part in ["trigger", "already", "constraint", "connections", "users"] {
+            assert!(!message.contains(part), "{message}");
+        }
+    }
 }
 
 #[tokio::test]
@@ -1886,6 +2419,63 @@ async fn an_admin_can_make_an_account_whose_password_is_chosen_on_the_first_sign
     assert_eq!(status, StatusCode::BAD_REQUEST);
 }
 
+// Whoever signs in first on an account an admin made sets its password. Two first sign-ins at once used to both
+// read that there was none, both write their own, and both be signed in; the write only lands now where there is
+// still no password, and the sign-in that comes second is answered as the wrong password it has become.
+#[tokio::test]
+async fn first_sign_ins_at_once_on_an_admin_made_account_let_one_in() {
+    let st = shared_state("first_sign_ins_at_once").await;
+    let router = build_router(st.clone());
+    let admin = register(&router, "ada").await;
+    let (status, created) =
+        post_json(&router, "/api/users", &admin, json!({ "username": "ben" })).await;
+    assert_eq!(status, StatusCode::OK);
+    let ben = created["id"].as_i64().unwrap();
+
+    let passwords = ["first-password", "second-password"];
+    let answers = join_all(passwords.iter().map(|password| {
+        post_json(
+            &router,
+            "/api/login",
+            "",
+            json!({ "username": "ben", "password": password }),
+        )
+    }))
+    .await;
+
+    let winners: Vec<usize> = (0..answers.len())
+        .filter(|&n| answers[n].0 == StatusCode::OK)
+        .collect();
+    assert_eq!(winners.len(), 1, "one sign-in sets the password");
+    let (status, body) = &answers[1 - winners[0]];
+    assert_eq!(*status, StatusCode::UNAUTHORIZED);
+    assert_eq!(body["error"]["type"], "invalid_credentials");
+    assert_eq!(
+        body["error"]["message"],
+        "username or password is not correct"
+    );
+    let sessions = sqlx::query("SELECT COUNT(*) AS n FROM sessions WHERE user_id = ?")
+        .bind(ben)
+        .fetch_one(&st.pool)
+        .await
+        .unwrap()
+        .get::<i64, _>("n");
+    assert_eq!(sessions, 1);
+
+    // The password that stays is the one whose sign-in was let in.
+    let winner = passwords[winners[0]];
+    let loser = passwords[1 - winners[0]];
+    sign_in(&router, "ben", winner).await;
+    let (status, _) = post_json(
+        &router,
+        "/api/login",
+        "",
+        json!({ "username": "ben", "password": loser }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
 async fn usage_count(pool: &SqlitePool, user: i64) -> i64 {
     sqlx::query("SELECT COUNT(*) AS n FROM usage WHERE user_id = ?")
         .bind(user)
@@ -1981,6 +2571,161 @@ async fn a_disabled_account_cannot_sign_in_or_use_its_key() {
         response.status(),
         StatusCode::FORBIDDEN,
         "a key alone does not reach an upstream for an account that is off"
+    );
+}
+
+async fn models_call(router: &Router, key: &str) -> Response {
+    call(
+        router,
+        Request::get("/v1/models")
+            .header("authorization", format!("Bearer {key}"))
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await
+}
+
+// Dropping the usage table makes every limit read fail while the key and the account can still be
+// read, which is the shape of a database that is held or failing in the middle of a request. Each
+// key reaches a different read first: the per-minute count, the key's cap, and the account's day.
+#[tokio::test]
+async fn a_limit_that_cannot_be_read_refuses_the_request_rather_than_letting_it_through() {
+    let st = test_state().await;
+    let router = build_router(st.clone());
+    let base_url = mock_upstream().await;
+    let admin = register(&router, "ada").await;
+    post_json(
+        &router,
+        "/api/connections",
+        &admin,
+        json!({ "name": "test", "base_url": base_url, "default_model": "reports-usage" }),
+    )
+    .await;
+    let mut keys = Vec::new();
+    for body in [
+        json!({ "name": "rated", "rpm_limit": 100 }),
+        json!({ "name": "capped", "token_cap": 1000 }),
+        json!({ "name": "plain" }),
+    ] {
+        let (_, created) = post_json(&router, "/api/keys", &admin, body).await;
+        keys.push(created["key"].as_str().unwrap().to_string());
+    }
+    let me = get_json(&router, "/api/me", &admin).await;
+    let (status, _) = send_json(
+        &router,
+        http::Method::PATCH,
+        &format!("/api/users/{}", me["id"]),
+        &admin,
+        json!({ "daily_token_cap": 1000 }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    sqlx::query("DROP TABLE usage")
+        .execute(&st.pool)
+        .await
+        .unwrap();
+    for key in &keys {
+        let response = gateway_call(
+            &router,
+            key,
+            json!({ "messages": [{ "role": "user", "content": "hi" }] }),
+        )
+        .await;
+        assert_eq!(
+            response.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "a limit that could not be read is not taken as one that was not reached"
+        );
+        let body = json_body(response).await;
+        assert_eq!(body["error"]["type"], "unavailable");
+        let message = body["error"]["message"].as_str().unwrap();
+        assert!(message.contains("logged as reference"), "{message}");
+        assert!(!message.contains("usage"), "no table name: {message}");
+    }
+}
+
+// Renaming the account table makes the account read fail while the key read still works, so the
+// disabled-account check is the one that cannot be made, at both gateway endpoints.
+#[tokio::test]
+async fn an_account_that_cannot_be_read_is_not_taken_as_one_that_is_enabled() {
+    let st = test_state().await;
+    let router = build_router(st.clone());
+    let base_url = mock_upstream().await;
+    let admin = register(&router, "ada").await;
+    post_json(
+        &router,
+        "/api/connections",
+        &admin,
+        json!({ "name": "test", "base_url": base_url, "default_model": "reports-usage" }),
+    )
+    .await;
+    let (_, created) = post_json(&router, "/api/keys", &admin, json!({ "name": "plain" })).await;
+    let key = created["key"].as_str().unwrap().to_string();
+
+    sqlx::query("ALTER TABLE users RENAME TO users_unreadable")
+        .execute(&st.pool)
+        .await
+        .unwrap();
+    let response = gateway_call(
+        &router,
+        &key,
+        json!({ "messages": [{ "role": "user", "content": "hi" }] }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        models_call(&router, &key).await.status(),
+        StatusCode::SERVICE_UNAVAILABLE
+    );
+}
+
+// Deleting an account takes its keys with it, so a key whose account is already gone can only be
+// seen between the two. Foreign keys are switched off on the test's one connection to hold that
+// moment still.
+#[tokio::test]
+async fn a_key_whose_account_is_gone_is_answered_as_a_key_that_no_longer_exists() {
+    let st = test_state().await;
+    let router = build_router(st.clone());
+    let base_url = mock_upstream().await;
+    let admin = register(&router, "ada").await;
+    post_json(
+        &router,
+        "/api/connections",
+        &admin,
+        json!({ "name": "test", "base_url": base_url, "default_model": "reports-usage" }),
+    )
+    .await;
+    let (_, created) = post_json(&router, "/api/keys", &admin, json!({ "name": "plain" })).await;
+    let key = created["key"].as_str().unwrap().to_string();
+
+    sqlx::query("PRAGMA foreign_keys = OFF")
+        .execute(&st.pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM users")
+        .execute(&st.pool)
+        .await
+        .unwrap();
+    let response = gateway_call(
+        &router,
+        &key,
+        json!({ "messages": [{ "role": "user", "content": "hi" }] }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        json_body(response).await["error"]["type"],
+        "invalid_api_key"
+    );
+    assert_eq!(
+        models_call(&router, &key).await.status(),
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        count(&st.pool, "usage").await,
+        0,
+        "nothing reached an upstream"
     );
 }
 
@@ -2503,6 +3248,368 @@ async fn a_database_that_takes_usage_with_a_deleted_key_is_moved_to_the_current_
     assert_eq!(usage_count(&pool, 1).await, 0);
 }
 
+async fn usage_indexes(pool: &SqlitePool) -> Vec<String> {
+    sqlx::query(
+        "SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = 'usage' ORDER BY name",
+    )
+    .fetch_all(pool)
+    .await
+    .unwrap()
+    .into_iter()
+    .map(|row| row.get::<String, _>("name"))
+    .collect()
+}
+
+async fn table_exists(pool: &SqlitePool, table: &str) -> bool {
+    sqlx::query("SELECT COUNT(*) AS n FROM sqlite_master WHERE type = 'table' AND name = ?")
+        .bind(table)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+        .get::<i64, _>("n")
+        > 0
+}
+
+async fn key_action(pool: &SqlitePool) -> String {
+    sqlx::query(
+        "SELECT \"on_delete\" AS action FROM pragma_foreign_key_list('usage') WHERE \"table\" = 'api_keys'",
+    )
+    .fetch_one(pool)
+    .await
+    .unwrap()
+    .get::<String, _>("action")
+}
+
+// Rebuilding the usage table drops its indexes with it, and the start that rebuilt it used to make
+// only the one on the key again, so every per-account query read the whole table until the next start.
+#[tokio::test]
+async fn the_usage_indexes_are_in_place_after_the_table_is_rebuilt() {
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
+        .unwrap();
+    for statement in db::SCHEMA {
+        sqlx::query(*statement).execute(&pool).await.unwrap();
+    }
+
+    // A usage table that still takes its rows with the key, with the indexes a database written then
+    // has on it.
+    sqlx::query("DROP TABLE usage")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "CREATE TABLE usage (
+            id INTEGER PRIMARY KEY,
+            api_key_id INTEGER NOT NULL REFERENCES api_keys(id) ON DELETE CASCADE,
+            user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            connection_id INTEGER REFERENCES connections(id) ON DELETE SET NULL,
+            model TEXT,
+            prompt_tokens INTEGER NOT NULL,
+            completion_tokens INTEGER NOT NULL,
+            total_tokens INTEGER NOT NULL,
+            latency_ms INTEGER NOT NULL,
+            status INTEGER NOT NULL,
+            streamed INTEGER NOT NULL DEFAULT 0,
+            estimated INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL
+        )",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    for statement in [
+        "CREATE INDEX idx_usage_created ON usage (created_at)",
+        "CREATE INDEX idx_usage_key ON usage (api_key_id)",
+        "CREATE INDEX idx_usage_user ON usage (user_id)",
+    ] {
+        sqlx::query(statement).execute(&pool).await.unwrap();
+    }
+    sqlx::query("INSERT INTO users (id, username, password_hash, role, created_at) VALUES (1, 'ada', 'hash', 'admin', '2026-01-01T00:00:00Z')")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO api_keys (id, user_id, name, key, created_at) VALUES (1, 1, 'key', 'dreamgate_test', '2026-01-01T00:00:00Z')")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO usage (api_key_id, user_id, model, prompt_tokens, completion_tokens, total_tokens, latency_ms, status, created_at) VALUES (1, 1, 'test-model', 11, 7, 18, 5, 200, '2026-01-01T00:00:00Z')")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    db::migrate(&pool).await.unwrap();
+
+    assert_eq!(key_action(&pool).await, "SET NULL", "the table was rebuilt");
+    assert_eq!(
+        usage_indexes(&pool).await.join(","),
+        "idx_usage_created,idx_usage_key,idx_usage_user"
+    );
+    // A per-account query reads through its index rather than the whole table.
+    let plan = sqlx::query("EXPLAIN QUERY PLAN SELECT COUNT(*) FROM usage WHERE user_id = 1")
+        .fetch_all(&pool)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|row| row.get::<String, _>("detail"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert!(plan.contains("idx_usage_user"), "{plan}");
+    assert_eq!(usage_count(&pool, 1).await, 1);
+
+    // Running it again on a table that is already current leaves them as they are.
+    db::migrate(&pool).await.unwrap();
+    assert_eq!(
+        usage_indexes(&pool).await.join(","),
+        "idx_usage_created,idx_usage_key,idx_usage_user"
+    );
+}
+
+// A start that was interrupted while it rebuilt a table, before the rebuilds were one transaction,
+// left the new table beside the old one: empty when the copy failed, full when it stopped after the
+// copy. The old table still holds every row, so the rebuild runs again from it rather than failing on
+// a table that already exists.
+#[tokio::test]
+async fn a_rebuild_left_unfinished_by_an_earlier_start_is_run_again() {
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
+        .unwrap();
+
+    // Accounts with a display name, an email and a lifetime cap, and usage rows that go with their key.
+    sqlx::query(
+        "CREATE TABLE users (
+            id INTEGER PRIMARY KEY,
+            name TEXT NOT NULL UNIQUE,
+            email TEXT NOT NULL UNIQUE,
+            password_hash TEXT NOT NULL,
+            role TEXT NOT NULL DEFAULT 'user',
+            token_cap INTEGER,
+            created_at TEXT NOT NULL
+        )",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    for statement in db::SCHEMA {
+        sqlx::query(*statement).execute(&pool).await.unwrap();
+    }
+    sqlx::query("DROP TABLE usage")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "CREATE TABLE usage (
+            id INTEGER PRIMARY KEY,
+            api_key_id INTEGER NOT NULL REFERENCES api_keys(id) ON DELETE CASCADE,
+            user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            connection_id INTEGER REFERENCES connections(id) ON DELETE SET NULL,
+            model TEXT,
+            prompt_tokens INTEGER NOT NULL,
+            completion_tokens INTEGER NOT NULL,
+            total_tokens INTEGER NOT NULL,
+            latency_ms INTEGER NOT NULL,
+            status INTEGER NOT NULL,
+            streamed INTEGER NOT NULL DEFAULT 0,
+            estimated INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL
+        )",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query("INSERT INTO users (name, email, password_hash, role, token_cap, created_at) VALUES ('ada', 'ada@example.com', 'hash', 'admin', 500, '2026-01-01T00:00:00Z')")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO api_keys (user_id, name, key, created_at) VALUES (1, 'key', 'dreamgate_test', '2026-01-01T00:00:00Z')")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO usage (api_key_id, user_id, model, prompt_tokens, completion_tokens, total_tokens, latency_ms, status, estimated, created_at) VALUES (1, 1, 'test-model', 11, 7, 18, 5, 200, 1, '2026-01-01T00:00:00Z')")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO sessions (token, user_id, created_at) VALUES ('session', 1, '2026-01-01T00:00:00Z')")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    // What the interrupted start left: the copy of the accounts it finished, and the usage table it
+    // made before the copy into it failed.
+    sqlx::query(
+        "CREATE TABLE users_new (
+            id INTEGER PRIMARY KEY,
+            username TEXT NOT NULL UNIQUE,
+            password_hash TEXT,
+            role TEXT NOT NULL DEFAULT 'user',
+            daily_token_cap INTEGER,
+            enabled INTEGER NOT NULL DEFAULT 1,
+            pending INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL
+        )",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO users_new (id, username, password_hash, role, daily_token_cap, enabled, pending, created_at) \
+         SELECT id, name, password_hash, role, token_cap, 1, 0, created_at FROM users",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "CREATE TABLE usage_new (
+            id INTEGER PRIMARY KEY,
+            api_key_id INTEGER REFERENCES api_keys(id) ON DELETE SET NULL,
+            user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            connection_id INTEGER REFERENCES connections(id) ON DELETE SET NULL,
+            model TEXT,
+            prompt_tokens INTEGER NOT NULL,
+            completion_tokens INTEGER NOT NULL,
+            total_tokens INTEGER NOT NULL,
+            cached_tokens INTEGER,
+            prompt_ms INTEGER,
+            generation_ms INTEGER,
+            latency_ms INTEGER NOT NULL,
+            status INTEGER NOT NULL,
+            streamed INTEGER NOT NULL DEFAULT 0,
+            estimated INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL
+        )",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    db::migrate(&pool).await.unwrap();
+
+    assert!(!table_exists(&pool, "users_new").await);
+    assert!(!table_exists(&pool, "usage_new").await);
+    assert_eq!(
+        user_columns(&pool).await.join(","),
+        "created_at,daily_token_cap,enabled,id,password_hash,pending,role,username"
+    );
+    assert_eq!(key_action(&pool).await, "SET NULL");
+
+    // The account and its row keep their values, once each.
+    assert_eq!(count(&pool, "users").await, 1);
+    let account =
+        sqlx::query("SELECT id, username, role, daily_token_cap, enabled, pending FROM users")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(account.get::<i64, _>("id"), 1);
+    assert_eq!(account.get::<String, _>("username"), "ada");
+    assert_eq!(account.get::<String, _>("role"), "admin");
+    assert_eq!(account.get::<i64, _>("daily_token_cap"), 500);
+    assert_eq!(account.get::<i64, _>("enabled"), 1);
+    assert_eq!(account.get::<i64, _>("pending"), 0);
+    assert_eq!(count(&pool, "usage").await, 1);
+    let usage = sqlx::query(
+        "SELECT api_key_id, user_id, model, prompt_tokens, completion_tokens, total_tokens, \
+         latency_ms, status, estimated, created_at FROM usage",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(usage.get::<Option<i64>, _>("api_key_id"), Some(1));
+    assert_eq!(usage.get::<i64, _>("user_id"), 1);
+    assert_eq!(usage.get::<String, _>("model"), "test-model");
+    assert_eq!(usage.get::<i64, _>("prompt_tokens"), 11);
+    assert_eq!(usage.get::<i64, _>("completion_tokens"), 7);
+    assert_eq!(usage.get::<i64, _>("total_tokens"), 18);
+    assert_eq!(usage.get::<i64, _>("latency_ms"), 5);
+    assert_eq!(usage.get::<i64, _>("status"), 200);
+    assert_eq!(
+        usage.get::<i64, _>("estimated"),
+        1,
+        "an estimate is still marked as one"
+    );
+    assert_eq!(usage.get::<String, _>("created_at"), "2026-01-01T00:00:00Z");
+    assert_eq!(count(&pool, "api_keys").await, 1);
+    assert_eq!(count(&pool, "sessions").await, 1);
+    assert_eq!(
+        usage_indexes(&pool).await.join(","),
+        "idx_usage_created,idx_usage_key,idx_usage_user"
+    );
+}
+
+// Two accounts the old table let share a display name cannot both become a username, so the copy into
+// the rebuilt table fails. What is tested is what that failure leaves: the table as it was, nothing
+// beside it, and a connection with foreign keys on, so the next start meets the same database and fails
+// for the same reason rather than on a table an earlier start left behind.
+#[tokio::test]
+async fn a_rebuild_that_fails_partway_leaves_the_table_as_it_was() {
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
+        .unwrap();
+    sqlx::query(
+        "CREATE TABLE users (
+            id INTEGER PRIMARY KEY,
+            email TEXT NOT NULL UNIQUE,
+            name TEXT NOT NULL,
+            password_hash TEXT NOT NULL,
+            role TEXT NOT NULL DEFAULT 'user',
+            created_at TEXT NOT NULL,
+            daily_token_cap INTEGER
+        )",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    for statement in db::SCHEMA {
+        sqlx::query(*statement).execute(&pool).await.unwrap();
+    }
+    sqlx::query("INSERT INTO users (email, name, password_hash, role, created_at, daily_token_cap) VALUES ('ada@example.com', 'ada', 'hash', 'admin', '2026-01-01T00:00:00Z', 500)")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO users (email, name, password_hash, role, created_at) VALUES ('ada@example.org', 'ada', 'hash', 'user', '2026-01-02T00:00:00Z')")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO sessions (token, user_id, created_at) VALUES ('session', 1, '2026-01-01T00:00:00Z')")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    for _ in 0..2 {
+        let err = db::migrate(&pool).await.unwrap_err();
+        assert!(err.to_string().contains("UNIQUE"), "{err}");
+
+        assert!(!table_exists(&pool, "users_new").await);
+        assert_eq!(
+            user_columns(&pool).await.join(","),
+            "created_at,daily_token_cap,email,id,name,password_hash,role"
+        );
+        assert_eq!(count(&pool, "users").await, 2);
+        assert_eq!(
+            sqlx::query("SELECT daily_token_cap FROM users WHERE id = 1")
+                .fetch_one(&pool)
+                .await
+                .unwrap()
+                .get::<i64, _>("daily_token_cap"),
+            500
+        );
+        assert_eq!(count(&pool, "sessions").await, 1);
+        assert_eq!(
+            sqlx::query("PRAGMA foreign_keys")
+                .fetch_one(&pool)
+                .await
+                .unwrap()
+                .get::<i64, _>(0),
+            1,
+            "the connection went back to the pool with foreign keys on"
+        );
+    }
+}
+
 #[tokio::test]
 async fn the_summary_separates_the_callers_own_figures_from_the_platform_total() {
     let st = test_state().await;
@@ -2588,6 +3695,63 @@ async fn the_summary_separates_the_callers_own_figures_from_the_platform_total()
     assert_eq!(recent["events"][0]["user"], "ben");
 }
 
+// The accounts in the summary are the only list an admin has to act on an account, so every account is in
+// it, however many there are. The last one by name registers itself and waits for approval, which is the
+// account an admin most needs to find.
+#[tokio::test]
+async fn the_summary_lists_every_account_for_an_admin() {
+    let st = test_state().await;
+    let router = build_router(st.clone());
+    let admin = register(&router, "ada").await;
+    for n in 0..24 {
+        let (status, _) = post_json(
+            &router,
+            "/api/users",
+            &admin,
+            json!({ "username": format!("member-{n:02}") }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+    }
+    open_registration(&router, &admin).await;
+    let (status, body) = post_json(
+        &router,
+        "/api/register",
+        "",
+        json!({ "username": "zoe", "password": "test-password" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["pending"], true);
+
+    let summary = get_json(&router, "/api/stats/summary", &admin).await;
+    let names: Vec<&str> = summary["users"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|user| user["username"].as_str().unwrap())
+        .collect();
+    assert_eq!(names.len(), 26, "every account is listed: {names:?}");
+    assert_eq!(names.len() as i64, count(&st.pool, "users").await);
+    let mut sorted = names.clone();
+    sorted.sort();
+    assert_eq!(names, sorted, "the accounts are listed by username");
+    assert!(
+        names.contains(&"member-23"),
+        "an account that sorts after the twentieth is listed: {names:?}"
+    );
+    let zoe = summary["users"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|user| user["username"] == "zoe")
+        .expect("the last account by name is listed");
+    assert_eq!(
+        zoe["pending"], true,
+        "the account waiting for approval can be found to approve"
+    );
+}
+
 #[tokio::test]
 async fn presence_counts_an_account_while_its_request_is_running() {
     let st = test_state().await;
@@ -2653,15 +3817,21 @@ async fn only_an_admin_can_change_a_connection_and_read_the_key_it_carries() {
     let id = created["id"].as_i64().unwrap();
 
     // The page shows a connection to every account, because the gate readout and the model list
-    // need it. The key it carries is a secret, so that part goes to an admin alone.
+    // need it. The key it carries is a secret, and its address names an internal host, so those
+    // parts go to an admin alone.
     let member_view = get_json(&router, "/api/connections", &member).await;
     assert_eq!(
         member_view["connections"][0]["name"], "test",
         "the connection itself is still readable"
     );
     assert!(member_view["connections"][0]["api_key"].is_null());
+    assert!(member_view["connections"][0]["base_url"].is_null());
     let admin_view = get_json(&router, "/api/connections", &admin).await;
     assert_eq!(admin_view["connections"][0]["api_key"], "upstream-secret");
+    assert_eq!(
+        admin_view["connections"][0]["base_url"],
+        "http://127.0.0.1:1"
+    );
 
     // Adding, removing and checking a connection is admin-only in the page, so the rule has to be
     // on the routes as well rather than only on the view.
@@ -3139,6 +4309,81 @@ async fn a_stream_that_reports_its_input_first_shows_it_as_reported_while_the_re
         input_first,
         "the input was seen as reported while the generated count was still an estimate"
     );
+}
+
+// A recorded row says whether its counts are the gateway's estimate, in the recent rows and in the event a
+// page is sent for it, so the page can mark an estimate rather than show it as a number the upstream
+// reported. The upstream reports usage for one model and nothing for the other, both as a single answer
+// and as a stream, because the two are recorded on different paths.
+#[tokio::test]
+async fn a_recorded_row_says_whether_its_counts_were_estimated() {
+    let st = test_state().await;
+    let router = build_router(st.clone());
+    let base_url = mock_upstream().await;
+    let cookie = register(&router, "ada").await;
+    post_json(
+        &router,
+        "/api/connections",
+        &cookie,
+        json!({ "name": "test", "base_url": base_url }),
+    )
+    .await;
+    let (_, created) =
+        post_json(&router, "/api/keys", &cookie, json!({ "name": "test key" })).await;
+    let key = created["key"].as_str().unwrap().to_string();
+
+    let mut live = Live::open(&router, &cookie).await;
+    assert_eq!(live.next().await["type"], "snapshot");
+
+    let requests = [
+        ("reports-usage", false),
+        ("silent", false),
+        ("reports-usage", true),
+        ("silent", true),
+    ];
+    // Each request is finished before the next is sent, and a stream's row is written before its body
+    // ends, so the rows are recorded in this order.
+    for (model, stream) in requests {
+        let response = gateway_call(
+            &router,
+            &key,
+            json!({ "model": model, "stream": stream, "messages": [{ "role": "user", "content": "hi" }] }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        response.into_body().collect().await.unwrap();
+    }
+
+    let mut events = Vec::new();
+    while events.len() < requests.len() {
+        let event = live.next().await;
+        if event["type"] == "usage" {
+            events.push(event["event"].clone());
+        }
+    }
+    for ((model, stream), event) in requests.iter().zip(&events) {
+        assert_eq!(event["model"], *model, "{event}");
+        assert_eq!(event["streamed"], *stream, "{event}");
+        assert_eq!(
+            event["estimated"],
+            *model == "silent",
+            "the live event says whether the counts were estimated: {event}"
+        );
+    }
+
+    let recent = get_json(&router, "/api/stats/recent", &cookie).await;
+    let rows = recent["events"].as_array().unwrap();
+    assert_eq!(rows.len(), requests.len());
+    // The recent rows are newest first.
+    for ((model, stream), row) in requests.iter().rev().zip(rows) {
+        assert_eq!(row["model"], *model, "{row}");
+        assert_eq!(row["streamed"], *stream, "{row}");
+        assert_eq!(
+            row["estimated"],
+            *model == "silent",
+            "the recent row says whether the counts were estimated: {row}"
+        );
+    }
 }
 
 // Another account's stream is part of the platform total, which anyone signed in sees, but the stream
