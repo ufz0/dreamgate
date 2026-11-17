@@ -9,11 +9,14 @@ use crate::api::error;
 use crate::auth::Caller;
 use crate::state::State;
 
+// Registration also reads both settings, with the same defaults, inside the insert that makes an
+// account (`auth::register`), so a change to a key or a default here is a change there as well.
 const KEY: &str = "open_registration";
 const APPROVAL_KEY: &str = "require_approval";
 
 // The first account is always allowed, which is how an instance gets its admin. After that,
-// self-registration stays closed until an admin opens it.
+// self-registration stays closed until an admin opens it. This is read before the insert, so it
+// can only be an early answer: the insert decides again, in the same step as it writes.
 pub async fn can_register(st: &State) -> bool {
     let accounts = count_accounts(st).await;
     if accounts == 0 {

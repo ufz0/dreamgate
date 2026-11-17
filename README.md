@@ -369,14 +369,18 @@ What an unauthenticated request can reach is the entry screen: `POST /api/regist
 - Every statement takes its values as parameters; the only text put into a statement is a scope clause
   that comes from the code. Every value the page prints from the API is escaped on the way into the DOM.
 
-Two things this pass left as they are, and a public release should decide on them first. An account an
-admin makes has no password until its first sign-in, so whoever signs in with that username first is the
-one who sets it — the intended feature, but a guessed username can be claimed by anyone who reaches the
-instance. And the role is decided by counting rows before the insert, so two first sign-ins at the same
-moment on an empty instance can both be told they own it. A taken username is named when an account is
-registered; other error responses pass the driver text through, so a constraint name (a duplicate
-connection name, for instance) can still reach a client, and bcrypt only reads the first 72 bytes of a
-password.
+One thing this pass left as it is, and a public release should decide on it first. An account an admin
+makes has no password until its first sign-in, so whoever signs in with that username first is the one
+who sets it — the intended feature, but a guessed username can be claimed by anyone who reaches the
+instance. Two first sign-ins at the same moment do not both get in: the password is written only where
+there is still none, so the one that lands second is answered exactly as a wrong password is, and the
+password that stays is the one whose sign-in was let in. Whether registration is open, the role, and
+whether a new account waits for approval are decided by the statement that inserts the account rather
+than by counting the accounts first, so registrations at the same moment on an empty instance make one
+admin, and the others are answered as registration being closed. A taken username is named when an
+account is registered; other error responses pass the driver text through, so a constraint name (a
+duplicate connection name, for instance) can still reach a client, and bcrypt only reads the first 72
+bytes of a password.
 
 ## Tests
 
@@ -403,7 +407,10 @@ queries and the split between a caller's own figures and the platform total, eve
 however many there are, including one past the twentieth by name that is waiting for approval, a taken username named when registering, including one held for approval, with any other failure
 answered as a server error, the registration setting being read before sign in and closed by default after the
 first account, approval being on by default and blocking a sign-in until an admin grants it, an
-account made by an admin with no password until its first sign-in, the account actions (disable,
+account made by an admin with no password until its first sign-in, the account races, run against several
+database connections at once: many registrations at the same moment on an empty instance making one admin
+that is not held for approval, and two first sign-ins at the same moment on an account an admin made letting
+one in, with the other answered as a wrong password and the stored password the one that was let in, the account actions (disable,
 rename, new password, approve, delete) and what they do to a sign-in, a key and the recorded usage,
 that deleting a key leaves the rows recorded for it and the
 counters standing, the presence counts while a request is in flight, a stream's progress reaching the live

@@ -10,7 +10,7 @@ use axum::{
     routing::{get, post},
 };
 use dreamgate::{build_router, db, limits, live, presence, state::State};
-use futures_util::stream;
+use futures_util::{future::join_all, stream};
 use http_body_util::BodyExt;
 use serde_json::{Value, json};
 use sqlx::{Row, sqlite::SqlitePool, sqlite::SqlitePoolOptions};
@@ -519,6 +519,66 @@ async fn a_taken_username_is_named_when_registering() {
             .unwrap()
             .contains("already taken")
     );
+}
+
+// The account races are between statements on different connections, which the single pooled connection of
+// `test_state` would put in a line by itself, so these tests run against a shared in-memory database with as many
+// connections as the gateway opens by default. Each test names its own database, because they run at once.
+async fn shared_state(name: &str) -> State {
+    let mut st = test_state().await;
+    st.pool = db::connect(
+        &format!("sqlite://file:{name}?mode=memory&cache=shared"),
+        db::DEFAULT_POOL_SIZE,
+    )
+    .await
+    .unwrap();
+    st
+}
+
+// The first account owns the instance. The role used to be decided by counting the accounts before a password
+// hash that takes tens of milliseconds, so registrations that arrived together all counted none and were all made
+// admin; the insert decides it now, in the same step as it writes.
+#[tokio::test]
+async fn registrations_at_once_on_an_empty_instance_make_one_admin() {
+    let st = shared_state("registrations_at_once").await;
+    let router = build_router(st.clone());
+
+    let names: Vec<String> = (0..12).map(|n| format!("racer{n}")).collect();
+    let answers = join_all(names.iter().map(|name| {
+        post_json(
+            &router,
+            "/api/register",
+            "",
+            json!({ "username": name, "password": "test-password" }),
+        )
+    }))
+    .await;
+
+    let admitted: Vec<&Value> = answers
+        .iter()
+        .filter(|(status, _)| *status == StatusCode::OK)
+        .map(|(_, body)| body)
+        .collect();
+    assert_eq!(admitted.len(), 1, "one registration owns the instance");
+    assert_eq!(admitted[0]["role"], "admin");
+    // The first account is not held for approval, because there is no one to approve it.
+    assert!(admitted[0]["pending"].is_null());
+    // Once there is an admin, registration is closed by default, and the others are told so.
+    for (status, body) in answers
+        .iter()
+        .filter(|(status, _)| *status != StatusCode::OK)
+    {
+        assert_eq!(*status, StatusCode::FORBIDDEN);
+        assert_eq!(body["error"]["type"], "registration_closed");
+    }
+    assert_eq!(count(&st.pool, "users").await, 1);
+    let admins =
+        sqlx::query("SELECT COUNT(*) AS n FROM users WHERE role = 'admin' AND pending = 0")
+            .fetch_one(&st.pool)
+            .await
+            .unwrap()
+            .get::<i64, _>("n");
+    assert_eq!(admins, 1);
 }
 
 #[tokio::test]
@@ -2131,6 +2191,63 @@ async fn an_admin_can_make_an_account_whose_password_is_chosen_on_the_first_sign
     )
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+// Whoever signs in first on an account an admin made sets its password. Two first sign-ins at once used to both
+// read that there was none, both write their own, and both be signed in; the write only lands now where there is
+// still no password, and the sign-in that comes second is answered as the wrong password it has become.
+#[tokio::test]
+async fn first_sign_ins_at_once_on_an_admin_made_account_let_one_in() {
+    let st = shared_state("first_sign_ins_at_once").await;
+    let router = build_router(st.clone());
+    let admin = register(&router, "ada").await;
+    let (status, created) =
+        post_json(&router, "/api/users", &admin, json!({ "username": "ben" })).await;
+    assert_eq!(status, StatusCode::OK);
+    let ben = created["id"].as_i64().unwrap();
+
+    let passwords = ["first-password", "second-password"];
+    let answers = join_all(passwords.iter().map(|password| {
+        post_json(
+            &router,
+            "/api/login",
+            "",
+            json!({ "username": "ben", "password": password }),
+        )
+    }))
+    .await;
+
+    let winners: Vec<usize> = (0..answers.len())
+        .filter(|&n| answers[n].0 == StatusCode::OK)
+        .collect();
+    assert_eq!(winners.len(), 1, "one sign-in sets the password");
+    let (status, body) = &answers[1 - winners[0]];
+    assert_eq!(*status, StatusCode::UNAUTHORIZED);
+    assert_eq!(body["error"]["type"], "invalid_credentials");
+    assert_eq!(
+        body["error"]["message"],
+        "username or password is not correct"
+    );
+    let sessions = sqlx::query("SELECT COUNT(*) AS n FROM sessions WHERE user_id = ?")
+        .bind(ben)
+        .fetch_one(&st.pool)
+        .await
+        .unwrap()
+        .get::<i64, _>("n");
+    assert_eq!(sessions, 1);
+
+    // The password that stays is the one whose sign-in was let in.
+    let winner = passwords[winners[0]];
+    let loser = passwords[1 - winners[0]];
+    sign_in(&router, "ben", winner).await;
+    let (status, _) = post_json(
+        &router,
+        "/api/login",
+        "",
+        json!({ "username": "ben", "password": loser }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
 }
 
 async fn usage_count(pool: &SqlitePool, user: i64) -> i64 {

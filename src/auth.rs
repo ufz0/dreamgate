@@ -184,6 +184,14 @@ fn with_cookie(mut resp: Response, token: &str, secure: bool) -> Response {
     resp
 }
 
+fn registration_closed() -> Response {
+    error(
+        StatusCode::FORBIDDEN,
+        "registration_closed",
+        "self-registration is closed. Ask an admin to open it.",
+    )
+}
+
 #[derive(Deserialize)]
 pub struct RegisterBody {
     pub username: String,
@@ -210,31 +218,11 @@ pub async fn register(
             "password must be at least 8 characters",
         );
     }
+    // Only an early answer, so a closed instance does not spend a hash on every attempt: whether the
+    // account may be made is decided again by the insert below.
     if !crate::settings::can_register(&st).await {
-        return error(
-            StatusCode::FORBIDDEN,
-            "registration_closed",
-            "self-registration is closed. Ask an admin to open it.",
-        );
+        return registration_closed();
     }
-
-    let count = match sqlx::query("SELECT COUNT(*) AS n FROM users")
-        .fetch_one(&st.pool)
-        .await
-    {
-        Ok(row) => row.get::<i64, _>("n"),
-        Err(err) => {
-            return error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "server_error",
-                err.to_string(),
-            );
-        }
-    };
-    // The first account to register owns the instance.
-    let role = if count == 0 { "admin" } else { "user" };
-    // The first account is never held back, because there is no one to approve it.
-    let pending = count > 0 && crate::settings::requires_approval(&st).await;
     let hash = match hash_password(&body.password).await {
         Ok(hash) => hash,
         Err(err) => {
@@ -242,18 +230,30 @@ pub async fn register(
         }
     };
 
+    // Whether the account may be made, its role and whether it waits are all decided by the statement
+    // that makes it. Counted before the hash, registrations that arrived together on an empty instance
+    // all counted none and were all made admin; a writing statement takes the write lock before it
+    // reads, so only the first insert finds no accounts. The first account owns the instance and is
+    // never held back, because there is no one to approve it; after it, registration has to be open,
+    // and a new account waits unless approval is turned off, with the defaults `settings` reads.
     let row = match sqlx::query(
-        "INSERT INTO users (username, password_hash, role, created_at, pending) VALUES (?, ?, ?, ?, ?) RETURNING id",
+        "INSERT INTO users (username, password_hash, role, created_at, pending) \
+         SELECT ?, ?, CASE WHEN EXISTS (SELECT 1 FROM users) THEN 'user' ELSE 'admin' END, ?, \
+                EXISTS (SELECT 1 FROM users) \
+                AND COALESCE((SELECT value FROM settings WHERE key = 'require_approval'), '1') = '1' \
+         WHERE NOT EXISTS (SELECT 1 FROM users) \
+            OR COALESCE((SELECT value FROM settings WHERE key = 'open_registration'), '0') = '1' \
+         RETURNING id, role, pending",
     )
     .bind(&username)
     .bind(&hash)
-    .bind(role)
     .bind(crate::clock::now())
-    .bind(pending as i64)
-    .fetch_one(&st.pool)
+    .fetch_optional(&st.pool)
     .await
     {
-        Ok(row) => row,
+        Ok(Some(row)) => row,
+        // Registration was closed by the time the account would have been made.
+        Ok(None) => return registration_closed(),
         // A name that is taken is named rather than answered with the driver text. The username is the
         // only unique column on users, so a unique violation here can only mean that; a failure for any
         // other reason is not dressed up as a taken name.
@@ -273,7 +273,8 @@ pub async fn register(
         }
     };
     let id = row.get::<i64, _>("id");
-    if pending {
+    let role = row.get::<String, _>("role");
+    if row.get::<i64, _>("pending") != 0 {
         // No session yet: the account is signed in after an admin approves it.
         return Json(json!({ "id": id, "username": username, "role": role, "pending": true }))
             .into_response();
@@ -380,17 +381,32 @@ pub async fn login(
                     return error(StatusCode::INTERNAL_SERVER_ERROR, "server_error", err);
                 }
             };
-            if let Err(err) = sqlx::query("UPDATE users SET password_hash = ? WHERE id = ?")
-                .bind(&hash)
-                .bind(id)
-                .execute(&st.pool)
-                .await
+            // Two first sign-ins at once both read that there is no password. Only the write that
+            // still finds none sets it, and the other is answered as what it now is: a password
+            // that does not match.
+            match sqlx::query(
+                "UPDATE users SET password_hash = ? WHERE id = ? AND password_hash IS NULL",
+            )
+            .bind(&hash)
+            .bind(id)
+            .execute(&st.pool)
+            .await
             {
-                return error(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "server_error",
-                    err.to_string(),
-                );
+                Ok(done) if done.rows_affected() == 1 => {}
+                Ok(_) => {
+                    return error(
+                        StatusCode::UNAUTHORIZED,
+                        "invalid_credentials",
+                        "username or password is not correct",
+                    );
+                }
+                Err(err) => {
+                    return error(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "server_error",
+                        err.to_string(),
+                    );
+                }
             }
         }
     }
