@@ -65,7 +65,11 @@ Environment variables:
    because a capability of zero would admit nothing, which is not what leaving it out means.
 2. Create a key. A DreamGate key is what clients use — the upstream key stays server-side.
    Optionally bind a key to one connection, pin a model, or set a requests-per-minute limit
-   and a token cap. An admin can set a token limit for any account from the Accounts view;
+   and a token cap. `PATCH /api/keys/{id}` leaves a field it does not name as it is, and clears a
+   binding, a pinned model or a limit sent as null, so any of them can be removed without deleting
+   the key; a name and whether a key is enabled cannot be cleared. A limit given as a number has to
+   be at least 1, as when the key is made, and an empty model is no pin at all. An admin can set a
+   token limit for any account from the Accounts view;
    that limit counts the tokens used in the current day — the input and the generated text
    together, as they are recorded in the usage row — and resets at 00:00 UTC, and it
    applies on top of a key's own cap, so a key cannot be used to work around it. Clearing
@@ -446,7 +450,8 @@ on its own when an upstream reports it first, and leaving it only when its row
 arrives, which names the stream it settles, another account's stream listed for an admin and only counted for a
 member, who is sent its row's figures and nothing else, the connections routes being
 admin-only with the key a connection carries and its address returned to an admin alone, a key made or changed
-with a connection that does not exist answered as a mistake in what was sent, a duplicate connection name named,
+with a connection that does not exist answered as a mistake in what was sent, a key's connection, model or limit
+cleared with a null while a field left out keeps its value, a duplicate connection name named,
 with a database that refuses a connection or an account answered as a server error with a reference and none
 of the driver's text, the model list refusing a
 disabled account the same way the completion path does, a request refused rather than let through when its

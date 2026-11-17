@@ -1,7 +1,7 @@
 use axum::extract::{Path, State as AxumState};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Json, Response};
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
 use serde_json::json;
 use sqlx::Row;
 use uuid::Uuid;
@@ -22,11 +22,26 @@ pub struct CreateKey {
 #[derive(Deserialize)]
 pub struct UpdateKey {
     pub name: Option<String>,
-    pub connection_id: Option<i64>,
-    pub model: Option<String>,
+    #[serde(default, deserialize_with = "double_option")]
+    pub connection_id: Option<Option<i64>>,
+    #[serde(default, deserialize_with = "double_option")]
+    pub model: Option<Option<String>>,
     pub enabled: Option<bool>,
-    pub rpm_limit: Option<i64>,
-    pub token_cap: Option<i64>,
+    #[serde(default, deserialize_with = "double_option")]
+    pub rpm_limit: Option<Option<i64>>,
+    #[serde(default, deserialize_with = "double_option")]
+    pub token_cap: Option<Option<i64>>,
+}
+
+// Serde reads a field left out of a request and a field sent as null as the same `None`, so the
+// fields that can be cleared are wrapped twice: the outer option says whether the field was sent,
+// the inner one whether it was sent as null. A field left out keeps its value; a null clears it.
+fn double_option<'de, D, T>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(deserializer).map(Some)
 }
 
 // One row shape for both lists. The Keys page shows the caller's own keys; an admin can ask for
@@ -189,24 +204,55 @@ pub async fn update(
             None => return error(StatusCode::NOT_FOUND, "not_found", "key not found"),
         }
     }
+    // A limit sent as a value is checked the way it is when the key is made; null is not a limit
+    // and is how one is cleared, so it passes this check.
+    if body.rpm_limit.flatten().is_some_and(|value| value < 1)
+        || body.token_cap.flatten().is_some_and(|value| value < 1)
+    {
+        return error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "limits must be a positive number, or null to clear them",
+        );
+    }
+    // An empty model is no pin at all, the same as when the key is made.
+    let model = body.model.as_ref().map(|value| {
+        value
+            .as_deref()
+            .map(str::trim)
+            .filter(|model| !model.is_empty())
+            .map(str::to_owned)
+    });
     let result = sqlx::query(
-        "UPDATE api_keys SET name = COALESCE(?, name), connection_id = COALESCE(?, connection_id), \
-                model = COALESCE(?, model), enabled = COALESCE(?, enabled), \
-                rpm_limit = COALESCE(?, rpm_limit), token_cap = COALESCE(?, token_cap) \
+        "UPDATE api_keys SET name = COALESCE(?, name), \
+                connection_id = CASE WHEN ? THEN ? ELSE connection_id END, \
+                model = CASE WHEN ? THEN ? ELSE model END, \
+                enabled = COALESCE(?, enabled), \
+                rpm_limit = CASE WHEN ? THEN ? ELSE rpm_limit END, \
+                token_cap = CASE WHEN ? THEN ? ELSE token_cap END \
          WHERE id = ?",
     )
     .bind(body.name)
-    .bind(body.connection_id)
-    .bind(body.model)
+    .bind(body.connection_id.is_some())
+    .bind(body.connection_id.flatten())
+    .bind(model.is_some())
+    .bind(model.as_ref().and_then(|model| model.as_deref()))
     .bind(body.enabled.map(|v| v as i64))
-    .bind(body.rpm_limit)
-    .bind(body.token_cap)
+    .bind(body.rpm_limit.is_some())
+    .bind(body.rpm_limit.flatten())
+    .bind(body.token_cap.is_some())
+    .bind(body.token_cap.flatten())
     .bind(id)
     .execute(&st.pool)
     .await;
     match result {
+        // An admin skips the ownership check, so the row a change matched is what says whether the
+        // key exists; without this an update of nothing would answer as success.
+        Ok(done) if done.rows_affected() == 0 => {
+            error(StatusCode::NOT_FOUND, "not_found", "key not found")
+        }
         Ok(_) => Json(json!({ "ok": true })).into_response(),
-        Err(err) => write_failed(&st, body.connection_id, err).await,
+        Err(err) => write_failed(&st, body.connection_id.flatten(), err).await,
     }
 }
 
