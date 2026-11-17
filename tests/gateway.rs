@@ -1055,6 +1055,72 @@ async fn reasoning_effort_is_forwarded_to_the_upstream_unchanged() {
     assert_eq!(sent["model"], "reasoning-model");
 }
 
+// Nothing names a model here: none is pinned to the key, the connection has no default and the request carries
+// none. The body reaches the upstream without one, as the client sent it, so the upstream answers with its own
+// default rather than with a name the gateway made up; the stream_options a stream is given is the only field
+// written.
+#[tokio::test]
+async fn a_request_that_names_no_model_reaches_the_upstream_without_one() {
+    let echo = Router::new().route("/v1/chat/completions", post(mock_echo));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base_url = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, echo).await.unwrap() });
+
+    let st = test_state().await;
+    let router = build_router(st.clone());
+    let cookie = register(&router, "ada").await;
+    post_json(
+        &router,
+        "/api/connections",
+        &cookie,
+        json!({ "name": "test", "base_url": base_url }),
+    )
+    .await;
+    let (_, created) =
+        post_json(&router, "/api/keys", &cookie, json!({ "name": "test key" })).await;
+    let key = created["key"].as_str().unwrap().to_string();
+    let messages = json!([{ "role": "user", "content": "hi" }]);
+
+    let response = gateway_call(&router, &key, json!({ "messages": messages })).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        json_body(response).await,
+        json!({ "messages": messages }),
+        "the body arrived as the client sent it"
+    );
+
+    // The echo answers a stream with the one body it was sent, and the gateway passes that through.
+    let response = gateway_call(
+        &router,
+        &key,
+        json!({ "messages": messages, "stream": true }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        json_body(response).await,
+        json!({ "messages": messages, "stream": true, "stream_options": { "include_usage": true } }),
+        "the stream arrived with stream_options added and nothing else"
+    );
+
+    // The rows name the model the gateway sent, so they say unknown when it sent none.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let usage = loop {
+        let usage = recorded_usage(&st.pool).await;
+        if usage.len() == 2 {
+            break usage;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the streamed request was not recorded"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
+    for row in &usage {
+        assert_eq!(row["model"], "unknown");
+    }
+}
+
 #[tokio::test]
 async fn records_the_model_the_client_asked_for_when_streaming() {
     let st = test_state().await;

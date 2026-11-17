@@ -82,6 +82,12 @@ Nothing else in the request body is changed, so a reasoning level a client sends
 or whatever the upstream calls it — reaches the runtime exactly as the client wrote it. DreamGate does
 not pick a level itself; it only routes and counts.
 
+When nothing names a model — none pinned to the key, no default model on the connection, and none in the
+request — the request goes out without one, exactly as the client sent it, and the upstream answers with its
+own default. DreamGate does not put a name of its own in its place. The row for such a request records the
+model as `unknown`, because what is recorded is the model the gateway sent, not the one the upstream answered
+with.
+
 An estimate counts everything the model produced, not only the answer. Reasoning models put their
 working in `reasoning_content` (or `reasoning`) beside the reply, and that text is counted as
 generated. So are the arguments of a tool call, whether an upstream sends them as a JSON string or
@@ -364,7 +370,8 @@ cargo test
 
 The suite runs the gateway against a mock OpenAI-compatible upstream and covers usage
 recording, estimation when the upstream reports nothing including reasoning text, SSE
-pass-through, that a client's reasoning level reaches the upstream unchanged, upstream failover,
+pass-through, that a client's reasoning level reaches the upstream unchanged, that a request naming no model
+reaches the upstream without one and is recorded as `unknown`, upstream failover,
 a connection marked down being tried after the ones that are not rather than skipped, including when every
 connection is marked down, and a connection that is full passing the request on to one marked down,
 the round of health checks marking a connection that answers,

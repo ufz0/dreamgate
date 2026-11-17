@@ -193,16 +193,24 @@ async fn enforce_limits(st: &State, key: &KeyInfo) -> Option<Response> {
     None
 }
 
-fn resolve_model(key_model: Option<&str>, conn: &Connection, requested: Option<&str>) -> String {
+fn resolve_model(
+    key_model: Option<&str>,
+    conn: &Connection,
+    requested: Option<&str>,
+) -> Option<String> {
     key_model
         .map(String::from)
         .or_else(|| conn.default_model.clone())
-        .unwrap_or_else(|| requested.unwrap_or("unknown").to_string())
+        .or_else(|| requested.map(String::from))
 }
 
-fn build_payload(body: &Value, model: &str) -> Value {
+fn build_payload(body: &Value, model: Option<&str>) -> Value {
     let mut payload = body.clone();
-    payload["model"] = Value::String(model.to_string());
+    // When nothing names a model the body keeps what the client sent, so the upstream answers with its own
+    // default rather than with a name nobody chose.
+    if let Some(model) = model {
+        payload["model"] = Value::String(model.to_string());
+    }
     // Upstreams that support stream_options report real usage at the end of the
     // stream; without it the gateway has to estimate completion tokens.
     if body.get("stream").and_then(Value::as_bool).unwrap_or(false)
@@ -588,7 +596,10 @@ pub async fn chat_completions(
         };
         let model = resolve_model(key.model.as_deref(), conn, requested);
         let url = registry::endpoint(&conn.base_url, "chat/completions");
-        let payload = build_payload(&body, &model);
+        let payload = build_payload(&body, model.as_deref());
+        // The row and the stream in flight name the model the gateway sent, and say unknown when it sent none.
+        // The upstream's answer says which model it used, but that is not read here.
+        let model = model.unwrap_or_else(|| String::from("unknown"));
         attempted = true;
         let mut request = st
             .http
