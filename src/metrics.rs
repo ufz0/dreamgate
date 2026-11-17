@@ -12,6 +12,7 @@ use axum::response::{IntoResponse, Response};
 
 use crate::db::{self, Probe};
 use crate::registry;
+use crate::shutdown::Phase;
 use crate::state::State;
 use crate::usage::UsageRow;
 
@@ -396,6 +397,11 @@ fn escape(value: &str) -> String {
 // that has given none for longer is one whose connections are stuck, on a disk that hangs for instance, and
 // the gateway's own requests are already failing with it, so the check fails as well.
 pub async fn health(AxumState(st): AxumState<State>) -> Response {
+    // A process that is stopping says so first, so a load balancer stops sending it requests it would
+    // turn away.
+    if st.shutdown.phase() != Phase::Running {
+        return (StatusCode::SERVICE_UNAVAILABLE, "draining").into_response();
+    }
     let probe = db::probe(&st.pool).await;
     let busy_for = {
         let mut since = st.metrics.busy_since.lock().expect("busy since");

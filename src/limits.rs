@@ -113,6 +113,16 @@ impl Limits {
         self.global_size
     }
 
+    // Whether every slot of the gateway as a whole came back within `timeout`. A request gives its slots
+    // back only after its row is written, so every slot back is every admitted request recorded.
+    pub async fn drained(&self, timeout: Duration) -> bool {
+        let every = u32::try_from(self.global_size).unwrap_or(u32::MAX);
+        matches!(
+            tokio::time::timeout(timeout, self.global.acquire_many(every)).await,
+            Ok(Ok(_))
+        )
+    }
+
     // How many requests hold a slot of the gateway as a whole right now.
     pub fn in_flight(&self) -> usize {
         self.global_size

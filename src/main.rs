@@ -1,6 +1,9 @@
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::Path;
 
+use std::time::Duration;
+
+use dreamgate::shutdown::{self, Phase};
 use dreamgate::{build_router, db, limits, live, metrics, registry, state};
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::filter::LevelFilter;
@@ -42,6 +45,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         metrics: std::sync::Arc::new(metrics::Metrics::new(
             std::env::var("DREAMGATE_METRICS_TOKEN").ok(),
         )),
+        shutdown: Default::default(),
     };
 
     tokio::spawn(registry::health_checker(st.clone()));
@@ -53,7 +57,37 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("  gateway:   POST /v1/chat/completions (OpenAI compatible)");
     println!("  dashboard: http://{}/", dashboard_address(bound));
 
-    axum::serve(listener, build_router(st)).await?;
+    let grace = Duration::from_secs(limits::env_number(
+        "DREAMGATE_SHUTDOWN_GRACE_SECS",
+        shutdown::DEFAULT_GRACE_SECS as usize,
+    ) as u64);
+    tokio::spawn(shutdown::on_signal(st.clone(), grace));
+
+    // The server stops taking connections when the process starts to stop, and returns once the ones it
+    // has are done. A client that keeps a connection open after its answer has ended does not hold the
+    // process: some seconds after the grace window, it is let go.
+    let draining = st.shutdown.clone();
+    let server = axum::serve(listener, build_router(st.clone()))
+        .with_graceful_shutdown(async move { draining.reached(Phase::Draining).await });
+    let deadline = st.shutdown.clone();
+    tokio::select! {
+        served = server.into_future() => served?,
+        _ = async move {
+            deadline.reached(Phase::Draining).await;
+            tokio::time::sleep(grace + Duration::from_secs(10)).await;
+        } => tracing::warn!("connections were still open after the grace window; stopping anyway"),
+    }
+
+    // Rows are written before a request gives its slots back, so waiting for every slot is waiting for
+    // every row; then the database is closed, which leaves the write-ahead log checkpointed.
+    if !st.limits.drained(Duration::from_secs(5)).await {
+        tracing::error!(
+            "{} requests had not been recorded when the process stopped",
+            st.limits.in_flight()
+        );
+    }
+    st.pool.close().await;
+    tracing::info!("stopped");
     Ok(())
 }
 

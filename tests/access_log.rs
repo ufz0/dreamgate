@@ -60,6 +60,7 @@ async fn app() -> (Router, State) {
         attempts: Default::default(),
         limits: Arc::new(limits),
         metrics: Default::default(),
+        shutdown: Default::default(),
     };
     (build_router(st.clone()), st)
 }

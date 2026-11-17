@@ -49,6 +49,7 @@ async fn test_state() -> State {
         attempts: Default::default(),
         limits: Arc::new(limits),
         metrics: Default::default(),
+        shutdown: Default::default(),
     }
 }
 
@@ -4825,4 +4826,33 @@ async fn a_usage_row_that_could_not_be_written_is_counted() {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     panic!("the stream's lost row was not counted:\n{scrape}");
+}
+
+// A dashboard's live stream ends as soon as the process starts to stop, because an open stream would hold the
+// stop for as long as the page stayed open. The page reconnects on its own.
+#[tokio::test]
+async fn a_dashboards_live_stream_ends_when_the_gateway_starts_to_stop() {
+    let st = test_state().await;
+    let router = build_router(st.clone());
+    let cookie = register(&router, "ada").await;
+    let response = call(
+        &router,
+        Request::get("/api/live")
+            .header("cookie", &cookie)
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let mut body = response.into_body();
+    // The snapshot comes first, so the stream is open and waiting when the stop begins.
+    let first = body.frame().await.unwrap().unwrap();
+    assert!(first.data_ref().is_some());
+
+    st.shutdown.advance(dreamgate::shutdown::Phase::Draining);
+    let ended = tokio::time::timeout(Duration::from_secs(2), body.collect()).await;
+    assert!(
+        ended.is_ok(),
+        "the live stream stayed open after the stop began"
+    );
 }

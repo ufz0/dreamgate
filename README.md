@@ -47,6 +47,8 @@ Environment variables:
   applied to a stream: a stream has no known end and is bounded by silence instead.
 - `DREAMGATE_STREAM_STALL_SECS` — how long a stream may go without producing anything before it is closed as a
   dead connection, default 120
+- `DREAMGATE_SHUTDOWN_GRACE_SECS` — how long the requests in flight are given to finish when the process is told to
+  stop, default 30 (see Stopping)
 - `DREAMGATE_METRICS_TOKEN` — the bearer token a scrape of `/metrics` has to send, read without the spaces or
   line break around it. Unset or blank, the default, there is no `/metrics` at all (see Monitoring)
 - `RUST_LOG` — which log lines are printed to standard output, in the usual form (`warn`,
@@ -230,18 +232,41 @@ does not answer can only delay its own row now; the round is still bounded rathe
 health check is a request to a connection that may already be working. A round that stops on a panic is logged
 and started again after the same 30 seconds, so health checking does not end with it.
 
+### Stopping
+
+A request that crossed the gate has been served, and billed by the upstream, so stopping the process must not
+lose its row. On Ctrl-C, or the SIGTERM a service manager or a container runtime sends, the gateway:
+
+1. stops taking work: no new connection is accepted, a request that arrives on one already open is answered 503
+   `shutting_down` and not recorded, `/health` answers 503 `draining` so a load balancer stops sending requests
+   here, and a dashboard's live stream ends, because it would otherwise hold the stop for as long as the page
+   stayed open (the page reconnects to whatever comes next);
+2. gives the requests in flight `DREAMGATE_SHUTDOWN_GRACE_SECS` (default 30) to finish on their own. A request
+   gives its slots back only after its row is written, so this waits for every slot of the gateway to come back,
+   which is every admitted request recorded;
+3. if the window passes with requests still in flight, or a second signal arrives, ends them: a stream ends as
+   an error, the way a stream closed for going quiet does, so a client can tell the answer was cut, and its row is
+   written with what was known, as an estimate unless the upstream had already reported its usage; a single
+   answer still waiting is answered 503 `shutting_down` and recorded with status 503 against the connection that
+   was working on it, its input estimated. Neither is counted as a failure of the connection;
+4. waits up to five more seconds for those rows, then closes the database, which checkpoints the write-ahead
+   log, and exits with success. A client that keeps a connection open after its answer has ended does not hold
+   the process: ten seconds after the grace window it is let go.
+
+A request that is cut or still unrecorded after all of that is logged as an error with the count.
+
 ## Monitoring
 
-`GET /health` answers 200 `ok` when the database answers, within a second, a statement that reads a table, and
-503 `database unavailable` when it does not, with the reason logged. When every connection of the pool is in use
-and none comes free within a quarter of a second, it answers 200 `busy` instead: that is a burst being served,
-the gateway admits more requests at once than the pool has connections, and a 503 then would get a working
-gateway restarted in the middle of its streams. That lasts as long as a query waits for a connection, 30
-seconds: when the checks have found the pool in use for longer, its connections are stuck rather than busy, the
-gateway's own requests are already failing with it, and the check answers 503 `database unavailable`. It does
-not ask the connections either: an upstream that is down is not a reason to restart the gateway in front of it,
-and the Connections view and `/metrics` say which one is down. It needs no session, so a load balancer or an
-orchestrator can call it.
+`GET /health` answers 200 `ok` when the database answers, within a second, a statement that reads a table, 503
+`database unavailable` when it does not, with the reason logged, and 503 `draining` once the process has started
+to stop. When every connection of the pool is in use and none comes free within a quarter of a second, it
+answers 200 `busy` instead: that is a burst being served, the gateway admits more requests at once than the pool
+has connections, and a 503 then would get a working gateway restarted in the middle of its streams. That lasts
+as long as a query waits for a connection, 30 seconds: when the checks have found the pool in use for longer,
+its connections are stuck rather than busy, the gateway's own requests are already failing with it, and the
+check answers 503 `database unavailable`. It does not ask the connections either: an upstream that is down is
+not a reason to restart the gateway in front of it, and the Connections view and `/metrics` say which one is
+down. It needs no session, so a load balancer or an orchestrator can call it.
 
 `GET /metrics` is a Prometheus scrape in the text format, there only when `DREAMGATE_METRICS_TOKEN` is set and
 read with `Authorization: Bearer <that token>`; without the token it answers 401, and with no token set it
@@ -558,8 +583,16 @@ The numbers are not part of the normal run: they measure, so they are only read 
 single-threaded runtime would measure one worker rather than the gateway. There is no Go-style race detector in
 Rust, so what stands in its place is that shared state is only reachable through types the compiler requires to
 be `Send` and `Sync`, plus running the concurrency tests repeatedly. The environment variables themselves are
-read in `src/main.rs`, which is the composition root and nothing in the suite reaches it, so the pool size is not
-exercised by a test; the things tested there are the dashboard address the startup line names and the log
+read in `src/main.rs`, the composition root. One test reaches it (`tests/process.rs`, on Unix): it starts the
+built binary with its address, database and grace window set through the environment, opens a stream through it,
+sends the process SIGTERM in the middle of the stream, and checks that the stream arrives whole, that the process
+stops on its own with a success even though the client keeps its connection open, and that the row is in the
+database file afterwards. The stopping phases are also tested in `tests/concurrency.rs`: a request that arrives
+while stopping turned away with 503 and not recorded, the model list and the health check saying so, a stream in
+flight let finish with the drain ending only once its row is written, a stream and a single answer still running
+when the window passes ended and recorded, and a dashboard's live stream ending as the stop begins. The pool size
+is still not exercised by a test; the other things tested in `src/main.rs` are the dashboard address the startup
+line names and the log
 filter chosen from `RUST_LOG`, set or not, each a unit test beside the function that picks it. The two time bounds are exercised, because the tests build the client and the state through
 the same functions the gateway uses; the connect timeout and the number of connections kept idle are read through
 that builder but no test asserts what they do. The pool and the busy timeout are exercised through `db::connect`
