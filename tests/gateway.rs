@@ -188,10 +188,59 @@ async fn mock_echo(Json(body): Json<Value>) -> Json<Value> {
     Json(body)
 }
 
+// The legacy completions endpoint: the answer is text rather than a message, and a stream's chunks carry the
+// text itself rather than a delta. It reports usage for the same model the chat mock does.
+async fn mock_completions(Json(body): Json<Value>) -> Response {
+    let reports = body.get("model").and_then(Value::as_str) == Some("reports-usage");
+    let usage = json!({ "prompt_tokens": 11, "completion_tokens": 7 });
+    if body.get("stream").and_then(Value::as_bool).unwrap_or(false) {
+        let mut lines = vec![
+            format!(
+                "data: {}\n\n",
+                json!({ "choices": [{ "text": "hello there" }] })
+            ),
+            format!("data: {}\n\n", json!({ "choices": [{ "text": " world" }] })),
+        ];
+        if reports {
+            lines.push(format!(
+                "data: {}\n\n",
+                json!({ "choices": [], "usage": usage })
+            ));
+        }
+        lines.push("data: [DONE]\n\n".to_string());
+        let mut out = Response::new(Body::from(lines.concat()));
+        out.headers_mut().insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("text/event-stream"),
+        );
+        return out;
+    }
+    let mut answer = json!({ "choices": [{ "text": "hello there world" }] });
+    if reports {
+        answer["usage"] = usage;
+    }
+    Json(answer).into_response()
+}
+
+// An embeddings server: it reports the input it read and nothing generated, as OpenAI's does, unless the
+// model is one that reports nothing. It also says whether it was sent anything about streaming.
+async fn mock_embeddings(Json(body): Json<Value>) -> Json<Value> {
+    let mut answer = json!({
+        "data": [{ "embedding": [0.1, 0.2] }],
+        "streaming_fields": body.get("stream_options").is_some(),
+    });
+    if body.get("model").and_then(Value::as_str) == Some("reports-usage") {
+        answer["usage"] = json!({ "prompt_tokens": 5, "total_tokens": 5 });
+    }
+    Json(answer)
+}
+
 async fn mock_upstream() -> String {
     let app = Router::new()
         .route("/v1/models", get(mock_models))
-        .route("/v1/chat/completions", post(mock_chat));
+        .route("/v1/chat/completions", post(mock_chat))
+        .route("/v1/completions", post(mock_completions))
+        .route("/v1/embeddings", post(mock_embeddings));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
@@ -4892,4 +4941,172 @@ async fn event_streams_ask_a_proxy_not_to_buffer_them() {
     )
     .await;
     assert_eq!(live.headers()["x-accel-buffering"], "no");
+}
+
+async fn endpoint_call(router: &Router, path: &str, key: &str, body: Value) -> Response {
+    call(
+        router,
+        Request::post(path)
+            .header("authorization", format!("Bearer {key}"))
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap(),
+    )
+    .await
+}
+
+async fn endpoint_setup() -> (State, Router, String) {
+    let st = test_state().await;
+    let router = build_router(st.clone());
+    let base_url = mock_upstream().await;
+    let cookie = register(&router, "ada").await;
+    post_json(
+        &router,
+        "/api/connections",
+        &cookie,
+        json!({ "name": "test", "base_url": base_url }),
+    )
+    .await;
+    let (_, created) = post_json(&router, "/api/keys", &cookie, json!({ "name": "k" })).await;
+    let key = created["key"].as_str().unwrap().to_string();
+    (st, router, key)
+}
+
+// Embeddings are forwarded and recorded like any other request: the input the upstream reports, nothing
+// generated, and the gateway's estimate of the input, marked as one, when the upstream reports nothing. An
+// embedding does not stream, so nothing about streaming is added to its body even when a client asks.
+#[tokio::test]
+async fn embeddings_are_forwarded_and_recorded() {
+    let (st, router, key) = endpoint_setup().await;
+    let response = endpoint_call(
+        &router,
+        "/v1/embeddings",
+        &key,
+        json!({ "model": "reports-usage", "input": "hello there", "stream": true }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = json_body(response).await;
+    assert_eq!(body["data"][0]["embedding"], json!([0.1, 0.2]));
+    assert_eq!(body["streaming_fields"], false);
+
+    let response = endpoint_call(
+        &router,
+        "/v1/embeddings",
+        &key,
+        json!({ "model": "silent", "input": ["hello there", "general kenobi"] }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let usage = recorded_usage(&st.pool).await;
+    assert_eq!(usage.len(), 2);
+    assert_eq!(
+        (
+            &usage[0]["prompt_tokens"],
+            &usage[0]["completion_tokens"],
+            &usage[0]["estimated"]
+        ),
+        (&json!(5), &json!(0), &json!(false))
+    );
+    assert_eq!(usage[0]["streamed"], false);
+    assert_eq!(
+        (
+            &usage[1]["prompt_tokens"],
+            &usage[1]["completion_tokens"],
+            &usage[1]["estimated"]
+        ),
+        (&json!(8), &json!(0), &json!(true))
+    );
+}
+
+// The legacy completions endpoint is forwarded too, a single answer and a stream, and when the upstream
+// reports nothing the estimate counts the prompt and the text it generated.
+#[tokio::test]
+async fn completions_are_forwarded_and_recorded_single_and_streamed() {
+    let (st, router, key) = endpoint_setup().await;
+    let response = endpoint_call(
+        &router,
+        "/v1/completions",
+        &key,
+        json!({ "model": "reports-usage", "prompt": "say hello" }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        json_body(response).await["choices"][0]["text"],
+        "hello there world"
+    );
+
+    let response = endpoint_call(
+        &router,
+        "/v1/completions",
+        &key,
+        json!({ "model": "silent", "prompt": "say hello", "stream": true }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    assert!(String::from_utf8_lossy(&bytes).contains("[DONE]"));
+
+    let mut usage = recorded_usage(&st.pool).await;
+    for _ in 0..50 {
+        if usage.len() == 2 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        usage = recorded_usage(&st.pool).await;
+    }
+    assert_eq!(usage.len(), 2);
+    assert_eq!(
+        (
+            &usage[0]["prompt_tokens"],
+            &usage[0]["completion_tokens"],
+            &usage[0]["estimated"]
+        ),
+        (&json!(11), &json!(7), &json!(false))
+    );
+    assert_eq!(usage[1]["streamed"], true);
+    assert_eq!(usage[1]["estimated"], true);
+    // "say hello" for the input and "hello there" " world" for the output, each word of five letters two tokens
+    // by the same estimate a chat answer is given.
+    assert_eq!(usage[1]["prompt_tokens"], 3);
+    assert_eq!(usage[1]["completion_tokens"], 6);
+}
+
+// A path under /v1 the gateway does not serve, and a served path asked with a method it does not take, are
+// answered as JSON in the shape an OpenAI client reads, not as the empty answer of the file server.
+#[tokio::test]
+async fn an_unknown_path_or_method_under_v1_is_answered_as_json() {
+    let router = build_router(test_state().await);
+    let response = call(
+        &router,
+        Request::post("/v1/responses")
+            .header("content-type", "application/json")
+            .body(Body::from("{}"))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    let body = json_body(response).await;
+    assert_eq!(body["error"]["type"], "not_found");
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .starts_with("/v1/responses is not served here")
+    );
+
+    let response = call(
+        &router,
+        Request::get("/v1/chat/completions")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
+    assert_eq!(
+        json_body(response).await["error"]["type"],
+        "invalid_request"
+    );
 }

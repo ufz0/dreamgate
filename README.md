@@ -197,6 +197,15 @@ curl -X POST http://127.0.0.1:8787/v1/chat/completions \
   -d '{"model":"qwen2.5","messages":[{"role":"user","content":"hi"}]}'
 ```
 
+Beside chat completions, the gateway forwards `POST /v1/completions` and `POST /v1/embeddings` the same way —
+the same keys, limits, routing, failover and recording — so a client's RAG embeddings and an editor's
+autocomplete go through it as well. When an upstream reports nothing, the input is estimated from `prompt` or
+`input` (a string, a list of strings, or token ids, each id one token), and the output from the text a
+completion generated; an embedding generates no text, so its row records none, and it is never streamed, so
+nothing about streaming is added to its body. Any other path under `/v1` is answered 404 `not_found` in the
+error shape an OpenAI client reads, and a served path asked with a method it does not take 405, rather than
+with the empty answer of the dashboard's file server.
+
 Streaming works as a straight pass-through, so a client that expects SSE gets SSE. When an
 upstream reports usage, DreamGate records those numbers; when it does not (several Ollama
 and llama.cpp builds), the gateway estimates them and marks the row as estimated. When
@@ -621,7 +630,10 @@ The suite runs the gateway against a mock OpenAI-compatible upstream and covers 
 recording, estimation when the upstream reports nothing including reasoning text, the `estimated` flag a
 recorded row carries in `/api/stats/recent` and in its event on `/api/live`, true for a row the gateway
 estimated and false for one the upstream reported, answered at once or streamed, SSE
-pass-through, that a client's reasoning level reaches the upstream unchanged, that a request naming no model
+pass-through, embeddings forwarded and recorded with the input the upstream reported or the gateway's estimate of
+it, no output and nothing about streaming added, legacy completions forwarded single and streamed with the
+generated text estimated when nothing is reported, an unknown path or method under `/v1` answered as JSON,
+that a client's reasoning level reaches the upstream unchanged, that a request naming no model
 reaches the upstream without one and is recorded as `unknown`, upstream failover,
 a connection marked down being tried after the ones that are not rather than skipped, including when every
 connection is marked down, and a connection that is full passing the request on to one marked down,

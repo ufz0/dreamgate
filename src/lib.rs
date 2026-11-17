@@ -67,12 +67,26 @@ pub fn build_router(st: State) -> Router {
 
     // Every answer the gateway endpoints give is counted, refusals included, because a refusal is
     // deliberately not a usage row and would otherwise be counted nowhere.
+    // Each served path answers a method it does not take, and every other path under /v1, as an
+    // OpenAI-compatible server does: with JSON a client can read rather than an empty answer.
     let gateway = Router::new()
-        .route("/v1/models", routing::get(gateway::list_models))
+        .route(
+            "/v1/models",
+            routing::get(gateway::list_models).fallback(gateway::method_not_allowed),
+        )
         .route(
             "/v1/chat/completions",
-            routing::post(gateway::chat_completions),
+            routing::post(gateway::chat_completions).fallback(gateway::method_not_allowed),
         )
+        .route(
+            "/v1/completions",
+            routing::post(gateway::completions).fallback(gateway::method_not_allowed),
+        )
+        .route(
+            "/v1/embeddings",
+            routing::post(gateway::embeddings).fallback(gateway::method_not_allowed),
+        )
+        .route("/v1/{*rest}", routing::any(gateway::not_found))
         .route_layer(middleware::from_fn_with_state(st.clone(), metrics::count));
 
     Router::new()
