@@ -240,11 +240,12 @@ URL hash (`#/overview`, `#/activity`, `#/keys`, `#/connections`, `#/connect`, `#
   turns approval on or off, and makes an account without opening registration.
 
 Every token figure on the page says which side of a request it counts: input tokens, what was sent in;
-output tokens, what the model generated; or the two together, where a figure is measured against a limit
-or a chart has always counted both, as a key's token cap, an account's daily limit and the message a request
-refused at either is answered with do. The tables and the live traffic feed show the two sides as separate
-columns rather than one sum, and `/api/keys`, `/api/keys/others` and the per-account and per-model rows of
-`/api/stats/summary` carry `prompt_tokens` and `completion_tokens` beside the total they already had.
+output tokens, what the model generated; or the two together, where a figure is measured against a limit or
+a chart has always counted both. A key's token cap and an account's daily limit say that they count both,
+and so does the message a request is refused with when it reaches either. The tables and the live traffic
+feed show the two sides as separate columns rather than one sum, and `/api/keys`, `/api/keys/others` and the
+per-account and per-model rows of `/api/stats/summary` carry `prompt_tokens` and `completion_tokens` beside
+the total they already had.
 
 The dashboard reads `/api/stats/summary` and subscribes to `/api/live`, so the counters, the charts, the
 presence panel, the activity table and an account's row in the Accounts view update as traffic arrives — rows
@@ -252,8 +253,8 @@ land in the current view without a reload. The only thing the page asks for on a
 every 30 seconds, because the five-minute online window passes with time as well as with traffic.
 
 A stream is on the page while it runs, not only once its row is written. The gateway keeps how far each
-stream in flight has got — the input and what it has generated so far, by the same estimate a row is given
-when nothing is reported, and the upstream's own count once it has reported the generated tokens — and
+stream in flight has got — the input and what it has generated so far, each by the same estimate a row is
+given when nothing is reported until the upstream has reported that count itself — and
 `/api/live` sends that to a page at most four times a second, and only when what that page would be sent has
 changed, however many streams are running. The two generated figures at the top of the Overview include it,
 and their notes say how much of the figure is still being generated and, while it is the gateway's count,

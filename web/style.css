@@ -594,10 +594,10 @@ input:focus-visible, select:focus-visible, textarea:focus-visible, button:focus-
   .shell[data-drawer="open"] .scrim { display: block; }
   .scrim { display: none; position: fixed; inset: 0; background: rgba(0, 0, 0, .35); z-index: 1; }
   .entry { grid-template-columns: 1fr; padding: 24px; }
-  /* Six columns fit a phone only with less room between them: these fit the 335px a 375px phone leaves
+  /* Six columns fit a phone only with less room between them: these fit the 320px a 360px phone leaves
      inside main's padding. On a narrower screen the feed scrolls sideways, as the tables do, rather than
      cutting the key and the model to nothing. */
-  .feed li, .feed-head { grid-template-columns: 56px minmax(44px, 1fr) minmax(44px, 1fr) 40px 56px 56px; gap: 6px; min-width: 326px; }
+  .feed li, .feed-head { grid-template-columns: 56px minmax(41px, 1fr) minmax(41px, 1fr) 40px 56px 56px; gap: 6px; min-width: 320px; }
 }
 
 @media (prefers-reduced-motion: reduce) {

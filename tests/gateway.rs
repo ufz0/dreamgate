@@ -1626,6 +1626,11 @@ async fn per_key_token_cap_blocks_the_next_request() {
     )
     .await;
     assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    // The cap counts the input and the output together, so the refusal says so.
+    assert_eq!(
+        json_body(response).await["error"]["message"],
+        "key 'capped' has reached its token cap of 10 input and output tokens"
+    );
 }
 
 #[tokio::test]
@@ -1675,6 +1680,10 @@ async fn account_daily_limit_blocks_the_next_request() {
     )
     .await;
     assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(
+        json_body(response).await["error"]["message"],
+        "account 'ada' has used its daily token limit of 15 input and output tokens"
+    );
 }
 
 #[tokio::test]
