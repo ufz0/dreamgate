@@ -384,7 +384,10 @@ and started again after the same 30 seconds, so health checking does not end wit
 ### Stopping
 
 A request that crossed the gate has been served, and billed by the upstream, so stopping the process must not
-lose its row. On Ctrl-C, or the SIGTERM a service manager or a container runtime sends, the gateway:
+lose its row. The gateway listens for the signals from before it prints that it is listening, so a stop sent
+once that line is printed is met by the steps below rather than by the signal's default, which ends a process at
+once; a stop sent before then, while the database is opened and migrated, still ends it at once, with nothing
+taken yet to lose. On Ctrl-C, or the SIGTERM a service manager or a container runtime sends, the gateway:
 
 1. stops taking work: a request to the gateway that arrives is answered 503 `shutting_down` and not recorded,
    `/health` answers 503 `draining` so a load balancer stops sending requests here, and a dashboard's live stream
@@ -782,8 +785,13 @@ sends the process SIGTERM in the middle of the stream, and checks that the strea
 connection meanwhile is answered 503 `draining` at `/health` and 503 `shutting_down` at the gateway rather than
 refused, that the process stops on its own with a success even though the client keeps its connection open, and
 that the row is in the database file afterwards with no write-ahead log left beside it. Another sends the
-process three signals with nothing in flight and a request whose head is only half sent holding it open, and
-checks that the second does not stop it and the third does, with exit status 1. The stopping phases are also
+process three signals with nothing in flight and a request holding it open whose handler is waiting for a body
+that never comes, sent only once the server has answered it 100 Continue, and checks that the second does not
+stop it and the third does, with exit status 1. A unit test in `src/shutdown.rs` sends the process itself a
+SIGTERM, a SIGINT and another SIGTERM, each after the one before was taken in, and checks that none is lost.
+That the listeners are made before the listening line is printed is not tested, because a signal cannot be made
+to arrive in the moment between the two without holding the process there, which only a hook in it could do. The
+stopping phases are also
 tested in `tests/concurrency.rs`: a request that arrives while stopping is turned away with 503 and not
 recorded, and so is one that passed the first check and waited on the database while the drain ended; the model
 list and the health check say so; a stream in flight is let finish with the drain ending only once its row is
