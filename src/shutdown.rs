@@ -62,14 +62,14 @@ impl Shutdown {
 // Waits for a signal to stop and takes the gateway through the phases. A request that reached a connection
 // gives its slots back only after its row is written, so every slot of the gateway coming back is every such
 // request recorded; that is what the grace window waits for (see `Limits::drained`).
-pub async fn on_signal(st: State, grace: Duration) {
-    signal().await;
+pub async fn on_signal(st: State, grace: Duration, mut signals: Signals) {
+    signals.next().await;
     tracing::info!(
         "stopping: no new requests are taken, and the {} in flight have {grace:?} to finish",
         st.limits.in_flight()
     );
     st.shutdown.advance(Phase::Draining);
-    let mut signals = 1;
+    let mut received = 1;
     tokio::select! {
         drained = st.limits.drained(grace) => {
             if drained {
@@ -81,8 +81,8 @@ pub async fn on_signal(st: State, grace: Duration) {
                 );
             }
         }
-        _ = signal() => {
-            signals += 1;
+        _ = signals.next() => {
+            received += 1;
             tracing::warn!(
                 "a second signal: the {} requests in flight are ended now and recorded as cut",
                 st.limits.in_flight()
@@ -96,9 +96,9 @@ pub async fn on_signal(st: State, grace: Duration) {
     // counted whether it ended the drain or came after the drain ended on its own, because to the one who sent
     // it, it is the second either way, and stopping at once on it would lose rows the README promises to keep.
     loop {
-        signal().await;
-        signals += 1;
-        if signals >= 3 {
+        signals.next().await;
+        received += 1;
+        if received >= 3 {
             break;
         }
         tracing::warn!(
@@ -112,26 +112,45 @@ pub async fn on_signal(st: State, grace: Duration) {
     std::process::exit(1);
 }
 
-// Ctrl-C, and on Unix the SIGTERM a service manager or a container runtime sends to stop a process.
-async fn signal() {
-    let interrupt = tokio::signal::ctrl_c();
+// Ctrl-C, and on Unix the SIGTERM a service manager or a container runtime sends to stop a process. They are
+// listened for from before the process says it is listening, and for the rest of its life: until a listener is
+// in place a signal meets its default action, which stops the process at once without the drain, and a listener
+// made for each wait would miss a signal that arrives between two of them. A service manager can send its stop
+// as soon as the process has started, and on a busy host the task that waits for it may not have run by then.
+pub struct Signals {
     #[cfg(unix)]
-    {
-        use tokio::signal::unix::{SignalKind, signal};
-        match signal(SignalKind::terminate()) {
-            Ok(mut terminate) => {
-                tokio::select! {
-                    _ = interrupt => {}
-                    _ = terminate.recv() => {}
-                }
-            }
-            Err(_) => {
-                let _ = interrupt.await;
-            }
+    terminate: tokio::signal::unix::Signal,
+    #[cfg(unix)]
+    interrupt: tokio::signal::unix::Signal,
+}
+
+impl Signals {
+    pub fn listen() -> std::io::Result<Signals> {
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{SignalKind, signal};
+            Ok(Signals {
+                terminate: signal(SignalKind::terminate())?,
+                interrupt: signal(SignalKind::interrupt())?,
+            })
+        }
+        #[cfg(not(unix))]
+        {
+            Ok(Signals {})
         }
     }
-    #[cfg(not(unix))]
-    {
-        let _ = interrupt.await;
+
+    async fn next(&mut self) {
+        #[cfg(unix)]
+        {
+            tokio::select! {
+                _ = self.terminate.recv() => {}
+                _ = self.interrupt.recv() => {}
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = tokio::signal::ctrl_c().await;
+        }
     }
 }

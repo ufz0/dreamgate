@@ -362,7 +362,9 @@ and started again after the same 30 seconds, so health checking does not end wit
 ### Stopping
 
 A request that crossed the gate has been served, and billed by the upstream, so stopping the process must not
-lose its row. On Ctrl-C, or the SIGTERM a service manager or a container runtime sends, the gateway:
+lose its row. The gateway listens for the signals from before it prints that it is listening, so a stop sent as
+soon as it has started is met by the steps below rather than by the signal's default, which ends a process at
+once. On Ctrl-C, or the SIGTERM a service manager or a container runtime sends, the gateway:
 
 1. stops taking work: a request to the gateway that arrives is answered 503 `shutting_down` and not recorded,
    `/health` answers 503 `draining` so a load balancer stops sending requests here, and a dashboard's live stream
