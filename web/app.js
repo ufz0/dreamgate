@@ -899,7 +899,7 @@ function renderConnect() {
   const key = state.keys.find((k) => k.key === state.connectKey) || state.keys[0];
   $('connect-model').textContent = key
     ? key.model
-      ? `This key resolves to ${key.model} for chat and completions; an embedding uses the model the client names. Use GET ${base}/models to see what the connection serves.`
+      ? `This key resolves to ${key.model} for chat and completions; an embedding uses the model the client names. Use GET ${base}/models to see the models the connections serve.`
       : `Use whatever the key resolves to, or list it with GET ${base}/models.`
     : 'Create a key first. The key is what the client sends.';
 
@@ -925,7 +925,7 @@ async function loadModels() {
   try {
     const data = await api('/v1/models', { headers: { authorization: `Bearer ${key}` } });
     state.models = (data.data ?? []).map((model) => model.id);
-    if (!state.models.length) state.modelNote = 'That connection did not list any models. Check it on the Connections page.';
+    if (!state.models.length) state.modelNote = 'No connection listed any models. Check them on the Connections page.';
   } catch (err) {
     state.modelNote = String(err?.message || 'The model list could not be read.');
   }

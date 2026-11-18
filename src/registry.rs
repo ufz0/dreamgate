@@ -1,7 +1,7 @@
 use axum::extract::{Path, State as AxumState};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Json, Response};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sqlx::Row;
 use std::sync::Arc;
@@ -28,18 +28,32 @@ pub struct Connection {
     // What the connection says it can take at once. Null means it never said, which is not the same as a
     // limit of one: an unstated capability is admitted by the default rather than by a guess.
     pub max_concurrent: Option<i64>,
-    // The ids of the models the connection listed at its last check that could read its list. None means no
-    // list has been read, which is not the same as a list with nothing in it.
-    pub models: Option<Vec<String>>,
+    // The models the connection listed at its last check that could read its list. None means no list has been
+    // read, which is not the same as a list with nothing in it.
+    pub models: Option<Vec<Listed>>,
+}
+
+// A model as a connection listed it: its id, and the time it was made when the upstream gave one, which the
+// merged model list passes on rather than leave out a field a typed client requires or make one up.
+#[derive(Clone, Serialize, Deserialize)]
+pub struct Listed {
+    pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created: Option<i64>,
 }
 
 impl Connection {
+    // Whether the connection's list was read and names the model.
+    pub fn lists(&self, model: &str) -> bool {
+        self.models
+            .as_ref()
+            .is_some_and(|models| models.iter().any(|listed| same_model(&listed.id, model)))
+    }
+
     // Whether the connection's list was read and does not name the model. A list that was never read says
     // nothing about what the connection serves, so it never counts against it.
     pub fn lists_without(&self, model: &str) -> bool {
-        self.models
-            .as_ref()
-            .is_some_and(|models| !models.iter().any(|listed| same_model(listed, model)))
+        self.models.is_some() && !self.lists(model)
     }
 }
 
@@ -51,17 +65,21 @@ fn same_model(listed: &str, asked: &str) -> bool {
         || asked.strip_suffix(":latest") == Some(listed)
 }
 
-// The ids in an OpenAI-shaped model list. A body in any other shape is not a list of nothing but one that was
-// not read, so it gives none rather than an empty list.
-fn model_ids(body: &Value) -> Option<Vec<String>> {
-    let entries = body.get("data")?.as_array()?;
-    Some(
-        entries
-            .iter()
-            .filter_map(|entry| entry.get("id").and_then(Value::as_str))
-            .map(str::to_string)
-            .collect(),
-    )
+// The models in an OpenAI-shaped list. A body in any other shape, or with an entry that has no id to read, is not
+// a list of nothing or of some of its models but one that was not read, so it gives none: a list read in part
+// would move a connection back for the models it left out.
+fn listed_models(body: &[u8]) -> Option<Vec<Listed>> {
+    let body: Value = serde_json::from_slice(body).ok()?;
+    body.get("data")?
+        .as_array()?
+        .iter()
+        .map(|entry| {
+            Some(Listed {
+                id: entry.get("id")?.as_str()?.to_string(),
+                created: entry.get("created").and_then(Value::as_i64),
+            })
+        })
+        .collect()
 }
 
 fn row_to_connection(row: &sqlx::sqlite::SqliteRow) -> Connection {
@@ -143,11 +161,14 @@ pub async fn check(st: &State, connection: &Connection) -> StatusCode {
         .timeout(Duration::from_secs(10))
         .send()
         .await;
+    // The body is read apart from what it says: one that could not be read, because the connection broke off
+    // or went quiet while sending it, leaves the last list as it was, and only one that was read and is in
+    // another shape is stored as no list.
     let (status, body) = match result {
         Ok(resp) => {
             let status = resp.status();
             let body = if status.is_success() {
-                resp.json::<Value>().await.ok()
+                resp.bytes().await.ok()
             } else {
                 None
             };
@@ -166,10 +187,16 @@ pub async fn check(st: &State, connection: &Connection) -> StatusCode {
                 .await;
         return status;
     }
-    let models = body
-        .as_ref()
-        .and_then(model_ids)
-        .map(|ids| Value::from(ids).to_string());
+    let Some(body) = body else {
+        let _ =
+            sqlx::query("UPDATE connections SET health = 'ok', last_checked_at = ? WHERE id = ?")
+                .bind(crate::clock::now())
+                .bind(connection.id)
+                .execute(&st.pool)
+                .await;
+        return status;
+    };
+    let models = listed_models(&body).and_then(|models| serde_json::to_string(&models).ok());
     let _ = sqlx::query(
         "UPDATE connections SET health = 'ok', last_checked_at = ?, models = ? WHERE id = ?",
     )
@@ -226,7 +253,10 @@ pub async fn list(AxumState(st): AxumState<State>, caller: Caller) -> Response {
                 "health": c.health,
                 "last_checked_at": c.last_checked_at,
                 "max_concurrent": c.max_concurrent,
-                "models": c.models,
+                // The ids alone: the page shows how many and which, and the dates are for the model list.
+                "models": c.models.as_ref().map(|models| {
+                    models.iter().map(|listed| listed.id.clone()).collect::<Vec<_>>()
+                }),
             })
         })
         .collect();
