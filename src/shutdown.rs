@@ -113,15 +113,18 @@ pub async fn on_signal(st: State, grace: Duration, mut signals: Signals) {
 }
 
 // Ctrl-C, and on Unix the SIGTERM a service manager or a container runtime sends to stop a process. They are
-// listened for from before the process says it is listening, and for the rest of its life: until a listener is
-// in place a signal meets its default action, which stops the process at once without the drain, and a listener
-// made for each wait would miss a signal that arrives between two of them. A service manager can send its stop
-// as soon as the process has started, and on a busy host the task that waits for it may not have run by then.
+// listened for from before the process says it is listening, and for the rest of its life, on Windows as on
+// Unix: until a listener is in place a signal meets its default action, which stops the process at once without
+// the drain, and a listener made for each wait would miss a signal that arrives between two of them. A service
+// manager can send its stop as soon as the process has started, and on a busy host the task that waits for it
+// may not have run by then.
 pub struct Signals {
     #[cfg(unix)]
     terminate: tokio::signal::unix::Signal,
     #[cfg(unix)]
     interrupt: tokio::signal::unix::Signal,
+    #[cfg(windows)]
+    ctrl_c: tokio::signal::windows::CtrlC,
 }
 
 impl Signals {
@@ -134,7 +137,13 @@ impl Signals {
                 interrupt: signal(SignalKind::interrupt())?,
             })
         }
-        #[cfg(not(unix))]
+        #[cfg(windows)]
+        {
+            Ok(Signals {
+                ctrl_c: tokio::signal::windows::ctrl_c()?,
+            })
+        }
+        #[cfg(not(any(unix, windows)))]
         {
             Ok(Signals {})
         }
@@ -148,9 +157,38 @@ impl Signals {
                 _ = self.interrupt.recv() => {}
             }
         }
-        #[cfg(not(unix))]
+        #[cfg(windows)]
         {
-            let _ = tokio::signal::ctrl_c().await;
+            self.ctrl_c.recv().await;
+        }
+        // A platform with no signals to listen for never sends one.
+        #[cfg(not(any(unix, windows)))]
+        {
+            std::future::pending::<()>().await;
+        }
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::Signals;
+    use std::time::Duration;
+
+    // Each signal is sent to this process after the one before it was taken in, so a listener made for each wait
+    // would miss the next, and one made only when it is first awaited would let the first stop the test binary.
+    #[tokio::test]
+    async fn every_stop_signal_is_taken_in_by_the_listeners_made_at_the_start() {
+        let mut signals = Signals::listen().unwrap();
+        for signal in ["-TERM", "-INT", "-TERM"] {
+            let sent = std::process::Command::new("kill")
+                .args([signal, &std::process::id().to_string()])
+                .status()
+                .unwrap();
+            assert!(sent.success());
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            tokio::time::timeout(Duration::from_secs(5), signals.next())
+                .await
+                .unwrap_or_else(|_| panic!("{signal} was lost"));
         }
     }
 }

@@ -279,9 +279,9 @@ fn only_a_third_signal_stops_the_process_at_once() {
     let dir = scratch("signals");
     let (mut child, addr) = start(&dir);
     // The server says it is inside the request by answering 100 Continue, which it does only once the handler
-    // reads the body, so the signals are sent after that. A connection whose first bytes the server has not read
-    // yet is closed at once when the server stops, because it cannot tell yet which protocol it speaks, so a head
-    // written just before the first signal could leave nothing to wait on.
+    // reads the body, so the signals are sent after that. A connection nothing of a request has been read from yet
+    // is closed at once when the server stops, so a head written just before the first signal could leave nothing
+    // to wait on.
     let mut waiting = std::net::TcpStream::connect(&addr).unwrap();
     std::io::Write::write_all(
         &mut waiting,
@@ -292,9 +292,14 @@ fn only_a_third_signal_stops_the_process_at_once() {
     waiting
         .set_read_timeout(Some(Duration::from_secs(5)))
         .unwrap();
-    let mut answer = [0u8; 64];
-    let read = std::io::Read::read(&mut waiting, &mut answer).unwrap();
-    let answer = String::from_utf8_lossy(&answer[..read]).to_string();
+    let mut answer = Vec::new();
+    let mut byte = [0u8; 1];
+    while !answer.ends_with(b"\r\n\r\n") {
+        let read = std::io::Read::read(&mut waiting, &mut byte).unwrap();
+        assert_eq!(read, 1, "the connection closed after {answer:?}");
+        answer.push(byte[0]);
+    }
+    let answer = String::from_utf8_lossy(&answer).to_string();
     assert!(answer.starts_with("HTTP/1.1 100"), "{answer:?}");
 
     terminate(&child);
