@@ -1045,7 +1045,7 @@ async fn forward(st: State, headers: HeaderMap, body: Value, endpoint: Endpoint)
         prompt_tokens,
         present,
         reservation,
-        session: headers.get(registry::OPENCODE_SESSION_HEADER).cloned(),
+        session: registry::client_session(&headers),
     };
     let mut response = admitted_request(st, body, endpoint, admitted).await;
     left_headers(&mut response, left);
@@ -1467,7 +1467,7 @@ pub async fn list_models(AxumState(st): AxumState<State>, headers: HeaderMap) ->
     let result = registry::authorized(
         st.http.get(registry::endpoint(&conn.base_url, "models")),
         &conn,
-        headers.get(registry::OPENCODE_SESSION_HEADER),
+        registry::client_session(&headers).as_ref(),
     )
     .timeout(st.limits.request_timeout())
     .send()

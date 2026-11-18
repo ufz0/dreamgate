@@ -362,8 +362,8 @@ async fn add_key_expiry(pool: &SqlitePool) -> Result<(), sqlx::Error> {
     Ok(())
 }
 
-// What kind of upstream a connection is. Every connection made before there were kinds speaks the plain OpenAI API,
-// so the column is added with that as its value, and those connections are sent what they were sent before.
+// What kind of upstream a connection is. Every connection made before there were kinds speaks the plain OpenAI
+// API, so the column is added with that as its value, and those connections are sent what they were sent before.
 async fn add_connection_kind(pool: &SqlitePool) -> Result<(), sqlx::Error> {
     if has_column(pool, "connections", "kind").await? {
         return Ok(());

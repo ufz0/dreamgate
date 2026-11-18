@@ -7735,9 +7735,10 @@ async fn recording_upstream() -> (String, Sent) {
 }
 
 // An OpenCode Go connection is sent the gateway's user agent and a session on every request: the session the
-// client sent when it sent one, as OpenCode Go asks a forwarding client to, and the gateway's own otherwise,
-// including on a health check and on the model list it asks for itself. A plain connection is sent neither, even
-// when the client sent a session. A kind the gateway does not know is refused, and one left out is the plain one.
+// client sent when it sent one with something in it, as OpenCode Go asks a forwarding client to, and the gateway's
+// own otherwise, which a health check always is. That holds for the list `/v1/models` asks the first connection
+// for when no list has been read too. A plain connection is sent neither, even when the client sent a session. A
+// kind the gateway does not know is refused, and one left out is the plain one.
 #[tokio::test]
 async fn an_opencode_go_connection_names_the_gateway_and_passes_on_the_clients_session() {
     let st = test_state().await;
@@ -7837,6 +7838,15 @@ async fn an_opencode_go_connection_names_the_gateway_and_passes_on_the_clients_s
         last(&go_sent),
         ours("/v1/chat/completions", "ses_client_chat")
     );
+    for blank in ["", "   "] {
+        let response = send(Some(blank), "/v1/chat/completions", Some(chat.clone())).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            last(&go_sent),
+            ours("/v1/chat/completions", "ses_dreamgate_abc123"),
+            "a blank session {blank:?} is none"
+        );
+    }
 
     // A key bound to the plain connection sends its requests there, with neither header.
     let (_, bound) = post_json(
@@ -7908,4 +7918,98 @@ async fn a_connection_written_before_kinds_is_a_plain_one() {
         .await
         .unwrap();
     assert_eq!(row.get::<String, _>("kind"), "openai");
+}
+
+// The headers follow the connection a request is sent to, not the one it was meant for: a request that fails over
+// from an OpenCode Go connection to a plain one reaches the plain one without them, and one that fails over the
+// other way, streamed, reaches OpenCode Go with them and with the client's session.
+#[tokio::test]
+async fn a_request_that_fails_over_is_sent_the_headers_of_the_connection_it_reaches() {
+    for (gone, reached, stream) in [
+        ("opencode-go", "openai", false),
+        ("openai", "opencode-go", true),
+    ] {
+        let st = test_state().await;
+        let router = build_router(st.clone());
+        let admin = register(&router, "ada").await;
+        let (url, sent) = recording_upstream().await;
+        // Nothing listens on port 1, so the first connection refuses the request and it goes on to the second.
+        post_json(
+            &router,
+            "/api/connections",
+            &admin,
+            json!({ "name": "gone", "base_url": "http://127.0.0.1:1", "kind": gone }),
+        )
+        .await;
+        post_json(
+            &router,
+            "/api/connections",
+            &admin,
+            json!({ "name": "reached", "base_url": url, "api_key": "k", "priority": 1, "kind": reached }),
+        )
+        .await;
+        let (_, key) = post_json(&router, "/api/keys", &admin, json!({ "name": "k" })).await;
+        let response = call(
+            &router,
+            Request::post("/v1/chat/completions")
+                .header("authorization", format!("Bearer {}", key["key"].as_str().unwrap()))
+                .header("content-type", "application/json")
+                .header("x-opencode-session", "ses_client")
+                .body(Body::from(
+                    json!({ "model": "glm-5", "stream": stream, "messages": [{ "role": "user", "content": "hi" }] })
+                        .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK, "{gone} to {reached}");
+        let (path, agent, session, _) = sent.lock().unwrap().last().cloned().unwrap();
+        assert_eq!(path, "/v1/chat/completions");
+        if reached == "opencode-go" {
+            assert_eq!(agent.as_deref(), Some("DreamGate/1.0"));
+            assert_eq!(session.as_deref(), Some("ses_client"));
+        } else {
+            assert_eq!((agent, session), (None, None), "{gone} to {reached}");
+        }
+    }
+}
+
+// A type written by a newer version is listed as it was stored, not as the plain type, and is sent the plain API,
+// which every type speaks.
+#[tokio::test]
+async fn a_type_this_version_does_not_know_is_listed_as_stored_and_sent_the_plain_api() {
+    let st = test_state().await;
+    let router = build_router(st.clone());
+    let admin = register(&router, "ada").await;
+    let (url, sent) = recording_upstream().await;
+    sqlx::query(
+        "INSERT INTO connections (name, base_url, api_key, kind, created_at) \
+         VALUES ('newer', ?, 'k', 'opencode-zen', '2026-01-01T00:00:00Z')",
+    )
+    .bind(&url)
+    .execute(&st.pool)
+    .await
+    .unwrap();
+    let listed = get_json(&router, "/api/connections", &admin).await;
+    assert_eq!(listed["connections"][0]["kind"], "opencode-zen");
+    let (_, key) = post_json(&router, "/api/keys", &admin, json!({ "name": "k" })).await;
+    let response = call(
+        &router,
+        Request::post("/v1/chat/completions")
+            .header(
+                "authorization",
+                format!("Bearer {}", key["key"].as_str().unwrap()),
+            )
+            .header("content-type", "application/json")
+            .header("x-opencode-session", "ses_client")
+            .body(Body::from(
+                json!({ "model": "m", "messages": [{ "role": "user", "content": "hi" }] })
+                    .to_string(),
+            ))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let (_, agent, session, _) = sent.lock().unwrap().last().cloned().unwrap();
+    assert_eq!((agent, session), (None, None));
 }

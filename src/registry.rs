@@ -68,6 +68,15 @@ pub const OPENCODE_USER_AGENT: &str = "DreamGate/1.0";
 pub const OPENCODE_SESSION_HEADER: &str = "x-opencode-session";
 pub const OPENCODE_SESSION: &str = "ses_dreamgate_abc123";
 
+// The session a client sent, if it sent one with something in it. An empty value is no session, and is replaced by
+// the gateway's rather than passed on to an upstream that refuses a request without one.
+pub fn client_session(headers: &axum::http::HeaderMap) -> Option<HeaderValue> {
+    headers
+        .get(OPENCODE_SESSION_HEADER)
+        .filter(|value| !value.as_bytes().trim_ascii().is_empty())
+        .cloned()
+}
+
 // A request to a connection, with its key and whatever else its kind asks for. Every request the gateway sends a
 // connection goes through here, so a kind's headers cannot be on one of them and missing from another.
 pub fn authorized(
@@ -403,7 +412,7 @@ pub async fn list(AxumState(st): AxumState<State>, caller: Caller) -> Response {
     // An upstream key is a secret, so it is returned to an admin alone, and so is the address: it
     // names an internal host and port, and can carry a credential of its own in its query or its
     // user part. The rest of the row is what any signed-in account needs for the gate readout and
-    // the model list.
+    // the model list, and the type, which names the kind of service and nothing about where it is.
     let admin = caller.role == "admin";
     let out: Vec<serde_json::Value> = rows
         .iter()
@@ -426,7 +435,9 @@ pub async fn list(AxumState(st): AxumState<State>, caller: Caller) -> Response {
                 "health": c.health,
                 "last_checked_at": c.last_checked_at,
                 "max_concurrent": c.max_concurrent,
-                "kind": c.kind.label(),
+                // As stored: a type this version does not know is sent the plain API, but it is not the
+                // plain type, so it is not listed as one.
+                "kind": row.get::<String, _>("kind"),
                 // The ids alone: the page shows how many and which, and the dates are for the model list.
                 "models": c.models.as_ref().map(|models| {
                     models.iter().map(|listed| listed.id.clone()).collect::<Vec<_>>()
