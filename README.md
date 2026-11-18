@@ -47,8 +47,8 @@ Environment variables:
   applied to a stream: a stream has no known end and is bounded by silence instead.
 - `DREAMGATE_STREAM_STALL_SECS` — how long a stream may go without producing anything before it is closed as a
   dead connection, default 120
-- `DREAMGATE_SHUTDOWN_GRACE_SECS` — how long the requests in flight are given to finish when the process is told to
-  stop, default 30 (see Stopping). Like the other numbers here, 0 is read as unset and gives the default
+- `DREAMGATE_SHUTDOWN_GRACE_SECS` — how long the requests in flight are given to finish when the process is told
+  to stop, default 30 (see Stopping). Like the other numbers here, 0 is read as unset and gives the default
 - `DREAMGATE_METRICS_TOKEN` — the bearer token a scrape of `/metrics` has to send, read without the spaces or
   line break around it. Unset or blank, the default, there is no `/metrics` at all (see Monitoring)
 - `RUST_LOG` — which log lines are printed to standard output, in the usual form (`warn`,
@@ -238,9 +238,10 @@ and started again after the same 30 seconds, so health checking does not end wit
 A request that crossed the gate has been served, and billed by the upstream, so stopping the process must not
 lose its row. On Ctrl-C, or the SIGTERM a service manager or a container runtime sends, the gateway:
 
-1. stops taking work: a request that arrives is answered 503 `shutting_down` and not recorded, `/health` answers
-   503 `draining` so a load balancer stops sending requests here, and a dashboard's live stream ends, because it
-   would otherwise hold the stop for as long as the page stayed open (the page reconnects to whatever comes next).
+1. stops taking work: a request to the gateway that arrives is answered 503 `shutting_down` and not recorded,
+   `/health` answers 503 `draining` so a load balancer stops sending requests here, and a dashboard's live stream
+   ends, because it would otherwise hold the stop for as long as the page stayed open (the page reconnects to
+   whatever comes next). The dashboard's own routes are still served.
    New connections are still accepted while the requests in flight drain, so a load balancer that has not yet
    stopped sending requests here reads those answers rather than a refused connection;
 2. gives the requests in flight `DREAMGATE_SHUTDOWN_GRACE_SECS` (default 30) to finish on their own. A request
@@ -257,8 +258,16 @@ lose its row. On Ctrl-C, or the SIGTERM a service manager or a container runtime
    itself. Neither is counted as a failure of the connection;
 4. stops accepting connections, waits up to ten seconds for the open ones, and five more for the rows of what was
    ended, then closes the database, which checkpoints the write-ahead log, and exits with success. A client that
-   keeps a connection open after its answer has ended does not hold the process. A signal after the second stops
-   the process at once, without waiting for those rows, and logs how many were in flight.
+   keeps a connection open after its answer has ended does not hold the process. A third signal stops the
+   process at once with exit status 1, without waiting for those rows, and logs how many were in flight; a
+   second one after a drain that ended on its own changes nothing.
+
+Whatever stops the process has to wait for all of that: the stop timeout of a service manager or a container
+runtime — `TimeoutStopSec` in systemd, `--stop-timeout` or `stop_grace_period` in Docker and Compose,
+`terminationGracePeriodSeconds` in Kubernetes — has to be longer than `DREAMGATE_SHUTDOWN_GRACE_SECS` plus
+fifteen seconds, or it kills the process while the rows of what was ended are written. Docker's and Compose's
+default is ten seconds and Kubernetes' thirty, so with the default grace window either has to be raised, or the
+grace window lowered to fit.
 
 A request that is cut or still unrecorded after all of that is logged as an error with the count.
 
@@ -595,8 +604,10 @@ built binary with its address, database and grace window set through the environ
 sends the process SIGTERM in the middle of the stream, and checks that the stream arrives whole, that a new
 connection meanwhile is answered 503 `draining` at `/health` and 503 `shutting_down` at the gateway rather than
 refused, that the process stops on its own with a success even though the client keeps its connection open, and
-that the row is in the database file afterwards with no write-ahead log left beside it. The stopping phases are
-also tested in `tests/concurrency.rs`: a request that arrives while stopping is turned away with 503 and not
+that the row is in the database file afterwards with no write-ahead log left beside it. Another sends the
+process three signals with nothing in flight and a request whose head is only half sent holding it open, and
+checks that the second does not stop it and the third does, with exit status 1. The stopping phases are also
+tested in `tests/concurrency.rs`: a request that arrives while stopping is turned away with 503 and not
 recorded, and so is one that passed the first check and waited on the database while the drain ended; the model
 list and the health check say so; a stream in flight is let finish with the drain ending only once its row is
 written, and while the drain waits what is in flight reads as that stream alone; a stream and a single answer
@@ -605,6 +616,6 @@ dashboard's live stream ending as the stop begins is tested in `tests/gateway.rs
 exercised by a test; the other things tested in `src/main.rs` are the dashboard address the startup line names
 and the log filter chosen from `RUST_LOG`, set or not, each a unit test beside the function that picks it. The
 two time bounds are exercised, because the tests build the client and the state through the same functions the
-gateway uses; the connect timeout and the number of connections kept idle are read through
-that builder but no test asserts what they do. The pool and the busy timeout are exercised through `db::connect`
-against a shared-cache in-memory database, which is not the same mechanism as writer contention on a file.
+gateway uses; the connect timeout and the number of connections kept idle are read through that builder but no
+test asserts what they do. The pool and the busy timeout are exercised through `db::connect` against a
+shared-cache in-memory database, which is not the same mechanism as writer contention on a file.

@@ -157,12 +157,19 @@ async fn sigterm_lets_a_running_stream_finish_records_it_and_stops_the_process()
     assert!(signalled.success());
 
     // A new connection while the stream drains: a load balancer that has not yet stopped sending requests
-    // here reads answers it can act on, not a refused connection.
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    // here reads answers it can act on, not a refused connection. The signal is handled on its own task, so
+    // the check is asked until it says so rather than after a guess at how long that takes.
     let fresh = reqwest::Client::new();
-    let health = fresh.get(format!("{base}/health")).send().await.unwrap();
-    assert_eq!(health.status(), 503);
-    assert_eq!(health.text().await.unwrap(), "draining");
+    let mut health = (0, String::new());
+    for _ in 0..100 {
+        let answer = fresh.get(format!("{base}/health")).send().await.unwrap();
+        health = (answer.status().as_u16(), answer.text().await.unwrap());
+        if health.1 == "draining" {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(health, (503, "draining".to_string()));
     let turned_away = fresh
         .post(format!("{base}/v1/chat/completions"))
         .bearer_auth(key)
@@ -219,5 +226,84 @@ async fn sigterm_lets_a_running_stream_finish_records_it_and_stops_the_process()
     );
     assert_eq!(row.get::<i64, _>("completion_tokens"), 10);
     pool.close().await;
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+fn scratch(name: &str) -> PathBuf {
+    let dir =
+        PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("{name}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
+// Started like the other process tests and waited on until it names its address.
+fn start(dir: &std::path::Path) -> (Running, String) {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_dreamgate"))
+        .env("DREAMGATE_ADDR", "127.0.0.1:0")
+        .env("DREAMGATE_DB", dir.join("dreamgate.db"))
+        .env("RUST_LOG", "warn")
+        .current_dir(dir)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let stdout = child.stdout.take().unwrap();
+    let child = Running(child);
+    let mut lines = BufReader::new(stdout).lines();
+    loop {
+        let line = lines
+            .next()
+            .expect("the process printed no address")
+            .unwrap();
+        if let Some(addr) = line.strip_prefix("DreamGate listening on ") {
+            return (child, addr.to_string());
+        }
+    }
+}
+
+fn terminate(child: &Running) {
+    let signalled = Command::new("kill")
+        .args(["-TERM", &child.0.id().to_string()])
+        .status()
+        .unwrap();
+    assert!(signalled.success());
+}
+
+// The second signal is the one that ends what is in flight, and only a third stops the process at once. When
+// the drain ends on its own, because nothing was in flight, the second signal still does not stop it at once:
+// to the one who sent it, it is the second. A request whose head is only half sent keeps the process waiting on
+// its connection after the drain, so there is time to send the others.
+#[test]
+fn only_a_third_signal_stops_the_process_at_once() {
+    let dir = scratch("signals");
+    let (mut child, addr) = start(&dir);
+    let mut half_sent = std::net::TcpStream::connect(&addr).unwrap();
+    std::io::Write::write_all(&mut half_sent, b"GET /health HTTP/1.1\r\nHost: gateway\r\n")
+        .unwrap();
+
+    terminate(&child);
+    std::thread::sleep(Duration::from_millis(300));
+    terminate(&child);
+    std::thread::sleep(Duration::from_millis(500));
+    assert!(
+        child.0.try_wait().unwrap().is_none(),
+        "the second signal stopped the process at once"
+    );
+
+    terminate(&child);
+    let stopping = Instant::now();
+    let status = loop {
+        if let Some(status) = child.0.try_wait().unwrap() {
+            break status;
+        }
+        assert!(
+            stopping.elapsed() < Duration::from_secs(5),
+            "the third signal did not stop the process"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    assert_eq!(status.code(), Some(1));
+    drop(half_sent);
     let _ = std::fs::remove_dir_all(&dir);
 }

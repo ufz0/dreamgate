@@ -69,6 +69,7 @@ pub async fn on_signal(st: State, grace: Duration) {
         st.limits.in_flight()
     );
     st.shutdown.advance(Phase::Draining);
+    let mut signals = 1;
     tokio::select! {
         drained = st.limits.drained(grace) => {
             if drained {
@@ -81,6 +82,7 @@ pub async fn on_signal(st: State, grace: Duration) {
             }
         }
         _ = signal() => {
+            signals += 1;
             tracing::warn!(
                 "a second signal: the {} requests in flight are ended now and recorded as cut",
                 st.limits.in_flight()
@@ -89,11 +91,22 @@ pub async fn on_signal(st: State, grace: Duration) {
     }
     st.shutdown.advance(Phase::Closing);
     // The handlers stay installed for the life of the process, so a signal from here on would otherwise do
-    // nothing at all. One more is someone who will not wait for the last rows to be written, and the process
-    // stops at once, with the rows still being written lost.
-    signal().await;
+    // nothing at all. A third is someone who will not wait for the last rows to be written, and the process
+    // stops at once, with the rows still being written lost and a failure as its exit status. The second is
+    // counted whether it ended the drain or came after the drain ended on its own, because to the one who sent
+    // it, it is the second either way, and stopping at once on it would lose rows the README promises to keep.
+    loop {
+        signal().await;
+        signals += 1;
+        if signals >= 3 {
+            break;
+        }
+        tracing::warn!(
+            "a second signal: the requests in flight were already ended and are being recorded; a third stops at once"
+        );
+    }
     tracing::error!(
-        "another signal: stopping at once, and {} requests are not recorded",
+        "a third signal: stopping at once, and {} requests are not recorded",
         st.limits.in_flight()
     );
     std::process::exit(1);
