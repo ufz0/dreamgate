@@ -1054,7 +1054,7 @@ function renderConnections() {
     ? state.connections
         .map(
           (connection) => `<tr>
-            <td><span class="clamp">${esc(connection.name)}</span></td>
+            <td><span class="clamp">${esc(connection.name)}</span>${connection.kind === 'opencode-go' ? '<br><span class="muted">OpenCode Go</span>' : ''}</td>
             <td><span class="clamp">${esc(connection.base_url)}</span></td>
             <td>${esc(connection.default_model || 'the model the client asks for')}</td>
             <td class="num">${esc(connection.priority)}</td>
@@ -1737,6 +1737,15 @@ $('key-form').addEventListener('submit', async (event) => {
   }
 });
 
+// OpenCode Go is served from one address, so choosing it fills the base URL in when nothing has been typed there,
+// and choosing another type takes it out again only if it is still the one filled in.
+const OPENCODE_GO_URL = 'https://opencode.ai/inference/go';
+$('connection-kind').addEventListener('change', (event) => {
+  const baseUrl = $('connection-form').elements.base_url;
+  if (event.target.value === 'opencode-go' && !baseUrl.value.trim()) baseUrl.value = OPENCODE_GO_URL;
+  else if (event.target.value !== 'opencode-go' && baseUrl.value === OPENCODE_GO_URL) baseUrl.value = '';
+});
+
 $('connection-form').addEventListener('submit', async (event) => {
   event.preventDefault();
   const form = event.target;
@@ -1747,6 +1756,7 @@ $('connection-form').addEventListener('submit', async (event) => {
     api_key: data.api_key || null,
     default_model: data.default_model || null,
     priority: data.priority ? Number(data.priority) : null,
+    kind: data.kind,
   };
   try {
     const created = await postJson('/api/connections', body);

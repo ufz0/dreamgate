@@ -1045,6 +1045,7 @@ async fn forward(st: State, headers: HeaderMap, body: Value, endpoint: Endpoint)
         prompt_tokens,
         present,
         reservation,
+        session: registry::client_session(&headers),
     };
     let mut response = admitted_request(st, body, endpoint, admitted).await;
     left_headers(&mut response, left);
@@ -1058,6 +1059,8 @@ struct Admitted {
     prompt_tokens: i64,
     present: Active,
     reservation: Reservation,
+    // The session the client sent, passed on to a connection whose kind asks for one.
+    session: Option<HeaderValue>,
 }
 
 async fn admitted_request(
@@ -1072,6 +1075,7 @@ async fn admitted_request(
         prompt_tokens,
         present,
         mut reservation,
+        session,
     } = admitted;
     let mut candidates = registry::candidates(&st, key.connection_id).await;
     if candidates.is_empty() {
@@ -1176,14 +1180,8 @@ async fn admitted_request(
         // From here the upstream is asked, so the request keeps its place in the minute even if its client
         // leaves before a row is written.
         reservation.sent();
-        let mut request = st
-            .http
-            .post(&url)
-            .header(
-                header::AUTHORIZATION,
-                format!("Bearer {}", conn.api_key.clone().unwrap_or_default()),
-            )
-            .json(&payload);
+        let mut request =
+            registry::authorized(st.http.post(&url), conn, session.as_ref()).json(&payload);
         // Only a single answer is given a deadline for the whole of it, because for that there is an end. A
         // stream is bounded by how long it goes quiet instead, and the same window is what bounds the wait for
         // its head: a connection that takes the request and never answers is a dead connection, not a slow
@@ -1466,16 +1464,14 @@ pub async fn list_models(AxumState(st): AxumState<State>, headers: HeaderMap) ->
     // OpenAI shape, so the first connection is asked for its own.
     // The model list is a single answer, not a stream, so the same deadline covers it as covers any single
     // answer, as the client's total deadline did before this change.
-    let result = st
-        .http
-        .get(registry::endpoint(&conn.base_url, "models"))
-        .header(
-            header::AUTHORIZATION,
-            format!("Bearer {}", conn.api_key.clone().unwrap_or_default()),
-        )
-        .timeout(st.limits.request_timeout())
-        .send()
-        .await;
+    let result = registry::authorized(
+        st.http.get(registry::endpoint(&conn.base_url, "models")),
+        &conn,
+        registry::client_session(&headers).as_ref(),
+    )
+    .timeout(st.limits.request_timeout())
+    .send()
+    .await;
     match result {
         Ok(upstream) => {
             let status = upstream.status();
