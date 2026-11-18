@@ -1,7 +1,6 @@
 use axum::extract::{Path, State as AxumState};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Json, Response};
-use chrono::{Duration, SecondsFormat, Utc};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use sqlx::Row;
@@ -48,8 +47,7 @@ pub fn plain_setup_code(code: &str) -> String {
 async fn issue_setup_code() -> Result<(String, String, String), String> {
     let code = new_setup_code();
     let hash = crate::auth::hash_password(&plain_setup_code(&code)).await?;
-    let expires_at =
-        (Utc::now() + Duration::days(SETUP_CODE_DAYS)).to_rfc3339_opts(SecondsFormat::Secs, true);
+    let expires_at = crate::clock::in_days(SETUP_CODE_DAYS);
     Ok((code, hash, expires_at))
 }
 
@@ -326,21 +324,37 @@ pub async fn update(
                     }
                 };
                 // A password the admin sets is the newest word on it, so a code given out before it can no
-                // longer replace it.
-                match sqlx::query(
+                // longer replace it. It also ends the account's sign-ins, as a reset with a code does, because an
+                // admin sets a password for someone most often when the old one is lost or known to someone else.
+                // An admin setting their own is the exception: the page they set it from is one of those
+                // sign-ins, and a session cannot be told apart from the others here.
+                let mut tx = match st.pool.begin().await {
+                    Ok(tx) => tx,
+                    Err(err) => return server_error(err),
+                };
+                if let Err(err) = sqlx::query(
                     "UPDATE users SET password_hash = ?, setup_code_hash = NULL, \
                      setup_code_expires_at = NULL WHERE id = ?",
                 )
                 .bind(&hash)
                 .bind(id)
-                .execute(&st.pool)
+                .execute(&mut *tx)
                 .await
                 {
-                    Ok(_) => changed.push(field.clone()),
-                    Err(err) => {
-                        return server_error(err);
-                    }
+                    return server_error(err);
                 }
+                if id != caller.id
+                    && let Err(err) = sqlx::query("DELETE FROM sessions WHERE user_id = ?")
+                        .bind(id)
+                        .execute(&mut *tx)
+                        .await
+                {
+                    return server_error(err);
+                }
+                if let Err(err) = tx.commit().await {
+                    return server_error(err);
+                }
+                changed.push(field.clone());
             }
             "enabled" => {
                 let Some(enabled) = value.as_bool() else {

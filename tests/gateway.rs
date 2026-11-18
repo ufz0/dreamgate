@@ -2445,7 +2445,12 @@ async fn an_admin_can_make_an_account_whose_password_is_set_with_a_one_time_code
     assert_eq!(created["role"], "user");
     let code = created["setup_code"].as_str().unwrap().to_string();
     assert_eq!(code.len(), 24, "five groups of four: {code}");
-    assert!(created["setup_code_expires_at"].as_str().unwrap() > "2026");
+    let expires_at = created["setup_code_expires_at"].as_str().unwrap();
+    assert!(
+        expires_at > dreamgate::clock::in_days(6).as_str()
+            && expires_at < dreamgate::clock::in_days(8).as_str(),
+        "a code works for seven days: {expires_at}"
+    );
 
     // Without the code nobody can set the password, and the answer is the one a wrong password gets, so it
     // does not say the account is waiting for one.
@@ -2557,7 +2562,7 @@ async fn an_admin_can_make_an_account_whose_password_is_set_with_a_one_time_code
 // become.
 #[tokio::test]
 async fn sign_ins_at_once_with_one_setup_code_let_one_in() {
-    let st = shared_state("first_sign_ins_at_once").await;
+    let st = shared_state("setup_code_sign_ins_at_once").await;
     let router = build_router(st.clone());
     let admin = register(&router, "ada").await;
     let (status, created) =
@@ -2601,6 +2606,161 @@ async fn sign_ins_at_once_with_one_setup_code_let_one_in() {
     )
     .await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+// A code given to an account that is disabled or waiting for approval is refused the way a sign-in there always
+// is, and is not used up by it, so it works once the account is let in. An empty code is no code, a code whose
+// time is missing does not work, and code sign-ins count toward the attempts an account is allowed.
+#[tokio::test]
+async fn a_setup_code_waits_for_the_account_to_be_let_in_and_counts_as_an_attempt() {
+    let st = test_state().await;
+    let router = build_router(st.clone());
+    let admin = register(&router, "ada").await;
+    let (_, made) = post_json(&router, "/api/users", &admin, json!({ "username": "ben" })).await;
+    let ben = made["id"].as_i64().unwrap();
+    let code = made["setup_code"].as_str().unwrap().to_string();
+
+    // Disabled: refused as disabled, and the code is still there afterwards.
+    let set = |id: i64, body: Value| {
+        let router = router.clone();
+        let admin = admin.clone();
+        async move {
+            let (status, _) = send_json(
+                &router,
+                http::Method::PATCH,
+                &format!("/api/users/{id}"),
+                &admin,
+                body,
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK);
+        }
+    };
+    set(ben, json!({ "enabled": false })).await;
+    let (status, body, _) = sign_in_with_code(&router, "ben", &code, "bens-password").await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(body["error"]["type"], "account_disabled");
+    set(ben, json!({ "enabled": true })).await;
+
+    // An empty or blank code is no code, so the sign-in is a password one, and there is no password yet.
+    for blank in ["", "  ", "--"] {
+        let (status, body, _) = sign_in_with_code(&router, "ben", blank, "bens-password").await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{blank:?}");
+        assert_eq!(
+            body["error"]["message"],
+            "username or password is not correct"
+        );
+    }
+    let (status, _, _) = sign_in_with_code(&router, "ben", &code, "bens-password").await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the code outlived the time the account was off"
+    );
+
+    // Waiting for approval: refused as pending, and the code works once the account is approved.
+    open_registration(&router, &admin).await;
+    let (_, registered) = post_json(
+        &router,
+        "/api/register",
+        "",
+        json!({ "username": "cy", "password": "cys-first-password" }),
+    )
+    .await;
+    let cy = registered["id"].as_i64().unwrap();
+    let (_, issued) = post_json(
+        &router,
+        &format!("/api/users/{cy}/setup-code"),
+        &admin,
+        json!({}),
+    )
+    .await;
+    let cy_code = issued["setup_code"].as_str().unwrap().to_string();
+    let (status, body, _) = sign_in_with_code(&router, "cy", &cy_code, "cys-new-password").await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(body["error"]["type"], "account_pending");
+    set(cy, json!({ "pending": false })).await;
+    let (status, _, _) = sign_in_with_code(&router, "cy", &cy_code, "cys-new-password").await;
+    assert_eq!(status, StatusCode::OK);
+
+    // A code whose time is missing does not work.
+    let (_, made) = post_json(&router, "/api/users", &admin, json!({ "username": "dee" })).await;
+    sqlx::query("UPDATE users SET setup_code_expires_at = NULL WHERE username = 'dee'")
+        .execute(&st.pool)
+        .await
+        .unwrap();
+    let (status, _, _) = sign_in_with_code(
+        &router,
+        "dee",
+        made["setup_code"].as_str().unwrap(),
+        "dees-password",
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+    // Code sign-ins count toward the attempts: past the tenth, even the right code is turned away.
+    let (_, made) = post_json(&router, "/api/users", &admin, json!({ "username": "eve" })).await;
+    for _ in 0..10 {
+        sign_in_with_code(&router, "eve", "0000-0000-0000-0000-0000", "eves-password").await;
+    }
+    let (status, _, _) = sign_in_with_code(
+        &router,
+        "eve",
+        made["setup_code"].as_str().unwrap(),
+        "eves-password",
+    )
+    .await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+}
+
+// A password an admin sets for someone else signs that account out; one an admin sets for themselves leaves the
+// page they set it from signed in.
+#[tokio::test]
+async fn a_password_an_admin_sets_signs_the_other_account_out() {
+    let st = test_state().await;
+    let router = build_router(st.clone());
+    let admin = register(&router, "ada").await;
+    let ada = get_json(&router, "/api/me", &admin).await["id"]
+        .as_i64()
+        .unwrap();
+    let (_, made) = post_json(&router, "/api/users", &admin, json!({ "username": "ben" })).await;
+    let ben = made["id"].as_i64().unwrap();
+    let (_, _, session) = sign_in_with_code(
+        &router,
+        "ben",
+        made["setup_code"].as_str().unwrap(),
+        "bens-password",
+    )
+    .await;
+    let session = session.unwrap();
+    let me = |cookie: String| {
+        let router = router.clone();
+        async move {
+            call(
+                &router,
+                Request::get("/api/me")
+                    .header("cookie", cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .status()
+        }
+    };
+    for (id, password) in [(ben, "set-by-the-admin"), (ada, "the-admins-own-new")] {
+        let (status, _) = send_json(
+            &router,
+            http::Method::PATCH,
+            &format!("/api/users/{id}"),
+            &admin,
+            json!({ "password": password }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+    }
+    assert_eq!(me(session).await, StatusCode::UNAUTHORIZED);
+    assert_eq!(me(admin.clone()).await, StatusCode::OK);
+    sign_in(&router, "ben", "set-by-the-admin").await;
 }
 
 // A new code replaces the one before it and resets a password the person already has: the old password works

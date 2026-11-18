@@ -1223,8 +1223,9 @@ function renderAuth() {
   setMode(open && (firstAccount || mode === 'register') ? 'register' : 'login');
 }
 
-// An account made by an admin has no password until the person signs in for the first time, so
-// the entry screen says which password becomes theirs. It only applies once accounts exist.
+// An account made by an admin has no password until the person signs in with the setup code the admin gave
+// them, and a password an admin resets is set the same way, so the entry screen points to the code. It only
+// applies once accounts exist.
 function showFirstPasswordNote() {
   const login = state.settings.has_accounts && mode === 'login';
   $('first-password-note').hidden = !login;
@@ -1239,7 +1240,7 @@ function showSetupCodeField(open) {
   $('setup-code-toggle').setAttribute('aria-expanded', String(open));
   $('setup-code-toggle').textContent = open ? 'Sign in with a password instead' : 'I have a setup code';
   $('password-label').textContent = open ? 'New password' : 'Password';
-  $('auth-password').autocomplete = open ? 'new-password' : 'current-password';
+  $('auth-password').autocomplete = open || mode === 'register' ? 'new-password' : 'current-password';
   if (!open) $('setup-code-field').querySelector('input').value = '';
 }
 
@@ -1500,9 +1501,11 @@ $('account-form').addEventListener('submit', async (event) => {
   try {
     const created = await postJson('/api/users', body);
     form.reset();
-    await refresh('stats');
-    notice(`Made account "${created.username}".`);
+    // The code is shown before anything else is read, because it is shown only once: a list that then fails
+    // to load must not be what keeps it from the admin.
     showSetupCode(created, 'made');
+    notice(`Made account "${created.username}".`);
+    await refresh('stats');
   } catch (err) {
     report(err);
   }
@@ -1598,10 +1601,23 @@ document.addEventListener('click', async (event) => {
   }
   if (button.dataset.setupCode) {
     const user = account(button.dataset.setupCode);
-    try {
+    const issue = async () => {
       const issued = await postJson(`/api/users/${user.id}/setup-code`, {});
+      showSetupCode(issued, user.has_password ? 'reset' : 'made');
       await refresh('stats');
-      showSetupCode(issued, 'reset');
+    };
+    // A code that still works may already be on its way to the person, and a new one makes it useless.
+    if (user.setup_code_expires_at && new Date(user.setup_code_expires_at) > new Date()) {
+      confirmAction(
+        'Replace the setup code?',
+        `The code "${user.username}" was given still works until ${utcTime(user.setup_code_expires_at)}. A new one replaces it, and the old one stops working.`,
+        'Replace',
+        issue,
+      );
+      return;
+    }
+    try {
+      await issue();
     } catch (err) {
       report(err);
     }

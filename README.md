@@ -17,15 +17,19 @@ network can reach the same port. Accounts sign in with a username and a password
 no email addresses. The first account to register is the admin; everyone after that is a normal
 user. An admin is the only one who can change an account, and sees every key and every account;
 users see their own. An admin can also make an account directly, with a username and a daily
-limit, while self-registration is closed — that person chooses their own password when they sign
-in for the first time.
+limit, while self-registration is closed — the admin is given a one-time setup code for it, and the
+person chooses their own password when they sign in with that code.
 
 A database written before this change is migrated on start: the stored display name becomes the
 username, the email column is dropped, a password column that was required is rebuilt so it can be
 left empty, the approval flag is added, the `max_concurrent` column is added to connections and left
-empty for the rows written before it, and existing accounts keep their limits and are enabled by
-default. A connection row with no `max_concurrent` keeps its meaning: it never stated a capability, so
-the default applies to it, which is not the same as a capability of one. A table that has to be rebuilt
+empty for the rows written before it, the setup code columns (`setup_code_hash`,
+`setup_code_expires_at`) are added to accounts and left empty, and existing accounts keep their
+limits and are enabled by default. A connection row with no `max_concurrent` keeps its meaning: it
+never stated a capability, so the default applies to it, which is not the same as a capability of
+one. An account with no setup code keeps its meaning too where it has a password, which it signs in
+with as before; one made by an admin before setup codes that never got a password can no longer be
+claimed by whoever signs in first, and waits for an admin to give it a code. A table that has to be rebuilt
 for this is rebuilt in one transaction, so a start that stops partway, on a full disk or in a crash,
 leaves that table as it was, and the next start migrates whatever is still in an older shape; each step
 reads the shape before it acts, so one that already finished is not run again. A new table that an older start left
@@ -608,12 +612,17 @@ there; the first account is never held, because there is no one to approve it, a
 admin made is not held either, because that admin approved it by making it.
 
 An account is identified by its username, and the only fields are the username, the password,
-the role, the daily limit, whether it is enabled, and whether it is waiting for approval.
+the role, the daily limit, whether it is enabled, whether it is waiting for approval, and a setup
+code given to it, stored as its hash with the time it stops working. A code belongs to the account
+rather than to its name, so after a rename it is used with the new name.
 Disabling an account signs it out, refuses its keys at the gateway with 403, and stops a new
 sign-in; deleting it takes the account, its keys, its sessions and everything recorded for it,
 because those reference it with `ON DELETE CASCADE`. An admin cannot delete the account they are
 signed in with. Changing one field changes only that field, so setting a password does not clear a
-limit.
+limit. A password an admin sets cancels a setup code given before it and signs the account out, as a
+reset with a code does, because a password is set for someone most often when the old one is lost or
+known to someone else; an admin setting their own password stays signed in, because the page they set
+it from is one of those sessions and cannot be told apart from the others.
 
 It follows the system theme with a manual light/dark toggle next to Sign out, the sidebar collapses
 to an icon rail and becomes a drawer under 768px, and deleting a key, an account or a connection
@@ -634,8 +643,13 @@ a session or a DreamGate key.
   a session token travel in the clear, which is what the `0.0.0.0` default means on a shared network.
 - A session row is refused after the window the cookie lasts (30 days), so a token taken from a shared
   browser and replayed does not work forever.
-- Sign-in attempts are bounded to 10 per account per minute, and an unknown username answers exactly as
-  a wrong password does, so an attempt cannot be used to list the accounts. Registering does say when a
+- Sign-in attempts are bounded to 10 per account per minute, a code given with a sign-in counting like a
+  password, and an unknown username answers exactly as a wrong password does, so an attempt cannot be
+  used to list the accounts. It takes as long as one too: every refusal costs one bcrypt check, against
+  a hash nothing matches where there is nothing else to check — no account, no password yet, no code
+  given — so the time an answer takes does not say which usernames exist or which accounts are waiting
+  for a code. An account that is waiting for approval or disabled is told so before its password is
+  checked, which does say that it exists. Registering does say when a
   username is taken, because the person has to pick another, so while self-registration is open a name
   can be tried there; a name that is free becomes an account, held for approval by default. While
   registration is closed the answer is 403 before the name is checked against the accounts. A state-changing request
@@ -719,11 +733,13 @@ first account, approval being on by default and blocking a sign-in until an admi
 account made by an admin signed into only with its setup code, the code used once, typed in any case and
 without its dashes, and refused with one answer when it is wrong, expired, or given for a username nobody has,
 a new code resetting a password that keeps working until it is used, then signing out the account's sessions,
-a password the admin sets cancelling a code, an account from before codes with no password claimed by nobody
-until it is given one, the account races, run against several
-database connections at once: many registrations at the same moment on an empty instance making one admin
-that is not held for approval, and two sign-ins at the same moment with one setup code letting one in, with
-the other refused and the stored password the one that was let in, the account actions (disable,
+a password the admin sets cancelling a code and signing the other account out while the admin's own stays signed
+in, a code waiting for a disabled or pending account and working once it is let in, a blank code read as none,
+a code with no time refused, code sign-ins counting toward the attempt limit, a code working for seven days, an
+account from before codes with no password claimed by nobody until it is given one, the account races, run
+against several database connections at once: many registrations at the same moment on an empty instance making
+one admin that is not held for approval, and two sign-ins at the same moment with one setup code letting one in,
+with the other refused and the stored password the one that was let in, the account actions (disable,
 rename, new password, approve, delete) and what they do to a sign-in, a key and the recorded usage,
 that deleting a key leaves the rows recorded for it and the
 counters standing, the presence counts while a request is in flight, a stream's progress reaching the live

@@ -112,6 +112,19 @@ pub async fn hash_password(password: &str) -> Result<String, String> {
     joined.map_err(|err| err.to_string())
 }
 
+// A hash nothing matches, checked where a sign-in has nothing to check against: no account by that name, no
+// password yet, no code given out. A wrong password costs one bcrypt check, so every refusal costs one, and the
+// time an answer takes does not say which usernames exist or which accounts are waiting for a code. It is made
+// on the blocking pool the first time it is needed, like any other hash.
+static NOTHING_TO_CHECK: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    bcrypt::hash("there is nothing to check this against", 10).unwrap_or_default()
+});
+
+async fn check_nothing(given: &str) {
+    let given = given.to_string();
+    let _ = tokio::task::spawn_blocking(move || bcrypt::verify(&given, &NOTHING_TO_CHECK)).await;
+}
+
 pub async fn password_matches(password: &str, hash: &str) -> bool {
     let password = password.to_string();
     let hash = hash.to_string();
@@ -353,7 +366,9 @@ pub async fn login(
             )
         }
     };
+    let given = setup_code.as_deref().unwrap_or(&body.password).to_string();
     let Some(row) = row else {
+        check_nothing(&given).await;
         return refused();
     };
     if row.get::<i64, _>("pending") == 1 {
@@ -378,14 +393,15 @@ pub async fn login(
         // A setup code sets the password, on an account that has none yet or as a reset of one that has.
         (Some(code), _) => {
             let Some(stored) = row.get::<Option<String>, _>("setup_code_hash") else {
+                check_nothing(&code).await;
                 return refused();
             };
-            // The expiry is RFC 3339 text in UTC, written the way `clock::now` writes, so the two compare as
-            // text.
-            let live = row
-                .get::<Option<String>, _>("setup_code_expires_at")
-                .is_some_and(|expires_at| expires_at > crate::clock::now());
-            if !live || !password_matches(&code, &stored).await {
+            // The code is checked whether or not it has expired, so an expired code takes as long to refuse as
+            // a wrong one. The expiry is RFC 3339 text in UTC, written by `clock`, so the two compare as text.
+            let expires_at = row.get::<Option<String>, _>("setup_code_expires_at");
+            let matched = password_matches(&code, &stored).await;
+            let now = crate::clock::now();
+            if !matched || expires_at.as_deref().is_none_or(|at| at <= now.as_str()) {
                 return refused();
             }
             let hash = match hash_password(&body.password).await {
@@ -399,14 +415,24 @@ pub async fn login(
             // code that does not work. The write also has to find the account still enabled and not held,
             // because an admin can change either while the password is being hashed, and a sign-in that lands
             // after that is not let in on what it read before.
+            // The code is checked again for its time as well, which may have passed while the password was hashed.
+            // A new password ends the sign-ins made with the old one, because a reset is most often asked for when
+            // the old one is lost or known to someone else, and the two writes land together or not at all, so a
+            // password is never changed with the old sessions left in place.
+            let mut tx = match st.pool.begin().await {
+                Ok(tx) => tx,
+                Err(err) => return server_error(err),
+            };
             match sqlx::query(
                 "UPDATE users SET password_hash = ?, setup_code_hash = NULL, setup_code_expires_at = NULL \
-                 WHERE id = ? AND setup_code_hash = ? AND enabled = 1 AND pending = 0",
+                 WHERE id = ? AND setup_code_hash = ? AND setup_code_expires_at > ? AND enabled = 1 \
+                 AND pending = 0",
             )
             .bind(&hash)
             .bind(id)
             .bind(&stored)
-            .execute(&st.pool)
+            .bind(crate::clock::now())
+            .execute(&mut *tx)
             .await
             {
                 Ok(done) if done.rows_affected() == 1 => {}
@@ -415,13 +441,14 @@ pub async fn login(
                     return server_error(err);
                 }
             }
-            // A new password ends the sign-ins made with the old one: a reset is most often asked for because
-            // the old one is lost or known to someone else.
             if let Err(err) = sqlx::query("DELETE FROM sessions WHERE user_id = ?")
                 .bind(id)
-                .execute(&st.pool)
+                .execute(&mut *tx)
                 .await
             {
+                return server_error(err);
+            }
+            if let Err(err) = tx.commit().await {
                 return server_error(err);
             }
         }
@@ -432,7 +459,10 @@ pub async fn login(
         }
         // An account with no password is signed into only with a setup code. Without one it is answered as a
         // wrong password, so the answer does not say which accounts are waiting for a code.
-        (None, None) => return refused(),
+        (None, None) => {
+            check_nothing(&body.password).await;
+            return refused();
+        }
     }
 
     let token = match create_session(&st, id).await {
