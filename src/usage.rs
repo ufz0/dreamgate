@@ -29,15 +29,25 @@ pub struct UsageRow {
     pub stream: Option<u64>,
 }
 
-pub async fn record(st: &State, row: &UsageRow) -> Result<(), sqlx::Error> {
-    let event = write(st, row).await?;
+pub async fn record(
+    st: &State,
+    row: &UsageRow,
+    written: impl FnOnce(i64),
+) -> Result<(), sqlx::Error> {
+    let event = write(st, row, written).await?;
     let _ = st.hub.send(HubEvent::Usage(event));
     Ok(())
 }
 
 // Writes the row and returns the event a page is sent for it without sending it, for the stream task,
-// which sends it in the same step that takes the stream off the list of streams in flight.
-pub async fn write(st: &State, row: &UsageRow) -> Result<LiveEvent, sqlx::Error> {
+// which sends it in the same step that takes the stream off the list of streams in flight. `written` is given
+// the row's id as soon as the row is in, before the names the event carries are read, because what holds the
+// request against its limits has to know which readings of the rows include it (`reservations`).
+pub async fn write(
+    st: &State,
+    row: &UsageRow,
+    written: impl FnOnce(i64),
+) -> Result<LiveEvent, sqlx::Error> {
     let id = sqlx::query(
         "INSERT INTO usage (api_key_id, user_id, connection_id, model, prompt_tokens, \
          completion_tokens, total_tokens, cached_tokens, prompt_ms, generation_ms, latency_ms, \
@@ -62,6 +72,7 @@ pub async fn write(st: &State, row: &UsageRow) -> Result<LiveEvent, sqlx::Error>
     .fetch_one(&st.pool)
     .await?
     .get::<i64, _>("id");
+    written(id);
 
     let key_name = sqlx::query("SELECT name FROM api_keys WHERE id = ?")
         .bind(row.api_key_id)
