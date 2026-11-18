@@ -18,6 +18,8 @@ pub struct CreateKey {
     pub model: Option<String>,
     pub rpm_limit: Option<i64>,
     pub token_cap: Option<i64>,
+    pub daily_token_cap: Option<i64>,
+    pub monthly_token_cap: Option<i64>,
     pub expires_at: Option<String>,
 }
 
@@ -29,6 +31,8 @@ pub struct UpdateKey {
     pub enabled: Option<bool>,
     pub rpm_limit: Option<i64>,
     pub token_cap: Option<i64>,
+    pub daily_token_cap: Option<i64>,
+    pub monthly_token_cap: Option<i64>,
     // Left out, the expiry stays as it is; null clears it, so the key no longer expires.
     #[serde(default, deserialize_with = "given")]
     pub expires_at: Option<Option<String>>,
@@ -96,6 +100,9 @@ fn key_hint(key: &str) -> String {
 // request, read from the rows rather than written on every request; a request refused before it was recorded,
 // and a model list, do not count.
 const KEY_SQL: &str = "SELECT k.id, k.name, k.key, k.model, k.connection_id, k.enabled, k.rpm_limit, k.token_cap, \
+        k.daily_token_cap, k.monthly_token_cap, \
+        COALESCE(SUM(CASE WHEN r.created_at >= ? THEN r.total_tokens END), 0) AS used_today, \
+        COALESCE(SUM(CASE WHEN r.created_at >= ? THEN r.total_tokens END), 0) AS used_this_month, \
         k.created_at, k.expires_at, MAX(r.created_at) AS last_used_at, c.name AS connection, u.username AS owner, \
         COUNT(r.id) AS requests, COALESCE(SUM(r.total_tokens), 0) AS tokens, \
         COALESCE(SUM(r.prompt_tokens), 0) AS prompt_tokens, \
@@ -113,7 +120,12 @@ async fn key_rows(
     reveal: bool,
 ) -> Result<Vec<serde_json::Value>, sqlx::Error> {
     let sql = KEY_SQL.replace("{scope}", scope);
+    // The day and the month in UTC, from their first moment, written as the rows write a moment, the same bounds
+    // the gateway reads a key's limits with.
+    let now = chrono::Utc::now();
     let rows = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
+        .bind(format!("{}T00:00:00Z", now.format("%Y-%m-%d")))
+        .bind(format!("{}-01T00:00:00Z", now.format("%Y-%m")))
         .bind(user_id)
         .fetch_all(&st.pool)
         .await?;
@@ -133,6 +145,10 @@ async fn key_rows(
                 "enabled": row.get::<i64, _>("enabled") != 0,
                 "rpm_limit": row.get::<Option<i64>, _>("rpm_limit"),
                 "token_cap": row.get::<Option<i64>, _>("token_cap"),
+                "daily_token_cap": row.get::<Option<i64>, _>("daily_token_cap"),
+                "monthly_token_cap": row.get::<Option<i64>, _>("monthly_token_cap"),
+                "used_today": row.get::<i64, _>("used_today"),
+                "used_this_month": row.get::<i64, _>("used_this_month"),
                 "requests": row.get::<i64, _>("requests"),
                 "tokens": row.get::<i64, _>("tokens"),
                 "prompt_tokens": row.get::<i64, _>("prompt_tokens"),
@@ -185,8 +201,14 @@ pub async fn create(
         );
     }
     // A limit of 0 would refuse every request, so a limit is a positive number or absent.
-    if body.rpm_limit.is_some_and(|value| value < 1)
-        || body.token_cap.is_some_and(|value| value < 1)
+    if [
+        body.rpm_limit,
+        body.token_cap,
+        body.daily_token_cap,
+        body.monthly_token_cap,
+    ]
+    .iter()
+    .any(|limit| limit.is_some_and(|value| value < 1))
     {
         return error(
             StatusCode::BAD_REQUEST,
@@ -208,7 +230,7 @@ pub async fn create(
     let key = new_key();
     let result = sqlx::query(
         "INSERT INTO api_keys (user_id, name, key, connection_id, model, rpm_limit, token_cap, created_at, \
-         expires_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id",
+         expires_at, daily_token_cap, monthly_token_cap) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id",
     )
     .bind(caller.id)
     .bind(&name)
@@ -219,6 +241,8 @@ pub async fn create(
     .bind(body.token_cap)
     .bind(crate::clock::now())
     .bind(&expires_at)
+    .bind(body.daily_token_cap)
+    .bind(body.monthly_token_cap)
     .fetch_one(&st.pool)
     .await;
     match result {
@@ -277,6 +301,22 @@ pub async fn update(
             None => return error(StatusCode::NOT_FOUND, "not_found", "key not found"),
         }
     }
+    // A limit of 0 would refuse every request, as it would when a key is made, so it is refused here too.
+    if [
+        body.rpm_limit,
+        body.token_cap,
+        body.daily_token_cap,
+        body.monthly_token_cap,
+    ]
+    .iter()
+    .any(|limit| limit.is_some_and(|value| value < 1))
+    {
+        return error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "limits must be a positive number, or left out",
+        );
+    }
     // Read before anything is written, so an expiry that cannot be read changes nothing else either.
     let expires_at = match &body.expires_at {
         None => None,
@@ -293,7 +333,9 @@ pub async fn update(
         "UPDATE api_keys SET expires_at = CASE WHEN ? THEN ? ELSE expires_at END, \
                 name = COALESCE(?, name), connection_id = COALESCE(?, connection_id), \
                 model = COALESCE(?, model), enabled = COALESCE(?, enabled), \
-                rpm_limit = COALESCE(?, rpm_limit), token_cap = COALESCE(?, token_cap) \
+                rpm_limit = COALESCE(?, rpm_limit), token_cap = COALESCE(?, token_cap), \
+                daily_token_cap = COALESCE(?, daily_token_cap), \
+                monthly_token_cap = COALESCE(?, monthly_token_cap) \
          WHERE id = ?",
     )
     .bind(expires_at.is_some())
@@ -304,6 +346,8 @@ pub async fn update(
     .bind(body.enabled.map(|v| v as i64))
     .bind(body.rpm_limit)
     .bind(body.token_cap)
+    .bind(body.daily_token_cap)
+    .bind(body.monthly_token_cap)
     .bind(id)
     .execute(&st.pool)
     .await;

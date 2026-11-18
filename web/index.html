@@ -184,6 +184,16 @@
               <input id="key-token-cap" name="token_cap" type="number" min="1" aria-describedby="key-token-cap-help">
             </div>
             <div class="field">
+              <label for="key-daily-cap">Daily token limit</label>
+              <p class="help" id="key-daily-cap-help">Input and output tokens this key may use in a day, counted from 00:00 UTC.</p>
+              <input id="key-daily-cap" name="daily_token_cap" type="number" min="1" aria-describedby="key-daily-cap-help">
+            </div>
+            <div class="field">
+              <label for="key-monthly-cap">Monthly token limit</label>
+              <p class="help" id="key-monthly-cap-help">Input and output tokens this key may use in a calendar month in UTC.</p>
+              <input id="key-monthly-cap" name="monthly_token_cap" type="number" min="1" aria-describedby="key-monthly-cap-help">
+            </div>
+            <div class="field">
               <label for="key-expires">Expires</label>
               <p class="help" id="key-expires-help">The key works through this day in UTC and is refused after it. Leave it empty for a key that does not expire.</p>
               <input id="key-expires" name="expires_at" type="date" max="9999-12-30" aria-describedby="key-expires-help">

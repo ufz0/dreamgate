@@ -14,11 +14,12 @@ use crate::api::{error, logged};
 use crate::limits::Admission;
 use crate::presence::{self, Active};
 use crate::registry::{self, Connection};
-use crate::reservations::{Ask, Reading, Refusal, Reservation};
+use crate::reservations::{Ask, Left, Reading, Refusal, Reservation, Window};
 use crate::shutdown::Phase;
 use crate::state::State;
 use crate::tokens;
 use crate::usage::{self, UsageRow};
+use chrono::Utc;
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
@@ -32,6 +33,8 @@ pub struct KeyInfo {
     pub enabled: bool,
     pub rpm_limit: Option<i64>,
     pub token_cap: Option<i64>,
+    pub daily_token_cap: Option<i64>,
+    pub monthly_token_cap: Option<i64>,
     pub expires_at: Option<String>,
 }
 
@@ -51,8 +54,8 @@ fn virtual_key(headers: &HeaderMap) -> Option<String> {
 
 async fn lookup_key(st: &State, raw: &str) -> Result<Option<KeyInfo>, sqlx::Error> {
     let row = sqlx::query(
-        "SELECT id, user_id, name, connection_id, model, enabled, rpm_limit, token_cap, expires_at \
-         FROM api_keys WHERE key = ?",
+        "SELECT id, user_id, name, connection_id, model, enabled, rpm_limit, token_cap, daily_token_cap, \
+         monthly_token_cap, expires_at FROM api_keys WHERE key = ?",
     )
     .bind(raw)
     .fetch_optional(&st.pool)
@@ -66,6 +69,8 @@ async fn lookup_key(st: &State, raw: &str) -> Result<Option<KeyInfo>, sqlx::Erro
         enabled: row.get::<i64, _>("enabled") != 0,
         rpm_limit: row.get::<Option<i64>, _>("rpm_limit"),
         token_cap: row.get::<Option<i64>, _>("token_cap"),
+        daily_token_cap: row.get::<Option<i64>, _>("daily_token_cap"),
+        monthly_token_cap: row.get::<Option<i64>, _>("monthly_token_cap"),
         expires_at: row.get::<Option<String>, _>("expires_at"),
     }))
 }
@@ -212,6 +217,24 @@ async fn enforce_limits(
                     in_flight_note(in_flight)
                 ),
             ),
+            Refusal::KeyDayCap { cap, in_flight } => error(
+                StatusCode::TOO_MANY_REQUESTS,
+                "token_cap",
+                format!(
+                    "key '{}' has used its daily token limit of {cap} input and output tokens{}",
+                    key.name,
+                    in_flight_note(in_flight)
+                ),
+            ),
+            Refusal::KeyMonthCap { cap, in_flight } => error(
+                StatusCode::TOO_MANY_REQUESTS,
+                "token_cap",
+                format!(
+                    "key '{}' has used its monthly token limit of {cap} input and output tokens{}",
+                    key.name,
+                    in_flight_note(in_flight)
+                ),
+            ),
             Refusal::DayCap { cap, in_flight } => error(
                 StatusCode::TOO_MANY_REQUESTS,
                 "token_cap",
@@ -286,6 +309,52 @@ async fn enforce_limits(
             in_flight: 0,
         }));
     }
+    // A key's day and month are UTC, as the account's day is, and are read from the moment they began written as
+    // the rows write a moment, so the comparison is one of text and the rows are found through the key's index.
+    let today = Utc::now();
+    let windows = [
+        (
+            key.daily_token_cap,
+            format!("{}T00:00:00Z", today.format("%Y-%m-%d")),
+            Window::KeyDay,
+        ),
+        (
+            key.monthly_token_cap,
+            format!("{}-01T00:00:00Z", today.format("%Y-%m")),
+            Window::KeyMonth,
+        ),
+    ];
+    let mut key_windows = [None, None];
+    for (slot, (cap, since, window)) in key_windows.iter_mut().zip(windows) {
+        let Some(cap) = cap else { continue };
+        let read = match sqlx::query(
+            "SELECT COALESCE(SUM(total_tokens), 0) AS used, \
+             (SELECT COALESCE(MAX(id), 0) FROM usage) AS seen FROM usage \
+             WHERE api_key_id = ? AND created_at >= ?",
+        )
+        .bind(key.id)
+        .bind(since)
+        .fetch_one(&st.pool)
+        .await
+        {
+            Ok(row) => reading(cap, row),
+            Err(err) => return Err(Box::new(unreadable(err))),
+        };
+        if read.used >= read.limit {
+            return Err(refuse(match window {
+                Window::KeyDay => Refusal::KeyDayCap {
+                    cap: read.limit,
+                    in_flight: 0,
+                },
+                _ => Refusal::KeyMonthCap {
+                    cap: read.limit,
+                    in_flight: 0,
+                },
+            }));
+        }
+        *slot = Some(read);
+    }
+    let [key_day_cap, key_month_cap] = key_windows;
     let day_cap = match account.get::<Option<i64>, _>("daily_token_cap") {
         Some(cap) => match sqlx::query(
             "SELECT COALESCE(SUM(total_tokens), 0) AS used, \
@@ -316,9 +385,52 @@ async fn enforce_limits(
         read_at,
         rpm,
         key_cap,
+        key_day_cap,
+        key_month_cap,
         day_cap,
     };
     st.reservations.reserve(ask).map_err(refuse)
+}
+
+// What was left of the limits when the request was admitted, before it, so a client can slow down before it is
+// refused rather than after. The token figure is the limit with the least left, named by its window; requests
+// still running count by their estimated input, as they do for the limit itself. A warning is added once a
+// fifth or less of a token limit is left. The names are the gateway's own: the `x-ratelimit-*` an OpenAI client
+// may read mean a window of a minute, and these windows are a day, a month, or a key's whole life.
+const WARN_BELOW_PERCENT: i64 = 20;
+
+fn left_headers(response: &mut Response, key: &KeyInfo, left: Left) {
+    let headers = response.headers_mut();
+    let number = |value: i64| HeaderValue::from(value.max(0));
+    if let Some((limit, remaining)) = left.requests {
+        headers.insert("x-dreamgate-requests-limit", number(limit));
+        headers.insert("x-dreamgate-requests-remaining", number(remaining));
+    }
+    if let Some((window, limit, remaining)) = left.tokens {
+        headers.insert("x-dreamgate-tokens-limit", number(limit));
+        headers.insert("x-dreamgate-tokens-remaining", number(remaining));
+        headers.insert(
+            "x-dreamgate-tokens-window",
+            HeaderValue::from_static(window.label()),
+        );
+        if remaining.saturating_mul(100) <= limit.saturating_mul(WARN_BELOW_PERCENT) {
+            let whose = match window {
+                Window::AccountDay => "the account's daily token limit".to_string(),
+                Window::Key => format!("key '{}'s token cap", key.name),
+                Window::KeyDay => format!("key '{}'s daily token limit", key.name),
+                Window::KeyMonth => format!("key '{}'s monthly token limit", key.name),
+            };
+            let warning = format!(
+                "{} input and output tokens of {whose} of {limit} were left before this request",
+                remaining.max(0)
+            );
+            // A key's name is the account's own text, so one a header cannot carry leaves the warning out
+            // rather than the answer.
+            if let Ok(value) = HeaderValue::from_str(&warning) {
+                headers.insert("x-dreamgate-budget-warning", value);
+            }
+        }
+    }
 }
 
 // A cap reached with requests still running counts their input as the gateway estimated it, so the answer
@@ -917,7 +1029,10 @@ async fn forward(st: State, headers: HeaderMap, body: Value, endpoint: Endpoint)
         Ok(reservation) => reservation,
         Err(blocked) => return *blocked,
     };
-
+    // Every answer from here on carries what was left of the key's and the account's limits when the request was
+    // admitted, so the tail is one block whose answer the headers are added to, whichever way it ends.
+    let left = reservation.left();
+    let mut response = async {
     let mut candidates = registry::candidates(&st, key.connection_id).await;
     if candidates.is_empty() {
         return error(
@@ -1244,6 +1359,10 @@ async fn forward(st: State, headers: HeaderMap, body: Value, endpoint: Endpoint)
         );
     }
     error(StatusCode::BAD_GATEWAY, "upstream_unavailable", last_error)
+    }
+    .await;
+    left_headers(&mut response, &key, left);
+    response
 }
 
 // The models the connections listed at their last checks, each once, in the order of the key's connections,

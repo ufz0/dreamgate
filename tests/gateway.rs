@@ -7385,3 +7385,185 @@ async fn a_keys_expiry_is_read_exactly_and_a_refused_change_changes_nothing() {
     assert!(rotated["key"].as_str().unwrap().starts_with("dreamgate_"));
     assert_ne!(rotated["key"], bens["key"]);
 }
+
+// A key's day and month limits hold, each refused with its own message, and a row from before either began counts
+// toward neither. Every answer says what was left of the limits when the request was admitted: the requests in
+// the minute, and the token limit with the least left, with a warning once a fifth or less of it is left.
+#[tokio::test]
+async fn a_keys_day_and_month_limits_hold_and_each_answer_says_what_was_left() {
+    let st = test_state().await;
+    let router = build_router(st.clone());
+    let base_url = mock_upstream().await;
+    let admin = register(&router, "ada").await;
+    let ada = get_json(&router, "/api/me", &admin).await["id"]
+        .as_i64()
+        .unwrap();
+    post_json(
+        &router,
+        "/api/connections",
+        &admin,
+        json!({ "name": "test", "base_url": base_url, "default_model": "reports-usage" }),
+    )
+    .await;
+    let body = json!({ "messages": [{ "role": "user", "content": "hi" }] });
+    let header = |response: &Response, name: &str| {
+        response
+            .headers()
+            .get(name)
+            .map(|value| value.to_str().unwrap().to_string())
+    };
+
+    // The mock reports 11 tokens in and 7 out, 18 a request.
+    let (_, daily) = post_json(
+        &router,
+        "/api/keys",
+        &admin,
+        json!({ "name": "daily", "daily_token_cap": 40, "monthly_token_cap": 1000, "rpm_limit": 10 }),
+    )
+    .await;
+    sqlx::query(
+        "INSERT INTO usage (api_key_id, user_id, model, prompt_tokens, completion_tokens, total_tokens, latency_ms, \
+         status, created_at) VALUES (?, ?, 'm', 400, 100, 500, 5, 200, '2020-01-01T00:00:00Z')",
+    )
+    .bind(daily["id"].as_i64().unwrap())
+    .bind(ada)
+    .execute(&st.pool)
+    .await
+    .unwrap();
+    let key = daily["key"].as_str().unwrap().to_string();
+    let expected = [("40", "10", false), ("22", "9", false), ("4", "8", true)];
+    for (tokens_left, requests_left, warned) in expected {
+        let response = gateway_call(&router, &key, body.clone()).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            header(&response, "x-dreamgate-tokens-limit").as_deref(),
+            Some("40")
+        );
+        assert_eq!(
+            header(&response, "x-dreamgate-tokens-remaining").as_deref(),
+            Some(tokens_left)
+        );
+        assert_eq!(
+            header(&response, "x-dreamgate-tokens-window").as_deref(),
+            Some("key-day")
+        );
+        assert_eq!(
+            header(&response, "x-dreamgate-requests-limit").as_deref(),
+            Some("10")
+        );
+        assert_eq!(
+            header(&response, "x-dreamgate-requests-remaining").as_deref(),
+            Some(requests_left)
+        );
+        assert_eq!(
+            header(&response, "x-dreamgate-budget-warning").is_some(),
+            warned,
+            "{tokens_left} left"
+        );
+    }
+    let response = gateway_call(&router, &key, body.clone()).await;
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    let refused = json_body(response).await;
+    assert!(
+        refused["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("daily token limit of 40"),
+        "{refused}"
+    );
+
+    let (_, monthly) = post_json(
+        &router,
+        "/api/keys",
+        &admin,
+        json!({ "name": "monthly", "monthly_token_cap": 30 }),
+    )
+    .await;
+    let key = monthly["key"].as_str().unwrap().to_string();
+    let response = gateway_call(&router, &key, body.clone()).await;
+    assert_eq!(
+        header(&response, "x-dreamgate-tokens-window").as_deref(),
+        Some("key-month")
+    );
+    assert_eq!(
+        header(&response, "x-dreamgate-requests-limit"),
+        None,
+        "no per-minute limit"
+    );
+    gateway_call(&router, &key, body.clone()).await;
+    let response = gateway_call(&router, &key, body.clone()).await;
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert!(
+        json_body(response).await["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("monthly token limit of 30")
+    );
+
+    // The list says what each key used of its day and its month, and an update to a limit below one is refused.
+    let keys = get_json(&router, "/api/keys", &admin).await;
+    let listed = keys["keys"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|key| key["name"] == "daily")
+        .unwrap()
+        .clone();
+    assert_eq!(listed["used_today"], 54);
+    assert_eq!(listed["used_this_month"], 54);
+    let (status, _) = send_json(
+        &router,
+        http::Method::PATCH,
+        &format!("/api/keys/{}", daily["id"]),
+        &admin,
+        json!({ "daily_token_cap": 0 }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let (_, plain) = post_json(&router, "/api/keys", &admin, json!({ "name": "plain" })).await;
+    let response = gateway_call(&router, plain["key"].as_str().unwrap(), body).await;
+    assert_eq!(
+        header(&response, "x-dreamgate-tokens-limit"),
+        None,
+        "a key with no limit says nothing"
+    );
+}
+
+// A key written before it could have a day or a month limit gains both columns on start, empty.
+#[tokio::test]
+async fn a_key_written_before_its_day_and_month_limits_has_neither() {
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
+        .unwrap();
+    for statement in db::SCHEMA {
+        let before = statement.replace(
+            ",\n        daily_token_cap INTEGER,\n        monthly_token_cap INTEGER",
+            "",
+        );
+        sqlx::query(sqlx::AssertSqlSafe(before.as_str()))
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+    sqlx::query(
+        "INSERT INTO users (id, username, role, created_at) VALUES (1, 'ada', 'admin', '2026-01-01T00:00:00Z')",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO api_keys (user_id, name, key, created_at) VALUES (1, 'k', 'dreamgate_old', '2026-01-01T00:00:00Z')",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    db::migrate(&pool).await.unwrap();
+    let row = sqlx::query("SELECT daily_token_cap, monthly_token_cap FROM api_keys")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(row.get::<Option<i64>, _>("daily_token_cap"), None);
+    assert_eq!(row.get::<Option<i64>, _>("monthly_token_cap"), None);
+}
