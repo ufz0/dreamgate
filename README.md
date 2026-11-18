@@ -178,21 +178,22 @@ was taken by an older version.
    client's headers is passed on. A type the gateway does not know is refused when a connection is made; one
    a newer version wrote is sent the plain API, which every type speaks, and listed as it was stored.
 2. Create a key. A DreamGate key is what clients use — the upstream key stays server-side.
-   Optionally bind a key to one connection, pin a model, give it an expiry, or set a requests-per-minute limit,
-   a token cap over its life, and token limits for a day and for a month.
-   A pinned model is the one chat and completions are sent with; an embedding keeps the model its client
-   names, so a pin does not limit which embedding model a key can ask for. An admin can set a token limit for
-   any account from the Accounts view; that limit counts the tokens used in the current day — the input and
-   the generated text together, as they are recorded in the usage row — and resets at 00:00 UTC, and it
-   applies on top of a key's own cap, so a key cannot be used to work around it. Clearing
-   the value clears the limit. A key's own cap is the same sum over the life of the key. A key can also have
-   a daily and a monthly token limit (`daily_token_cap`, `monthly_token_cap`), the same sum over the current
-   day and the current calendar month in UTC, from 00:00 on the first; a row from before either began counts
-   toward neither, and a key that reaches one is answered 429 `token_cap` with a message that names it. A
-   change to a key sets a day or a month limit, or removes it with null; its per-minute limit and its cap
-   over its life can be changed but not removed, as before. A limit given as less than one is refused, on a
-   key that is being made as on one that is being changed. Splitting the figures on the Overview does not
-   change what any of these limits counts.
+   Optionally bind a key to one connection, pin a model, give it an expiry, or set a requests-per-minute
+   limit, a token cap over its life, and token limits for a day and for a month. `PATCH /api/keys/{id}`
+   leaves a field it does not name as it is, and removes a binding, a pinned model, an expiry or any of the
+   limits sent as null, so each can be removed without deleting the key; a name and whether a key is on
+   cannot be cleared. A limit given as a number has to be at least 1, as when the key is made, and an empty
+   model is no pin at all. A pinned model is the one chat and completions are sent with; an embedding keeps
+   the model its client names, so a pin does not limit which embedding model a key can ask for. An admin can
+   set a token limit for any account from the Accounts view; that limit counts the tokens used in the
+   current day — the input and the generated text together, as they are recorded in the usage row — and
+   resets at 00:00 UTC, and it applies on top of a key's own cap, so a key cannot be used to work around it.
+   Clearing the value clears the limit. A key's own cap is the same sum over the life of the key. A key can
+   also have a daily and a monthly token limit (`daily_token_cap`, `monthly_token_cap`), the same sum over
+   the current day and the current calendar month in UTC, from 00:00 on the first; a row from before either
+   began counts toward neither, and a key that reaches one is answered 429 `token_cap` with a message that
+   names it. A limit given as less than one is refused, on a key that is being made as on one that is being
+   changed. Splitting the figures on the Overview does not change what any of these limits counts.
 
    Every answer to a request held against a limit, its key's or its account's, says what was left of its
    limits when the request was admitted, before it: `x-dreamgate-requests-limit` and
@@ -891,7 +892,8 @@ on its own when an upstream reports it first, and leaving it only when its row
 arrives, which names the stream it settles, another account's stream listed for an admin and only counted for a
 member, who is sent its row's figures and nothing else, the connections routes being
 admin-only with the key a connection carries and its address returned to an admin alone, a key made or changed
-with a connection that does not exist answered as a mistake in what was sent, a duplicate connection name named,
+with a connection that does not exist answered as a mistake in what was sent, a key's connection, model or limit
+cleared with a null while a field left out keeps its value, a duplicate connection name named,
 with a database that refuses a connection or an account answered as a server error with a reference and none
 of the driver's text, the model list refusing a
 disabled account the same way the completion path does, a request refused rather than let through when its

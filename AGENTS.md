@@ -16,7 +16,9 @@ around it.
 ## Layout
 
 ```
-src/        the gateway: api, auth, gateway, keys, registry, stats, usage, db, state
+src/        the gateway: one module per concern (api, auth, clock, db, gateway, keys, limits,
+            live, metrics, presence, registry, reservations, settings, shutdown, state, stats,
+            tokens, usage, users), plus lib.rs, the route table, and main.rs, which starts everything
 web/        the dashboard (plain html, css, js — no build step, no bundler)
 tests/      integration tests against an in-memory SQLite database, and one that runs the binary
 deploy/     example systemd units, for the service and a daily backup; the Dockerfile is at the root, where `docker build .` finds it
@@ -24,7 +26,8 @@ data/       runtime state, gitignored
 ```
 
 Each module in `src/` is one concern. Keep it that way: a handler lives in the
-module that owns its data, not in `api.rs`, which is only the route table.
+module that owns its data, not in `lib.rs`, which is only the route table, or in
+`api.rs`, which is only the envelope a handler answers a failure with.
 
 ## Common commands
 

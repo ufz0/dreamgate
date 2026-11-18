@@ -1609,6 +1609,145 @@ async fn a_key_bound_to_a_connection_that_does_not_exist_is_told_so() {
     assert_eq!(body["error"]["message"], "no connection with that id");
 }
 
+// A field left out of a change keeps its value, while a field sent as null clears it, so a key can
+// be unbound or unpinned without being deleted and made again.
+#[tokio::test]
+async fn a_key_field_can_be_cleared_with_a_null_and_an_omitted_field_is_left_alone() {
+    let st = test_state().await;
+    let router = build_router(st.clone());
+    let cookie = register(&router, "ada").await;
+    let (_, connection) = post_json(
+        &router,
+        "/api/connections",
+        &cookie,
+        json!({ "name": "test", "base_url": "http://127.0.0.1:1" }),
+    )
+    .await;
+    let connection_id = connection["id"].as_i64().unwrap();
+    let (_, created) = post_json(
+        &router,
+        "/api/keys",
+        &cookie,
+        json!({
+            "name": "pinned",
+            "connection_id": connection_id,
+            "model": "qwen2.5",
+            "rpm_limit": 5,
+            "token_cap": 1000,
+        }),
+    )
+    .await;
+    let id = created["id"].as_i64().unwrap();
+    let key_value = created["key"].as_str().unwrap().to_string();
+
+    // Clearing one field leaves the others alone.
+    let (status, _) = send_json(
+        &router,
+        http::Method::PATCH,
+        &format!("/api/keys/{id}"),
+        &cookie,
+        json!({ "model": null }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let keys = get_json(&router, "/api/keys", &cookie).await;
+    let key = &keys["keys"][0];
+    assert!(key["model"].is_null(), "a null model clears the pin");
+    assert_eq!(key["connection_id"], connection_id);
+    assert_eq!(key["rpm_limit"], 5);
+    assert_eq!(key["token_cap"], 1000);
+
+    // Every clearable field can be cleared the same way.
+    let (status, _) = send_json(
+        &router,
+        http::Method::PATCH,
+        &format!("/api/keys/{id}"),
+        &cookie,
+        json!({ "connection_id": null, "rpm_limit": null, "token_cap": null }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let keys = get_json(&router, "/api/keys", &cookie).await;
+    let key = &keys["keys"][0];
+    assert!(key["connection_id"].is_null());
+    assert!(key["rpm_limit"].is_null());
+    assert!(key["token_cap"].is_null());
+    assert_eq!(key["name"], "pinned", "a field left out keeps its value");
+
+    // A value still sets the field, and a model is trimmed the way it is when the key is made.
+    let (status, _) = send_json(
+        &router,
+        http::Method::PATCH,
+        &format!("/api/keys/{id}"),
+        &cookie,
+        json!({ "model": "  qwen3  ", "rpm_limit": 7 }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let keys = get_json(&router, "/api/keys", &cookie).await;
+    let key = &keys["keys"][0];
+    assert_eq!(key["model"], "qwen3");
+    assert_eq!(key["rpm_limit"], 7);
+
+    // An empty model is no pin at all, the same as when the key is made.
+    let (status, _) = send_json(
+        &router,
+        http::Method::PATCH,
+        &format!("/api/keys/{id}"),
+        &cookie,
+        json!({ "model": "   " }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let keys = get_json(&router, "/api/keys", &cookie).await;
+    assert!(keys["keys"][0]["model"].is_null());
+
+    // A limit sent as a number still has to be one that could be used, whichever limit it is.
+    for limits in [json!({ "rpm_limit": 0 }), json!({ "token_cap": -1 })] {
+        let (status, _) = send_json(
+            &router,
+            http::Method::PATCH,
+            &format!("/api/keys/{id}"),
+            &cookie,
+            limits,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    // Disabling a key still works, and the answer keeps its shape.
+    let (status, body) = send_json(
+        &router,
+        http::Method::PATCH,
+        &format!("/api/keys/{id}"),
+        &cookie,
+        json!({ "enabled": false }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, json!({ "ok": true }));
+    let keys = get_json(&router, "/api/keys", &cookie).await;
+    assert_eq!(keys["keys"][0]["enabled"], false);
+    let response = gateway_call(
+        &router,
+        &key_value,
+        json!({ "messages": [{ "role": "user", "content": "hi" }] }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+    // An admin changing a key that is not there is told so, as a member already is.
+    let (status, _) = send_json(
+        &router,
+        http::Method::PATCH,
+        "/api/keys/4242",
+        &cookie,
+        json!({ "name": "gone" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
 // A key holder is told which connection failed, not where it is: the HTTP client's error ends in the
 // full upstream address, which names an internal host and port, and any credential an upstream takes
 // in its query string.
