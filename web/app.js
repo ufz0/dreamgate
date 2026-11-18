@@ -780,8 +780,9 @@ function renderFeed(arrived) {
 
 // Activity
 
-// What the view starts from: no rows, no filters, and the number of rows it keeps as rows arrive, which grows to
-// what "Load older" has read so a page the reader asked for is not let go under them.
+// What the view starts from: no rows, no filters, and the number of rows it keeps as rows arrive. "Load older"
+// raises it to what is shown plus as many again as the view keeps at first, so a page the reader asked for is
+// let go only after that many rows have arrived on top of it, and the count stays bounded by what they read.
 function freshActivity() {
   return { filters: {}, rows: [], next: null, loaded: false, loading: false, reading: false, arrived: [], kept: ACTIVITY_KEPT, ticket: 0 };
 }
@@ -844,7 +845,7 @@ async function loadActivity(older) {
     if (ticket !== activity.ticket || activity !== state.activity) return false;
     if (older) {
       activity.rows = activity.rows.concat(page.events);
-      activity.kept = Math.max(ACTIVITY_KEPT, activity.rows.length);
+      activity.kept = activity.rows.length + ACTIVITY_KEPT;
     } else {
       const newest = page.events[0]?.id ?? 0;
       const arrived = activityFiltered() ? [] : activity.arrived.filter((event) => event.id > newest);
@@ -914,7 +915,7 @@ function renderActivity() {
         .map(
           (event) =>
             `<tr>
-              <td>${esc(event.created_at.slice(0, 10))} ${esc(event.created_at.slice(11, 19))}</td>
+              <td class="nowrap">${esc(event.created_at.slice(0, 10))} ${esc(event.created_at.slice(11, 19))}</td>
               <td><span class="clamp">${esc(keyLabel(event))}</span></td>
               ${admin ? `<td><span class="clamp">${esc(event.user)}</span></td>` : ''}
               <td><span class="clamp">${esc(event.model || 'no model')}</span></td>
@@ -1570,6 +1571,8 @@ $('sign-out').addEventListener('click', async () => {
   state.progress = { shares: [], streams: [] };
   names.clear();
   resetActivity();
+  // A message from the session that ended, such as a refused export, is not for whoever signs in next.
+  notice('');
   showAuth();
 });
 

@@ -614,3 +614,6 @@ input:focus-visible, select:focus-visible, textarea:focus-visible, button:focus-
 .filters { display: flex; flex-wrap: wrap; gap: 12px; align-items: flex-end; margin-bottom: 16px; }
 .filters .field { margin-bottom: 0; flex: 1 1 9rem; max-width: 14rem; }
 .filters .filter-actions { display: flex; gap: 8px; align-items: center; }
+
+/* A time in the Activity table reads as one value, so it is kept on one line even on a phone. */
+td.nowrap { white-space: nowrap; }
