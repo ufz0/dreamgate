@@ -51,12 +51,24 @@ function healthChip(health) {
   return `<span class="chip ${kind}">${glyph ? `<span class="icon">${icon(glyph)}</span>` : ''}<span>${esc(label)}</span></span>`;
 }
 
+// How many rows the Activity view keeps while new ones arrive. A page left open on a busy gateway would otherwise
+// hold every row since it was opened and rebuild the whole table for each one; the rows let go are still there
+// with "Load older", which goes on from the last row kept.
+const ACTIVITY_KEPT = 500;
+
 const state = {
   me: null,
   summary: { self: {}, global: {}, hourly: [], daily: [], models: [], users: [] },
   keys: [],
   // Keys that belong to another account, read only by an admin, and which of them the page shows.
   otherKeys: [],
+  // Each connection's last day, read when the Connections view is opened: null until then, and the error when a
+  // read failed, so neither is shown as a connection that had no requests.
+  connectionFigures: null,
+  connectionFiguresError: null,
+  // The Activity view's rows, read a page at a time with the filters that were applied, and the id to read the
+  // page after them from.
+  activity: freshActivity(),
   keyOwner: '',
   connections: [],
   events: [],
@@ -258,6 +270,12 @@ function route() {
   // A model list comes from the upstream, so it is read when the Sandbox is opened rather than
   // on every page load.
   if (state.view === 'sandbox' && !state.models.length && state.keys.length) loadModels().then(() => renderSandbox());
+  if (state.view === 'connections') loadConnectionFigures().then(() => state.view === 'connections' && renderConnections());
+  if (state.view === 'activity' && !state.activity.loaded && !state.activity.loading) {
+    loadActivity(false)
+      .then((landed) => landed && renderActivity())
+      .catch(report);
+  }
 }
 
 function render(arrived) {
@@ -280,10 +298,13 @@ function renderNav() {
 async function load() {
   // What was in flight belongs to the session that was open before; this one is told its own.
   state.progress = { shares: [], streams: [] };
+  resetActivity();
   state.settings = await api('/api/settings');
   state.summary = await api('/api/stats/summary');
   state.keys = (await api('/api/keys')).keys;
   state.connections = (await api('/api/connections')).connections;
+  state.connectionFigures = null;
+  state.connectionFiguresError = null;
   state.events = (await api('/api/stats/recent')).events;
   await loadOtherKeys();
   await refreshPresence();
@@ -291,6 +312,20 @@ async function load() {
   showShell();
   route();
   subscribe();
+}
+
+// Each connection's last day is read when the Connections view, which only an admin sees, is opened or changed,
+// rather than with every page load: it reads a day of rows. A read that fails is shown on the view and does not
+// stop the page.
+async function loadConnectionFigures() {
+  if (state.me?.role !== 'admin') return;
+  try {
+    state.connectionFigures = (await api('/api/stats/connections')).connections;
+    state.connectionFiguresError = null;
+  } catch (err) {
+    state.connectionFiguresError = String(err?.message || 'the figures could not be read');
+    console.error(err);
+  }
 }
 
 // Only an admin can read another account's keys, so a member never asks for them.
@@ -341,7 +376,12 @@ async function refresh(path) {
     state.keys = (await api('/api/keys')).keys;
     await loadOtherKeys();
   }
-  if (path === 'connections') state.connections = (await api('/api/connections')).connections;
+  // The connections are shown as soon as they are read, and their figures, which read a day of rows, follow.
+  if (path === 'connections') {
+    state.connections = (await api('/api/connections')).connections;
+    render(false);
+    await loadConnectionFigures();
+  }
   if (path === 'stats') state.summary = await api('/api/stats/summary');
   render(false);
 }
@@ -416,6 +456,8 @@ function subscribe() {
     }
     state.events.unshift(payload.event);
     state.events = state.events.slice(0, 50);
+    // A row that arrives belongs at the top of the Activity view only while nothing narrows what it shows.
+    if (!activityFiltered()) arriveInActivity(payload.event);
     const event = payload.event;
     retireStream(event.stream);
     // Every event counts toward the total the gate has produced, but only the caller's own events
@@ -738,22 +780,142 @@ function renderFeed(arrived) {
 
 // Activity
 
-// The recent rows and the models are an admin's for every account and anyone else's for their own, the
-// same scope the live stream keeps, so the lede says which.
+// What the view starts from: no rows, no filters, and the number of rows it keeps as rows arrive. "Load older"
+// raises it to what is shown plus as many again as the view keeps at first, so a page the reader asked for is
+// let go only after that many rows have arrived on top of it, and the count stays bounded by what they read.
+function freshActivity() {
+  return { filters: {}, rows: [], next: null, loaded: false, loading: false, reading: false, arrived: [], kept: ACTIVITY_KEPT, ticket: 0 };
+}
+
+// The rows are the signed-in account's own, or every account's for an admin, so none of them, nor the filters
+// they were read with, outlive the session they were read in.
+function resetActivity() {
+  state.activity = freshActivity();
+  $('activity-filters').reset();
+  for (const id of ['activity-key', 'activity-user', 'activity-connection']) $(id).innerHTML = '';
+}
+
+// A row that arrives while the first page is being read may have been written after the read, so it is kept and
+// put on top of the page once the page is in, unless the page already has it.
+function arriveInActivity(event) {
+  const activity = state.activity;
+  if (activity.loading) {
+    activity.arrived.push(event);
+    return;
+  }
+  if (!activity.loaded) return;
+  activity.rows.unshift(event);
+  // Nothing is let go while an older page is being read, because that page goes on from the last row kept.
+  if (!activity.reading && activity.rows.length > activity.kept) {
+    activity.rows.length = activity.kept;
+    activity.next = activity.rows[activity.kept - 1].id;
+  }
+}
+
+// What the form shows, which is what Show, Export CSV and a new page read, so neither reads a filter other than
+// the one on the screen.
+function formFilters() {
+  return Object.fromEntries([...new FormData($('activity-filters'))].filter(([, value]) => value));
+}
+
+function activityFiltered() {
+  return Object.values(state.activity.filters).some(Boolean);
+}
+
+function activityQuery(extra = {}) {
+  const params = new URLSearchParams();
+  for (const [name, value] of Object.entries({ ...state.activity.filters, ...extra })) if (value) params.set(name, value);
+  return params.toString();
+}
+
+// The first page with the filters as they are, or the page after the rows already shown.
+// Only the latest read lands, so a read answered late cannot replace what a later one showed, and none lands
+// in the state of a session that has since ended. It says whether it landed.
+async function loadActivity(older) {
+  const activity = state.activity;
+  const ticket = ++activity.ticket;
+  if (older) {
+    activity.reading = true;
+  } else {
+    activity.loading = true;
+    activity.arrived = [];
+  }
+  try {
+    const page = await api(`/api/stats/activity?${activityQuery(older ? { before: activity.next } : {})}`);
+    if (ticket !== activity.ticket || activity !== state.activity) return false;
+    if (older) {
+      activity.rows = activity.rows.concat(page.events);
+      activity.kept = activity.rows.length + ACTIVITY_KEPT;
+    } else {
+      const newest = page.events[0]?.id ?? 0;
+      const arrived = activityFiltered() ? [] : activity.arrived.filter((event) => event.id > newest);
+      activity.rows = arrived.sort((a, b) => b.id - a.id).concat(page.events);
+      activity.kept = ACTIVITY_KEPT;
+    }
+    activity.next = page.next;
+    activity.loaded = true;
+    return true;
+  } finally {
+    if (ticket === activity.ticket) {
+      activity.loading = false;
+      activity.reading = false;
+      activity.arrived = [];
+    }
+  }
+}
+
+// Filters are applied by reading their first page. A read that is refused leaves the filters that were applied
+// before it, so arriving rows and "Load older" go on as they did rather than repeating the refusal.
+async function applyActivityFilters(filters) {
+  const previous = state.activity.filters;
+  state.activity.filters = filters;
+  try {
+    return await loadActivity(false);
+  } catch (err) {
+    if (state.activity.filters === filters) state.activity.filters = previous;
+    throw err;
+  }
+}
+
+function fillSelect(select, options, current) {
+  select.innerHTML = options.map((o) => `<option value="${esc(o.value)}"${o.value === current ? ' selected' : ''}>${esc(o.label)}</option>`).join('');
+}
+
+// The filters offer what the caller can see: its own keys, and for an admin every account's keys and the
+// accounts themselves. A select that is already filled keeps what it shows, which may be a choice not applied
+// yet, so a row arriving does not undo it.
+function renderActivityFilters() {
+  const admin = state.me.role === 'admin';
+  const f = state.activity.filters;
+  const shown = (select, applied) => (select.options.length ? select.value : applied || '');
+  const keys = [...state.keys, ...(admin ? state.otherKeys : [])];
+  fillSelect($('activity-key'), [{ value: '', label: 'Any' }, ...keys.map((k) => ({ value: String(k.id), label: k.owner ? `${k.name} (${k.owner})` : k.name }))], shown($('activity-key'), f.key));
+  $('activity-user-field').hidden = !admin;
+  if (admin) fillSelect($('activity-user'), [{ value: '', label: 'Any' }, ...state.summary.users.map((u) => ({ value: String(u.id), label: u.username }))], shown($('activity-user'), f.user));
+  fillSelect($('activity-connection'), [{ value: '', label: 'Any' }, ...state.connections.map((c) => ({ value: String(c.id), label: c.name }))], shown($('activity-connection'), f.connection));
+  $('activity-models').innerHTML = state.summary.models.map((m) => `<option value="${esc(m.model)}"></option>`).join('');
+}
+
+// The rows and the models are an admin's for every account and anyone else's for their own, the same scope the
+// live stream keeps, so the lede says which.
 function renderActivity() {
+  if (!state.me) return;
   const admin = state.me.role === 'admin';
   $('activity-lede').textContent = `${
-    admin ? 'The last 50 requests that crossed the gate from every account' : 'The last 50 requests this account sent through the gate'
-  }, newest first, with what each cost. New rows arrive as they happen. Times are UTC.`;
+    admin ? 'The requests that crossed the gate from every account' : 'The requests this account sent through the gate'
+  }, newest first, with what each cost${activityFiltered() ? ', narrowed by the filters below' : '. New rows arrive as they happen'}. Times are UTC.`;
+  if (document.activeElement?.closest?.('#activity-filters') == null) renderActivityFilters();
+  $('activity-older').hidden = !state.activity.next;
   const columns = ['Time', 'Key', admin ? 'Account' : null, 'Model', 'Input tokens', 'Output tokens', 'Latency', 'Status'].filter(Boolean);
   $('activity-head').innerHTML = `<tr>${columns.map((c) => `<th>${esc(c)}</th>`).join('')}</tr>`;
 
-  $('activity-body').innerHTML = state.events.length
-    ? state.events
+  const rows = state.activity.rows;
+  $('activity-body').innerHTML = rows.length
+    ? rows
         .map(
           (event) =>
             `<tr>
-              <td>${esc(event.created_at.slice(11, 19))}</td>
+              <td class="nowrap">${esc(event.created_at.slice(0, 10))} ${esc(event.created_at.slice(11, 19))}</td>
               <td><span class="clamp">${esc(keyLabel(event))}</span></td>
               ${admin ? `<td><span class="clamp">${esc(event.user)}</span></td>` : ''}
               <td><span class="clamp">${esc(event.model || 'no model')}</span></td>
@@ -764,7 +926,9 @@ function renderActivity() {
             </tr>`,
         )
         .join('')
-    : `<tr><td colspan="${columns.length}">No requests recorded yet. Send one through the gateway and it appears here.</td></tr>`;
+    : `<tr><td colspan="${columns.length}">${
+        activityFiltered() ? 'No request matches these filters.' : 'No requests recorded yet. Send one through the gateway and it appears here.'
+      }</td></tr>`;
 
   $('models-body').innerHTML = state.summary.models.length
     ? state.summary.models
@@ -782,8 +946,9 @@ function connectionOptions() {
   return [{ value: '', label: 'Any enabled connection' }, ...state.connections.map((c) => ({ value: String(c.id), label: c.name }))];
 }
 
-// The gateway takes a key's own model first, then the default of the connection that serves it, and
-// the model the client asks for only when neither is set. A key that is not bound to one connection can
+// For chat and completions, the gateway takes a key's own model first, then the default of the connection that
+// serves it, and the model the client asks for only when neither is set; an embedding takes the model the
+// client asks for first, which this column does not show. A key that is not bound to one connection can
 // be served by any, so it can only say which of the two it may be, and so can a key whose connection is
 // marked down, because the gateway starts with another one.
 function keyModel(key, bound) {
@@ -794,6 +959,29 @@ function keyModel(key, bound) {
     : 'the model the client asks for';
 }
 
+// When a key was last used, from its last recorded request, and when it stops working, in UTC like every
+// time on the page.
+function keyTimes(key) {
+  const used = key.last_used_at ? `last used ${key.last_used_at.slice(0, 16).replace('T', ' ')} UTC` : 'never used';
+  if (!key.expires_at) return esc(used);
+  // An expiry given as a date is the first moment of the day after it, so it reads as the day it works through.
+  const at = key.expires_at.endsWith('T00:00:00Z')
+    ? `${new Date(Date.parse(key.expires_at) - 1).toISOString().slice(0, 10)} UTC, through the day`
+    : `${key.expires_at.slice(0, 16).replace('T', ' ')} UTC`;
+  return new Date(key.expires_at) > new Date()
+    ? `${esc(used)} · expires ${esc(at)}`
+    : `${esc(used)} · <span class="danger">expired ${esc(at)}</span>`;
+}
+
+// A key's limits, each token limit with what it has used of it, input and output together as the limit counts.
+function keyLimits(key) {
+  const lines = [key.rpm_limit ? `${key.rpm_limit}/min` : 'no rate limit'];
+  lines.push(key.token_cap ? `${nf.format(key.token_cap)} input + output tokens` : 'no token cap');
+  if (key.daily_token_cap) lines.push(`${nf.format(key.used_today)} of ${nf.format(key.daily_token_cap)} input + output tokens today`);
+  if (key.monthly_token_cap) lines.push(`${nf.format(key.used_this_month)} of ${nf.format(key.monthly_token_cap)} input + output tokens this month`);
+  return lines.map(esc).join('<br>');
+}
+
 function keyRow(key, showOwner) {
   // A binding to a disabled connection does not hold: the key uses another one.
   const bound = key.connection_id ? state.connections.find((c) => c.id === key.connection_id) : null;
@@ -802,15 +990,21 @@ function keyRow(key, showOwner) {
   // Enable button in it says plainly which state it is in.
   return `<tr class="${key.enabled ? '' : 'off'}">
     ${showOwner ? `<td>${esc(key.owner)}</td>` : ''}
-    <td><span class="clamp" title="${esc(key.key)}">${esc(key.name)}</span></td>
+    <td>
+      <span class="stack">
+        <span class="clamp" title="${esc(key.key_hint)}">${esc(key.name)}</span>
+        <span class="muted">${keyTimes(key)}</span>
+      </span>
+    </td>
     <td>${binding}</td>
     <td>${esc(keyModel(key, bound))}</td>
-    <td>${key.rpm_limit ? `${key.rpm_limit}/min` : 'no rate limit'}<br>${key.token_cap ? `${nf.format(key.token_cap)} input + output tokens` : 'no token cap'}</td>
+    <td>${keyLimits(key)}</td>
     <td class="num">${nf.format(key.requests)}</td>
     <td class="num">${nf.format(key.prompt_tokens)}</td>
     <td class="num">${nf.format(key.completion_tokens)}</td>
     <td class="num">
-      <button class="link" data-copy="${esc(key.key)}">Copy key</button>
+      ${key.key ? `<button class="link" data-copy="${esc(key.key)}">Copy key</button>` : ''}
+      <button class="link" data-rotate="${key.id}">Rotate</button>
       <button class="link" data-toggle="${key.id}" data-enabled="${key.enabled}">${key.enabled ? 'Disable' : 'Enable'}</button>
       <button class="link danger" data-delete="${key.id}">Delete</button>
     </td>
@@ -825,6 +1019,8 @@ function keyOwnerOptions() {
 
 function renderKeys() {
   const admin = state.me.role === 'admin';
+  // A date that has already ended in UTC is refused, so it is not offered.
+  $('key-expires').min = new Date().toISOString().slice(0, 10);
   // The table above is this account's own keys for everyone; another account's keys are a
   // separate read an admin can ask for.
   $('other-keys-field').hidden = !admin;
@@ -858,11 +1054,12 @@ function renderConnections() {
     ? state.connections
         .map(
           (connection) => `<tr>
-            <td><span class="clamp">${esc(connection.name)}</span></td>
+            <td><span class="clamp">${esc(connection.name)}</span>${connection.kind === 'opencode-go' ? '<br><span class="muted">OpenCode Go</span>' : ''}</td>
             <td><span class="clamp">${esc(connection.base_url)}</span></td>
             <td>${esc(connection.default_model || 'the model the client asks for')}</td>
             <td class="num">${esc(connection.priority)}</td>
-            <td>${healthChip(connection.health)}</td>
+            <td>${healthChip(connection.health)} ${modelsNote(connection.models)}</td>
+            <td>${connectionFigures(connection.id)}</td>
             <td class="num">
               <button class="link" data-check="${connection.id}">Check health</button>
               <button class="link danger" data-drop="${connection.id}">Remove</button>
@@ -870,7 +1067,34 @@ function renderConnections() {
           </tr>`,
         )
         .join('')
-    : `<tr><td colspan="6">No connection yet. Add one above. Any endpoint that speaks the OpenAI API works, including llama.cpp, Ollama and vLLM.</td></tr>`;
+    : `<tr><td colspan="7">No connection yet. Add one above. Any endpoint that speaks the OpenAI API works, including llama.cpp, Ollama and vLLM.</td></tr>`;
+}
+
+// What a connection did in the last day. A failure is a request it was sent and did not answer, or whose answer
+// broke off or went quiet; passed on is how many of those went to another connection. The times are kept apart
+// for single answers and streams, because a stream's time is its whole length. A figure nothing measured is left
+// out rather than shown as nothing.
+function connectionFigures(id) {
+  if (state.connectionFiguresError) return `<span class="muted">figures unavailable: ${esc(state.connectionFiguresError)}</span>`;
+  if (!state.connectionFigures) return '<span class="muted">reading…</span>';
+  const f = state.connectionFigures.find((figures) => figures.id === id);
+  if (!f) return '<span class="muted">not read yet</span>';
+  if (!f.answered && !f.failures) return '<span class="muted">no requests</span>';
+  const parts = [`${nf.format(f.answered)} answered`];
+  if (f.errors) parts.push(f.errors === 1 ? '1 error' : `${nf.format(f.errors)} errors`);
+  if (f.failures) parts.push(`${nf.format(f.failures)} failed, ${nf.format(f.passed_on)} passed on`);
+  const times = [];
+  if (f.single.p50_ms !== null) times.push(`answers ${nf.format(f.single.p50_ms)} ms, p95 ${nf.format(f.single.p95_ms)} ms`);
+  if (f.streamed.p50_ms !== null) times.push(`streams ${nf.format(f.streamed.p50_ms)} ms, p95 ${nf.format(f.streamed.p95_ms)} ms`);
+  return `${esc(parts.join(' · '))}${times.length ? `<br><span class="muted">${esc(times.join(' · '))}</span>` : ''}`;
+}
+
+// What the last check read of a connection's model list, which is what a request for a model is routed by.
+// A list that was never read is said to be unknown rather than shown as empty.
+function modelsNote(models) {
+  if (!Array.isArray(models)) return '<span class="muted" title="No model list has been read from this connection yet">models unknown</span>';
+  const label = models.length === 1 ? '1 model' : `${nf.format(models.length)} models`;
+  return `<span class="muted" title="${esc(models.join(', '))}">${label}</span>`;
 }
 
 // Connect a client
@@ -890,7 +1114,7 @@ function renderConnect() {
   const key = state.keys.find((k) => k.key === state.connectKey) || state.keys[0];
   $('connect-model').textContent = key
     ? key.model
-      ? `This key always resolves to ${key.model}. Use GET ${base}/models to see what the connection serves.`
+      ? `This key resolves to ${key.model} for chat and completions; an embedding uses the model the client names. Use GET ${base}/models to see the models the connections serve.`
       : `Use whatever the key resolves to, or list it with GET ${base}/models.`
     : 'Create a key first. The key is what the client sends.';
 
@@ -916,7 +1140,7 @@ async function loadModels() {
   try {
     const data = await api('/v1/models', { headers: { authorization: `Bearer ${key}` } });
     state.models = (data.data ?? []).map((model) => model.id);
-    if (!state.models.length) state.modelNote = 'That connection did not list any models. Check it on the Connections page.';
+    if (!state.models.length) state.modelNote = 'No connection listed any models. Check them on the Connections page.';
   } catch (err) {
     state.modelNote = String(err?.message || 'The model list could not be read.');
   }
@@ -1053,6 +1277,35 @@ async function sendChat(text) {
 }
 
 // Accounts. The view is admin-only, so the limit control is always editable here.
+function utcTime(at) {
+  return `${at.slice(0, 16).replace('T', ' ')} UTC`;
+}
+
+// Whether the account can be signed into, and until when a code given to it works; the code itself is shown
+// once, when it is made.
+function passwordState(user) {
+  const code = user.setup_code_expires_at;
+  const live = code && new Date(code) > new Date();
+  if (!user.has_password) {
+    return live
+      ? `<span class="muted">no password yet · setup code works until ${esc(utcTime(code))}</span>`
+      : '<span class="danger">no password and no working setup code · give it a new one</span>';
+  }
+  return live ? `<span class="muted">reset code works until ${esc(utcTime(code))}</span>` : '';
+}
+
+// A code is shown once, so the dialog says so and offers to copy it.
+function showSetupCode(issued, why) {
+  $('setup-code-title').textContent = `Setup code for ${issued.username}`;
+  $('setup-code-text').textContent = `${
+    why === 'made'
+      ? 'They sign in with this code and choose their password.'
+      : 'They sign in with this code and choose a new password; until then their old one keeps working, and any code given before this one no longer does.'
+  } It works once, until ${utcTime(issued.setup_code_expires_at)}, and is not shown again.`;
+  $('setup-code-value').textContent = issued.setup_code;
+  $('setup-code').showModal();
+}
+
 function renderAccounts() {
   renderAccountSettings();
   $('accounts-body').innerHTML = state.summary.users.length
@@ -1074,6 +1327,7 @@ function renderAccounts() {
                   <button class="secondary" data-password="${user.id}">Set password</button>
                 </span>
                 ${user.pending ? '<span class="muted">waiting for approval</span>' : ''}
+                ${passwordState(user)}
                 ${disabled ? '<span class="danger">disabled</span>' : ''}
               </span>
             </td>
@@ -1089,6 +1343,7 @@ function renderAccounts() {
             <td class="num">${nf.format(user.completion_tokens)}</td>
             <td class="num">
               ${user.pending ? `<button class="link" data-approve="${user.id}">Approve</button>` : ''}
+              <button class="link" data-setup-code="${user.id}">New setup code</button>
               <button class="link" data-status="${user.id}" data-enabled="${user.enabled}">${disabled ? 'Enable' : 'Disable'}</button>
               ${user.id === state.me.id ? '<span class="muted">signed in</span>' : `<button class="link danger" data-account="${user.id}">Delete</button>`}
             </td>
@@ -1183,10 +1438,26 @@ function renderAuth() {
   setMode(open && (firstAccount || mode === 'register') ? 'register' : 'login');
 }
 
-// An account made by an admin has no password until the person signs in for the first time, so
-// the entry screen says which password becomes theirs. It only applies once accounts exist.
+// An account made by an admin has no password until the person signs in with the setup code the admin gave
+// them, and a password an admin resets is set the same way, so the entry screen points to the code. It only
+// applies once accounts exist.
 function showFirstPasswordNote() {
-  $('first-password-note').hidden = !(state.settings.has_accounts && mode === 'login');
+  const login = state.settings.has_accounts && mode === 'login';
+  $('first-password-note').hidden = !login;
+  $('setup-code-toggle').hidden = !login;
+  // Run on every switch, so the password field says what it is for in the mode it is now in.
+  showSetupCodeField(login && !$('setup-code-field').hidden);
+}
+
+// With a setup code, the password typed is the new one to set rather than one to check, so the field says so
+// and a password manager offers to save it.
+function showSetupCodeField(open) {
+  $('setup-code-field').hidden = !open;
+  $('setup-code-toggle').setAttribute('aria-expanded', String(open));
+  $('setup-code-toggle').textContent = open ? 'Sign in with a password instead' : 'I have a setup code';
+  $('password-label').textContent = open ? 'New password' : 'Password';
+  $('auth-password').autocomplete = open || mode === 'register' ? 'new-password' : 'current-password';
+  if (!open) $('setup-code-field').querySelector('input').value = '';
 }
 
 function showShell() {
@@ -1214,6 +1485,7 @@ function setMode(next) {
 // so the entry screen says what happens next instead of loading the app.
 async function submitAuth(form) {
   const data = Object.fromEntries(new FormData(form));
+  if (mode !== 'login' || !data.setup_code) delete data.setup_code;
   try {
     const account = await postJson(`/api/${mode}`, data);
     if (account.pending) {
@@ -1305,6 +1577,11 @@ $('mode-login').addEventListener('click', () => {
   notice('');
   setMode('login');
 });
+$('setup-code-toggle').addEventListener('click', () => {
+  notice('');
+  showSetupCodeField($('setup-code-field').hidden);
+});
+$('setup-code-close').addEventListener('click', () => $('setup-code').close());
 $('toggle-rail').addEventListener('click', toggleRail);
 $('scrim').addEventListener('click', () => {
   $('shell').removeAttribute('data-drawer');
@@ -1377,11 +1654,60 @@ $('sign-out').addEventListener('click', async () => {
   // for whoever signs in next.
   state.progress = { shares: [], streams: [] };
   names.clear();
+  resetActivity();
+  // A message from the session that ended, such as a refused export, is not for whoever signs in next.
+  notice('');
   showAuth();
 });
 
 window.addEventListener('hashchange', () => {
   if (state.me) route();
+});
+
+$('activity-filters').addEventListener('submit', async (event) => {
+  event.preventDefault();
+  try {
+    if (await applyActivityFilters(formFilters())) renderActivity();
+  } catch (err) {
+    report(err);
+  }
+});
+
+// Every control is emptied rather than reset, because a reset puts a select back on the option the page marked
+// as the applied one.
+$('activity-clear').addEventListener('click', async () => {
+  for (const field of $('activity-filters').elements) if (field.name) field.value = '';
+  try {
+    if (await applyActivityFilters({})) renderActivity();
+  } catch (err) {
+    report(err);
+  }
+});
+
+$('activity-older').addEventListener('click', async () => {
+  try {
+    if (await loadActivity(true)) renderActivity();
+  } catch (err) {
+    report(err);
+  }
+});
+
+// The export is the filters the form shows, every matching row rather than the pages shown, downloaded with the
+// session the page already has. They are applied first, which reads a page with them: a download that fails
+// says nothing on the page, so a filter the server refuses, or a session that has ended, is reported here
+// instead.
+$('activity-export').addEventListener('click', async () => {
+  try {
+    if (!(await applyActivityFilters(formFilters()))) return;
+    renderActivity();
+  } catch (err) {
+    report(err);
+    return;
+  }
+  const link = document.createElement('a');
+  link.href = `/api/stats/activity.csv?${activityQuery()}`;
+  link.download = 'dreamgate-activity.csv';
+  link.click();
 });
 
 $('key-form').addEventListener('submit', async (event) => {
@@ -1395,6 +1721,9 @@ $('key-form').addEventListener('submit', async (event) => {
     model: data.model || null,
     rpm_limit: data.rpm_limit ? Number(data.rpm_limit) : null,
     token_cap: data.token_cap ? Number(data.token_cap) : null,
+    daily_token_cap: data.daily_token_cap ? Number(data.daily_token_cap) : null,
+    monthly_token_cap: data.monthly_token_cap ? Number(data.monthly_token_cap) : null,
+    expires_at: data.expires_at || null,
   };
   try {
     const created = await postJson('/api/keys', body);
@@ -1408,6 +1737,15 @@ $('key-form').addEventListener('submit', async (event) => {
   }
 });
 
+// OpenCode Go is served from one address, so choosing it fills the base URL in when nothing has been typed there,
+// and choosing another type takes it out again only if it is still the one filled in.
+const OPENCODE_GO_URL = 'https://opencode.ai/inference/go';
+$('connection-kind').addEventListener('change', (event) => {
+  const baseUrl = $('connection-form').elements.base_url;
+  if (event.target.value === 'opencode-go' && !baseUrl.value.trim()) baseUrl.value = OPENCODE_GO_URL;
+  else if (event.target.value !== 'opencode-go' && baseUrl.value === OPENCODE_GO_URL) baseUrl.value = '';
+});
+
 $('connection-form').addEventListener('submit', async (event) => {
   event.preventDefault();
   const form = event.target;
@@ -1418,6 +1756,7 @@ $('connection-form').addEventListener('submit', async (event) => {
     api_key: data.api_key || null,
     default_model: data.default_model || null,
     priority: data.priority ? Number(data.priority) : null,
+    kind: data.kind,
   };
   try {
     const created = await postJson('/api/connections', body);
@@ -1440,8 +1779,11 @@ $('account-form').addEventListener('submit', async (event) => {
   try {
     const created = await postJson('/api/users', body);
     form.reset();
+    // The code is shown before anything else is read, because it is shown only once: a list that then fails
+    // to load must not be what keeps it from the admin.
+    showSetupCode(created, 'made');
+    notice(`Made account "${created.username}".`);
     await refresh('stats');
-    notice(`Made account "${created.username}". The password is theirs when they sign in for the first time.`);
   } catch (err) {
     report(err);
   }
@@ -1535,6 +1877,30 @@ document.addEventListener('click', async (event) => {
     await changeAccount(user, { username: value }, `Renamed "${user.username}" to "${value}".`);
     return;
   }
+  if (button.dataset.setupCode) {
+    const user = account(button.dataset.setupCode);
+    const issue = async () => {
+      const issued = await postJson(`/api/users/${user.id}/setup-code`, {});
+      showSetupCode(issued, user.has_password ? 'reset' : 'made');
+      await refresh('stats');
+    };
+    // A code that still works may already be on its way to the person, and a new one makes it useless.
+    if (user.setup_code_expires_at && new Date(user.setup_code_expires_at) > new Date()) {
+      confirmAction(
+        'Replace the setup code?',
+        `The code given to "${user.username}" still works until ${utcTime(user.setup_code_expires_at)}. A new one replaces it, and the old one stops working.`,
+        'Replace',
+        issue,
+      );
+      return;
+    }
+    try {
+      await issue();
+    } catch (err) {
+      report(err);
+    }
+    return;
+  }
   if (button.dataset.password) {
     const user = account(button.dataset.password);
     const value = fieldValue(user, 'password');
@@ -1542,7 +1908,13 @@ document.addEventListener('click', async (event) => {
       notice('A new password must be at least 8 characters.', 'error');
       return;
     }
-    await changeAccount(user, { password: value }, `Set a new password for "${user.username}".`);
+    await changeAccount(
+      user,
+      { password: value },
+      user.id === state.me.id
+        ? 'Set your new password. Your other sessions are signed out.'
+        : `Set a new password for "${user.username}". They are signed out.`,
+    );
     return;
   }
   if (button.dataset.status) {
@@ -1580,6 +1952,28 @@ document.addEventListener('click', async (event) => {
     } catch (err) {
       report(err);
     }
+    return;
+  }
+  if (button.dataset.rotate) {
+    const id = Number(button.dataset.rotate);
+    const own = state.keys.find((k) => k.id === id);
+    const key = own || state.otherKeys.find((k) => k.id === id);
+    const who = own ? '' : ` (${key.owner})`;
+    // Another account's new key is not shown to an admin, so the confirm says where it can be read.
+    const after = own ? 'The new key is in this list.' : `${key.owner} reads the new key from their own list.`;
+    confirmAction(
+      'Rotate key',
+      `Give "${key.name}"${who} a new key? The old key stops working at once, so every client that uses it needs the new one. The key keeps its limits, its binding and its usage. ${after}`,
+      'Rotate',
+      async () => {
+        const rotated = await postJson(`/api/keys/${key.id}/rotate`, {});
+        // The Connect view and the Sandbox go on with the key they had picked, under its new secret.
+        if (own && key.key === state.connectKey) state.connectKey = rotated.key;
+        if (own && key.key === state.sandboxKey) state.sandboxKey = rotated.key;
+        await refresh('keys');
+        notice(`Rotated "${key.name}". The old key no longer works.`);
+      },
+    );
     return;
   }
   if (button.dataset.delete) {

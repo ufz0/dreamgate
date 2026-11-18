@@ -29,9 +29,9 @@ pub struct Limits {
     stream_stall: Duration,
     connect_timeout: Duration,
     // One semaphore per connection, kept for the life of the process, so the count belongs to the connection
-    // rather than to the request that first looked it up. A plain mutex: looking one up is a hashmap read
-    // and nothing here awaits inside it.
-    per_connection: Mutex<HashMap<i64, Arc<Semaphore>>>,
+    // rather than to the request that first looked it up, with the number it was made with. A plain mutex:
+    // looking one up is a hashmap read and nothing here awaits inside it.
+    per_connection: Mutex<HashMap<i64, (usize, Arc<Semaphore>)>>,
 }
 
 pub fn from_env() -> Limits {
@@ -113,17 +113,48 @@ impl Limits {
         self.global_size
     }
 
+    // Whether every slot of the gateway as a whole came back within `timeout`. A request that reached a
+    // connection gives its slots back only after its row is written, so every slot back is every such request
+    // recorded. The one exception is a single answer whose client left while it waited: the request is dropped
+    // with the connection to the client and never recorded, so there is nothing for the drain to wait for. The
+    // slots are looked at rather than taken, so what is in flight still reads as it is while the drain waits,
+    // in the log and in a scrape.
+    pub async fn drained(&self, timeout: Duration) -> bool {
+        let every = async {
+            while self.global.available_permits() < self.global_size {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        };
+        tokio::time::timeout(timeout, every).await.is_ok()
+    }
+
+    // How many requests hold a slot of the gateway as a whole right now.
+    pub fn in_flight(&self) -> usize {
+        self.global_size
+            .saturating_sub(self.global.available_permits())
+    }
+
+    // How many requests hold a slot of one connection right now, for a connection a request has reached
+    // since the start; one that nothing has asked yet has no count rather than a count of zero it was
+    // never given.
+    pub fn connection_in_flight(&self, id: i64) -> Option<usize> {
+        let semaphores = self.per_connection.lock().expect("semaphore map");
+        semaphores
+            .get(&id)
+            .map(|(limit, semaphore)| limit.saturating_sub(semaphore.available_permits()))
+    }
+
     // A connection that states no capability is admitted by the default. The number is fixed when the
     // semaphore is first made for it, so changing a stored value takes effect on the next start: a
     // semaphore that has already handed out permits cannot be resized.
     pub fn for_connection(&self, id: i64, cap: Option<i64>) -> Arc<Semaphore> {
         let limit = cap.unwrap_or(self.default as i64).max(1) as usize;
         let mut semaphores = self.per_connection.lock().expect("semaphore map");
-        if let Some(existing) = semaphores.get(&id) {
+        if let Some((_, existing)) = semaphores.get(&id) {
             return existing.clone();
         }
         let semaphore = Arc::new(Semaphore::new(limit));
-        semaphores.insert(id, semaphore.clone());
+        semaphores.insert(id, (limit, semaphore.clone()));
         semaphore
     }
 

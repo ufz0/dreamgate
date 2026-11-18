@@ -15,7 +15,9 @@ pub const SCHEMA: &[&str] = &[
         daily_token_cap INTEGER,
         enabled INTEGER NOT NULL DEFAULT 1,
         pending INTEGER NOT NULL DEFAULT 0,
-        created_at TEXT NOT NULL
+        created_at TEXT NOT NULL,
+        setup_code_hash TEXT,
+        setup_code_expires_at TEXT
     )",
     "CREATE TABLE IF NOT EXISTS sessions (
         token TEXT PRIMARY KEY,
@@ -33,6 +35,8 @@ pub const SCHEMA: &[&str] = &[
         health TEXT NOT NULL DEFAULT 'unknown',
         last_checked_at TEXT,
         max_concurrent INTEGER,
+        models TEXT,
+        kind TEXT NOT NULL DEFAULT 'openai',
         created_at TEXT NOT NULL
     )",
     "CREATE TABLE IF NOT EXISTS api_keys (
@@ -45,7 +49,10 @@ pub const SCHEMA: &[&str] = &[
         enabled INTEGER NOT NULL DEFAULT 1,
         rpm_limit INTEGER,
         token_cap INTEGER,
-        created_at TEXT NOT NULL
+        created_at TEXT NOT NULL,
+        expires_at TEXT,
+        daily_token_cap INTEGER,
+        monthly_token_cap INTEGER
     )",
     "CREATE TABLE IF NOT EXISTS usage (
         id INTEGER PRIMARY KEY,
@@ -65,6 +72,23 @@ pub const SCHEMA: &[&str] = &[
         estimated INTEGER NOT NULL DEFAULT 0,
         created_at TEXT NOT NULL
     )",
+    // Each time a connection failed a request: it could not be reached or gave no answer (`unreachable`), its
+    // answer broke off (`broken`), or its stream went quiet for the stall window (`stalled`), and whether the
+    // request was then passed on to another connection. A usage row says which connection answered; this is
+    // what the rows cannot say, the connections that were asked first and did not. A stream cut short after its
+    // head was sent has a usage row as well, which `usage_id` names, so its figures count it as a failure rather
+    // than as an answer that took that long; it is not a reference, because a failure says nothing more once
+    // the row is gone. A table of its own, made on start like every other, so a database written before it gains
+    // it empty; a connection's failures go with it when it is removed, because they only mean something beside
+    // the connection, and rows older than the figures' window are removed by the health round.
+    "CREATE TABLE IF NOT EXISTS connection_failures (
+        id INTEGER PRIMARY KEY,
+        connection_id INTEGER NOT NULL REFERENCES connections(id) ON DELETE CASCADE,
+        kind TEXT NOT NULL,
+        passed_on INTEGER NOT NULL DEFAULT 0,
+        usage_id INTEGER,
+        created_at TEXT NOT NULL
+    )",
     "CREATE TABLE IF NOT EXISTS settings (
         key TEXT PRIMARY KEY,
         value TEXT NOT NULL
@@ -78,7 +102,13 @@ pub const SCHEMA: &[&str] = &[
 const INDEXES: &[&str] = &[
     "CREATE INDEX IF NOT EXISTS idx_usage_created ON usage (created_at)",
     "CREATE INDEX IF NOT EXISTS idx_usage_key ON usage (api_key_id)",
+    // A key's day and month limits sum its rows from a moment on; without the time beside the key the read would
+    // pass over every row the key ever had.
+    "CREATE INDEX IF NOT EXISTS idx_usage_key_created ON usage (api_key_id, created_at)",
     "CREATE INDEX IF NOT EXISTS idx_usage_user ON usage (user_id)",
+    "CREATE INDEX IF NOT EXISTS idx_failures_created ON connection_failures (created_at)",
+    // Removing a connection removes its failures, which would otherwise read the whole table to find them.
+    "CREATE INDEX IF NOT EXISTS idx_failures_connection ON connection_failures (connection_id)",
 ];
 
 async fn has_column<'e, E>(db: E, table: &str, column: &str) -> Result<bool, sqlx::Error>
@@ -119,12 +149,89 @@ where
 // against that same file while a write is happening.
 pub const DEFAULT_POOL_SIZE: u32 = 16;
 
+// What the health check learns about the database.
+pub enum Probe {
+    Answered,
+    // Every connection of the pool is in use, which is requests being served rather than a database that
+    // has stopped; waiting for one would turn a burst into a failed check.
+    Busy,
+    Failed(sqlx::Error),
+    TimedOut,
+}
+
+// A statement that reads a table, within a second. `SELECT 1` alone never opens a read of the database, so
+// a file that can no longer be read would still be answered as fine. A connection is waited for briefly,
+// because one a query has just finished with goes back to the pool a moment later; a pool that has none to
+// give in that time while every connection is in use is busy rather than down.
+pub async fn probe(pool: &SqlitePool) -> Probe {
+    let mut connection =
+        match tokio::time::timeout(Duration::from_millis(250), pool.acquire()).await {
+            Ok(Ok(connection)) => connection,
+            Ok(Err(err)) => return Probe::Failed(err),
+            Err(_) if pool.size() >= pool.options().get_max_connections() => return Probe::Busy,
+            Err(_) => return Probe::TimedOut,
+        };
+    let read = sqlx::query("SELECT 1 FROM settings LIMIT 1").fetch_optional(&mut *connection);
+    match tokio::time::timeout(Duration::from_secs(1), read).await {
+        Ok(Ok(_)) => Probe::Answered,
+        Ok(Err(err)) => Probe::Failed(err),
+        Err(_) => Probe::TimedOut,
+    }
+}
+
+// How long a query waits for a pooled connection before it fails. It is the default sqlx has always used
+// here, stated because the health check reads it: a pool that has given no connection for this long is no
+// longer a burst being served, since the gateway's own requests are failing with it.
+pub const ACQUIRE_TIMEOUT: Duration = Duration::from_secs(30);
+
+// A copy of the database that can be taken while the gateway runs. Copying the file is not one: with WAL,
+// committed rows can still be in the -wal file beside it, and a copy taken during a write is torn.
+// `VACUUM INTO` writes a consistent snapshot to a new file instead. The database is opened as it is, not
+// created and not migrated, because a backup must not change what it copies.
+//
+// The copy holds every key the gateway stores, upstream keys included. SQLite would make the file with the
+// process's umask, readable by anyone on the machine while it is written, and would write into an empty file
+// or through a link someone else left in a shared directory. So the file is made here first, by this process
+// alone, refusing anything already at that path and, on Unix, readable by its owner alone from the start;
+// SQLite writes into it and gives its journal the same mode. A copy that fails partway is removed with its
+// journal, because a partial copy holds keys too. The path is made absolute, because SQLite reads a name that
+// starts with `file:` as a URI rather than as a file.
+// An error about the copy names the file, so it does not read as one about the database being copied.
+pub async fn backup(
+    url: &str,
+    target: &std::path::Path,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let cannot_create = |err: std::io::Error| format!("cannot create {}: {err}", target.display());
+    let target = std::path::absolute(target).map_err(cannot_create)?;
+    let options = SqliteConnectOptions::from_str(url)?.busy_timeout(Duration::from_secs(5));
+    let mut connection = SqliteConnection::connect_with(&options).await?;
+    let mut file = std::fs::OpenOptions::new();
+    file.write(true).create_new(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut file, 0o600);
+    drop(file.open(&target).map_err(cannot_create)?);
+    let written = sqlx::query("VACUUM INTO ?")
+        .bind(target.to_string_lossy().into_owned())
+        .execute(&mut connection)
+        .await;
+    if let Err(err) = written {
+        let _ = std::fs::remove_file(&target);
+        let mut journal = target.into_os_string();
+        journal.push("-journal");
+        let _ = std::fs::remove_file(journal);
+        return Err(err.into());
+    }
+    connection.close().await?;
+    Ok(())
+}
+
 pub async fn connect(url: &str, max_connections: u32) -> Result<SqlitePool, sqlx::Error> {
     let options = SqliteConnectOptions::from_str(url)?
         .create_if_missing(true)
         .busy_timeout(Duration::from_secs(5));
     let pool = SqlitePoolOptions::new()
         .max_connections(max_connections.max(1))
+        .acquire_timeout(ACQUIRE_TIMEOUT)
         .connect_with(options)
         .await?;
     for statement in SCHEMA {
@@ -184,6 +291,11 @@ pub async fn migrate(pool: &SqlitePool) -> Result<(), sqlx::Error> {
     // table.
     add_usage_columns(pool).await?;
     add_connection_limit(pool).await?;
+    add_connection_models(pool).await?;
+    add_key_expiry(pool).await?;
+    add_setup_codes(pool).await?;
+    add_key_windows(pool).await?;
+    add_connection_kind(pool).await?;
     relax_key_reference(pool).await?;
     for statement in INDEXES {
         sqlx::query(*statement).execute(pool).await?;
@@ -209,6 +321,23 @@ async fn add_usage_columns(pool: &SqlitePool) -> Result<(), sqlx::Error> {
     Ok(())
 }
 
+// A setup code is how the person an admin made an account for, or gave a new code to, sets its password. Both
+// columns are nullable, so an account written before the change reads as having no code: one with a password
+// signs in with it as before, and one without waits for an admin to give it a code, because no code means
+// nothing can set its password.
+async fn add_setup_codes(pool: &SqlitePool) -> Result<(), sqlx::Error> {
+    for column in ["setup_code_hash", "setup_code_expires_at"] {
+        if has_column(pool, "users", column).await? {
+            continue;
+        }
+        let statement = format!("ALTER TABLE users ADD COLUMN {column} TEXT");
+        sqlx::query(sqlx::AssertSqlSafe(statement.as_str()))
+            .execute(pool)
+            .await?;
+    }
+    Ok(())
+}
+
 // A connection that states no capability is admitted by the default, so the column is nullable and a
 // row written before the change keeps its meaning: nothing stated.
 async fn add_connection_limit(pool: &SqlitePool) -> Result<(), sqlx::Error> {
@@ -216,6 +345,59 @@ async fn add_connection_limit(pool: &SqlitePool) -> Result<(), sqlx::Error> {
         return Ok(());
     }
     sqlx::query("ALTER TABLE connections ADD COLUMN max_concurrent INTEGER")
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+// A key can be given a time it stops working. The column is nullable, so a key written before it keeps its
+// meaning: it does not expire.
+async fn add_key_expiry(pool: &SqlitePool) -> Result<(), sqlx::Error> {
+    if has_column(pool, "api_keys", "expires_at").await? {
+        return Ok(());
+    }
+    sqlx::query("ALTER TABLE api_keys ADD COLUMN expires_at TEXT")
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+// What kind of upstream a connection is. Every connection made before there were kinds speaks the plain OpenAI
+// API, so the column is added with that as its value, and those connections are sent what they were sent before.
+async fn add_connection_kind(pool: &SqlitePool) -> Result<(), sqlx::Error> {
+    if has_column(pool, "connections", "kind").await? {
+        return Ok(());
+    }
+    sqlx::query("ALTER TABLE connections ADD COLUMN kind TEXT NOT NULL DEFAULT 'openai'")
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+// A key can have a token limit for each day and each month in UTC, beside the cap over its whole life. Both are
+// nullable, so a key written before them keeps its meaning: no limit for either.
+async fn add_key_windows(pool: &SqlitePool) -> Result<(), sqlx::Error> {
+    for column in ["daily_token_cap", "monthly_token_cap"] {
+        if has_column(pool, "api_keys", column).await? {
+            continue;
+        }
+        let statement = format!("ALTER TABLE api_keys ADD COLUMN {column} INTEGER");
+        sqlx::query(sqlx::AssertSqlSafe(statement.as_str()))
+            .execute(pool)
+            .await?;
+    }
+    Ok(())
+}
+
+// The models a connection listed at its last check, as a JSON array of objects with each one's id and, when the
+// upstream gave it, the time it was made, so a request can be sent to a connection that serves its model. Null
+// means no list has been read, which says nothing about what the connection serves, so a row written before the
+// change keeps its meaning: not known.
+async fn add_connection_models(pool: &SqlitePool) -> Result<(), sqlx::Error> {
+    if has_column(pool, "connections", "models").await? {
+        return Ok(());
+    }
+    sqlx::query("ALTER TABLE connections ADD COLUMN models TEXT")
         .execute(pool)
         .await?;
     Ok(())

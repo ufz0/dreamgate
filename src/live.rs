@@ -12,6 +12,7 @@ use tokio::time::{Interval, MissedTickBehavior};
 
 use crate::auth::Caller;
 use crate::presence::{self, PresenceEvent};
+use crate::shutdown::Phase;
 use crate::state::{Hub, State};
 use crate::stats;
 
@@ -102,10 +103,13 @@ pub async fn stream_events(AxumState(st): AxumState<State>, caller: Caller) -> R
         .chain(stream::unfold(feed, move |mut feed| async move {
             loop {
                 let payload = tokio::select! {
+                    // A page's live stream ends when the process starts to stop, because an open stream would
+                    // hold the stop for as long as the page stays open; the page reconnects on its own.
+                    biased;
+                    _ = feed.st.shutdown.reached(Phase::Draining) => return None,
                     // The hub is read before the tick. A stream leaves the list in the same step that sends its
                     // row's event, so progress read without the stream has the row waiting here, and the row
                     // goes first.
-                    biased;
                     event = feed.receiver.recv() => {
                         let Ok(event) = event else {
                             return None;
@@ -169,6 +173,9 @@ pub async fn stream_events(AxumState(st): AxumState<State>, caller: Caller) -> R
     );
     out.headers_mut()
         .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-cache"));
+    // As on the gateway's own streams: a proxy that buffers would hold the page's updates back.
+    out.headers_mut()
+        .insert("x-accel-buffering", HeaderValue::from_static("no"));
     *out.body_mut() = Body::from_stream(body);
     out.into_response()
 }

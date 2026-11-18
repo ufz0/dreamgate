@@ -1,8 +1,8 @@
 use axum::extract::{Path, State as AxumState};
-use axum::http::StatusCode;
+use axum::http::{HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Json, Response};
-use serde::Deserialize;
-use serde_json::json;
+use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
 use sqlx::Row;
 use std::sync::Arc;
 use std::time::Duration;
@@ -28,6 +28,126 @@ pub struct Connection {
     // What the connection says it can take at once. Null means it never said, which is not the same as a
     // limit of one: an unstated capability is admitted by the default rather than by a guess.
     pub max_concurrent: Option<i64>,
+    // The models the connection listed at its last check that could read its list. None means no list has been
+    // read, which is not the same as a list with nothing in it.
+    pub models: Option<Vec<Listed>>,
+    pub kind: Kind,
+}
+
+// What kind of upstream a connection is. Every kind speaks the OpenAI API; a kind other than the plain one also
+// needs something more on each request, which `authorized` adds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Kind {
+    OpenAi,
+    OpencodeGo,
+}
+
+impl Kind {
+    pub fn parse(text: &str) -> Option<Kind> {
+        match text {
+            "openai" => Some(Kind::OpenAi),
+            "opencode-go" => Some(Kind::OpencodeGo),
+            _ => None,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Kind::OpenAi => "openai",
+            Kind::OpencodeGo => "opencode-go",
+        }
+    }
+}
+
+// OpenCode Go asks every client to name itself with a user agent of its own rather than an HTTP library's, and to
+// send a session that stays the same for each conversation, which it routes and caches prompts by and without
+// which it refuses the request. It also asks a client that forwards requests to pass on the session it was sent,
+// so a session a client sends is the one that goes on; a client that sends none, and the gateway's own checks and
+// model lists, are sent the gateway's.
+pub const OPENCODE_USER_AGENT: &str = "DreamGate/1.0";
+pub const OPENCODE_SESSION_HEADER: &str = "x-opencode-session";
+pub const OPENCODE_SESSION: &str = "ses_dreamgate_abc123";
+
+// The session a client sent, if it sent one with something in it. An empty value is no session, and is replaced by
+// the gateway's rather than passed on to an upstream that refuses a request without one.
+pub fn client_session(headers: &axum::http::HeaderMap) -> Option<HeaderValue> {
+    headers
+        .get(OPENCODE_SESSION_HEADER)
+        .filter(|value| !value.as_bytes().trim_ascii().is_empty())
+        .cloned()
+}
+
+// A request to a connection, with its key and whatever else its kind asks for. Every request the gateway sends a
+// connection goes through here, so a kind's headers cannot be on one of them and missing from another.
+pub fn authorized(
+    request: reqwest::RequestBuilder,
+    connection: &Connection,
+    session: Option<&HeaderValue>,
+) -> reqwest::RequestBuilder {
+    let request = request.header(
+        header::AUTHORIZATION,
+        format!("Bearer {}", connection.api_key.clone().unwrap_or_default()),
+    );
+    match connection.kind {
+        Kind::OpenAi => request,
+        Kind::OpencodeGo => request
+            .header(header::USER_AGENT, OPENCODE_USER_AGENT)
+            .header(
+                OPENCODE_SESSION_HEADER,
+                session
+                    .cloned()
+                    .unwrap_or(HeaderValue::from_static(OPENCODE_SESSION)),
+            ),
+    }
+}
+
+// A model as a connection listed it: its id, and the time it was made when the upstream gave one, which the
+// merged model list passes on rather than leave out a field a typed client requires or make one up.
+#[derive(Clone, Serialize, Deserialize)]
+pub struct Listed {
+    pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created: Option<i64>,
+}
+
+impl Connection {
+    // Whether the connection's list was read and names the model.
+    pub fn lists(&self, model: &str) -> bool {
+        self.models
+            .as_ref()
+            .is_some_and(|models| models.iter().any(|listed| same_model(&listed.id, model)))
+    }
+
+    // Whether the connection's list was read and does not name the model. A list that was never read says
+    // nothing about what the connection serves, so it never counts against it.
+    pub fn lists_without(&self, model: &str) -> bool {
+        self.models.is_some() && !self.lists(model)
+    }
+}
+
+// Ollama lists a model under its tag and answers to its name without one, which it reads as `:latest`, so the
+// two are the same model here.
+pub fn same_model(listed: &str, asked: &str) -> bool {
+    listed == asked
+        || listed.strip_suffix(":latest") == Some(asked)
+        || asked.strip_suffix(":latest") == Some(listed)
+}
+
+// The models in an OpenAI-shaped list. A body in any other shape, or with an entry that has no id to read, is not
+// a list of nothing or of some of its models but one that was not read, so it gives none: a list read in part
+// would move a connection back for the models it left out.
+fn listed_models(body: &[u8]) -> Option<Vec<Listed>> {
+    let body: Value = serde_json::from_slice(body).ok()?;
+    body.get("data")?
+        .as_array()?
+        .iter()
+        .map(|entry| {
+            Some(Listed {
+                id: entry.get("id")?.as_str()?.to_string(),
+                created: entry.get("created").and_then(Value::as_i64),
+            })
+        })
+        .collect()
 }
 
 fn row_to_connection(row: &sqlx::sqlite::SqliteRow) -> Connection {
@@ -42,6 +162,12 @@ fn row_to_connection(row: &sqlx::sqlite::SqliteRow) -> Connection {
         health: row.get::<String, _>("health"),
         last_checked_at: row.get::<Option<String>, _>("last_checked_at"),
         max_concurrent: row.get::<Option<i64>, _>("max_concurrent"),
+        models: row
+            .get::<Option<String>, _>("models")
+            .and_then(|text| serde_json::from_str(&text).ok()),
+        // Only the kinds this version knows are written, so another is one a newer version wrote; it is sent the
+        // plain OpenAI API, which every kind speaks, rather than refused.
+        kind: Kind::parse(&row.get::<String, _>("kind")).unwrap_or(Kind::OpenAi),
     }
 }
 
@@ -54,10 +180,138 @@ pub fn endpoint(base_url: &str, path: &str) -> String {
     }
 }
 
+// The health each enabled connection's last check left, for a scrape of `/metrics`. A connection that is
+// turned off is left out, because no check reaches it and what it holds is stale.
+pub async fn health_readings(st: &State) -> Result<Vec<(i64, String, String)>, sqlx::Error> {
+    let rows =
+        sqlx::query("SELECT id, name, health FROM connections WHERE enabled = 1 ORDER BY id")
+            .fetch_all(&st.pool)
+            .await?;
+    Ok(rows
+        .iter()
+        .map(|row| (row.get("id"), row.get("name"), row.get("health")))
+        .collect())
+}
+
+// The connections one request was sent to that failed it, kept in memory while the request runs and written
+// together when it is over, so a failover goes on to the next connection without waiting for a write, and each
+// failure is written once, already knowing whether the request went on after it. The request's last task writes
+// them before it lets its slots go, which is what a stop waits for. A request whose client left drops them
+// instead, and they are written from there on a task of their own. A failure that cannot be written is logged
+// and otherwise let go: the request it belongs to is answered all the same.
+pub struct Failures {
+    st: State,
+    pending: Vec<Failure>,
+}
+
+struct Failure {
+    connection_id: i64,
+    kind: &'static str,
+    at: String,
+    passed_on: bool,
+    usage_id: Option<i64>,
+}
+
+impl Failures {
+    pub fn new(st: &State) -> Self {
+        Failures {
+            st: st.clone(),
+            pending: Vec::new(),
+        }
+    }
+
+    pub fn push(&mut self, connection_id: i64, kind: &'static str) {
+        self.pending.push(Failure {
+            connection_id,
+            kind,
+            at: crate::clock::now(),
+            passed_on: false,
+            usage_id: None,
+        });
+    }
+
+    // The request is going on to another connection after these failures, which is what a failover is.
+    pub fn passed_on(&mut self) {
+        for failure in &mut self.pending {
+            failure.passed_on = true;
+        }
+    }
+
+    // The row of the answer a failure cut short: a stream that broke off or went quiet after its head was sent.
+    // Its row says the connection answered, and this is how the figures know that answer was a failure, not an
+    // answer that took that long.
+    pub fn cut_short(&mut self, usage_id: i64) {
+        for failure in self.pending.iter_mut().filter(|failure| !failure.passed_on) {
+            failure.usage_id = Some(usage_id);
+        }
+    }
+
+    pub async fn write(&mut self) {
+        let pending = std::mem::take(&mut self.pending);
+        write_failures(&self.st, pending).await;
+    }
+}
+
+impl Drop for Failures {
+    fn drop(&mut self) {
+        if self.pending.is_empty() {
+            return;
+        }
+        let pending = std::mem::take(&mut self.pending);
+        let st = self.st.clone();
+        match tokio::runtime::Handle::try_current() {
+            Ok(runtime) => {
+                runtime.spawn(async move { write_failures(&st, pending).await });
+            }
+            Err(_) => tracing::warn!(
+                "{} connection failures were let go with no runtime to write them",
+                pending.len()
+            ),
+        }
+    }
+}
+
+async fn write_failures(st: &State, pending: Vec<Failure>) {
+    if pending.is_empty() {
+        return;
+    }
+    // The failures are written in one statement, which lands whole or not at all, so a connection removed while
+    // the request ran is left out rather than let its reference fail the others with it.
+    let mut insert = sqlx::QueryBuilder::new(
+        "INSERT INTO connection_failures (connection_id, kind, passed_on, usage_id, created_at) \
+         SELECT * FROM (",
+    );
+    insert.push_values(pending, |mut row, failure| {
+        row.push_bind(failure.connection_id)
+            .push_bind(failure.kind)
+            .push_bind(failure.passed_on as i64)
+            .push_bind(failure.usage_id)
+            .push_bind(failure.at);
+    });
+    insert.push(") WHERE column1 IN (SELECT id FROM connections)");
+    if let Err(err) = insert.build().execute(&st.pool).await {
+        tracing::warn!("a connection's failures could not be written down: {err}");
+    }
+}
+
+// Nothing reads a failure older than the figures' window, so the table is kept to it rather than left to grow.
+async fn prune_failures(st: &State) {
+    let before = (chrono::Utc::now()
+        - chrono::Duration::hours(crate::stats::CONNECTION_WINDOW_HOURS))
+    .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    if let Err(err) = sqlx::query("DELETE FROM connection_failures WHERE created_at < ?")
+        .bind(before)
+        .execute(&st.pool)
+        .await
+    {
+        tracing::warn!("old connection failures could not be removed: {err}");
+    }
+}
+
 pub async fn candidates(st: &State, preferred: Option<i64>) -> Vec<Connection> {
     let rows = sqlx::query(
         "SELECT id, name, base_url, api_key, default_model, enabled, priority, health, last_checked_at, \
-         max_concurrent FROM connections WHERE enabled = 1 ORDER BY priority ASC, id ASC",
+         max_concurrent, models, kind FROM connections WHERE enabled = 1 ORDER BY priority ASC, id ASC",
     )
     .fetch_all(&st.pool)
     .await
@@ -74,35 +328,63 @@ pub async fn candidates(st: &State, preferred: Option<i64>) -> Vec<Connection> {
     // every 30 seconds, so one marked down may be answering again, and leaving out every connection
     // that is marked down would send a request nowhere when all of them are. The sort is stable, so
     // the connections that are not down keep their order — the key's own connection first, then
-    // priority — and the ones that are down follow in that same order. Both gateway endpoints read
-    // this one order: a completion tries each in turn, and the model list asks the first.
+    // priority — and the ones that are down follow in that same order. Every gateway endpoint reads
+    // this one order: a request tries each in turn, after moving back the ones whose list does not
+    // name its model, and the model list names each model after the first connection that lists it.
     all.sort_by_key(|conn| conn.health == "down");
     all
 }
 
 pub async fn check(st: &State, connection: &Connection) -> StatusCode {
     let url = endpoint(&connection.base_url, "models");
-    let result = st
-        .http
-        .get(&url)
-        .header(
-            "Authorization",
-            format!("Bearer {}", connection.api_key.clone().unwrap_or_default()),
-        )
+    let result = authorized(st.http.get(&url), connection, None)
         .timeout(Duration::from_secs(10))
         .send()
         .await;
-    let status = match result {
-        Ok(resp) => resp.status(),
-        Err(_) => StatusCode::BAD_GATEWAY,
+    // The body is read apart from what it says: one that could not be read, because the connection broke off
+    // or went quiet while sending it, leaves the last list as it was, and only one that was read and is in
+    // another shape is stored as no list.
+    let (status, body) = match result {
+        Ok(resp) => {
+            let status = resp.status();
+            let body = if status.is_success() {
+                resp.bytes().await.ok()
+            } else {
+                None
+            };
+            (status, body)
+        }
+        Err(_) => (StatusCode::BAD_GATEWAY, None),
     };
-    let health = if status.is_success() { "ok" } else { "down" };
-    let _ = sqlx::query("UPDATE connections SET health = ?, last_checked_at = ? WHERE id = ?")
-        .bind(health)
-        .bind(crate::clock::now())
-        .bind(connection.id)
-        .execute(&st.pool)
-        .await;
+    if !status.is_success() {
+        // A connection that did not answer keeps the list it gave last: it is tried after the others while it
+        // is down, and when it answers again it most likely serves what it served before.
+        let _ =
+            sqlx::query("UPDATE connections SET health = 'down', last_checked_at = ? WHERE id = ?")
+                .bind(crate::clock::now())
+                .bind(connection.id)
+                .execute(&st.pool)
+                .await;
+        return status;
+    }
+    let Some(body) = body else {
+        let _ =
+            sqlx::query("UPDATE connections SET health = 'ok', last_checked_at = ? WHERE id = ?")
+                .bind(crate::clock::now())
+                .bind(connection.id)
+                .execute(&st.pool)
+                .await;
+        return status;
+    };
+    let models = listed_models(&body).and_then(|models| serde_json::to_string(&models).ok());
+    let _ = sqlx::query(
+        "UPDATE connections SET health = 'ok', last_checked_at = ?, models = ? WHERE id = ?",
+    )
+    .bind(crate::clock::now())
+    .bind(models)
+    .bind(connection.id)
+    .execute(&st.pool)
+    .await;
     status
 }
 
@@ -115,12 +397,14 @@ pub struct CreateConnection {
     pub priority: Option<i64>,
     // What the connection can take at once. Left out means it never said, and the default limit applies.
     pub max_concurrent: Option<i64>,
+    // `openai` or `opencode-go`; left out, the plain OpenAI API.
+    pub kind: Option<String>,
 }
 
 pub async fn list(AxumState(st): AxumState<State>, caller: Caller) -> Response {
     let rows = sqlx::query(
         "SELECT id, name, base_url, api_key, default_model, enabled, priority, health, last_checked_at, \
-         max_concurrent FROM connections ORDER BY priority ASC, id ASC",
+         max_concurrent, models, kind FROM connections ORDER BY priority ASC, id ASC",
     )
     .fetch_all(&st.pool)
     .await
@@ -128,7 +412,7 @@ pub async fn list(AxumState(st): AxumState<State>, caller: Caller) -> Response {
     // An upstream key is a secret, so it is returned to an admin alone, and so is the address: it
     // names an internal host and port, and can carry a credential of its own in its query or its
     // user part. The rest of the row is what any signed-in account needs for the gate readout and
-    // the model list.
+    // the model list, and the type, which names the kind of service and nothing about where it is.
     let admin = caller.role == "admin";
     let out: Vec<serde_json::Value> = rows
         .iter()
@@ -151,6 +435,13 @@ pub async fn list(AxumState(st): AxumState<State>, caller: Caller) -> Response {
                 "health": c.health,
                 "last_checked_at": c.last_checked_at,
                 "max_concurrent": c.max_concurrent,
+                // As stored: a type this version does not know is sent the plain API, but it is not the
+                // plain type, so it is not listed as one.
+                "kind": row.get::<String, _>("kind"),
+                // The ids alone: the page shows how many and which, and the dates are for the model list.
+                "models": c.models.as_ref().map(|models| {
+                    models.iter().map(|listed| listed.id.clone()).collect::<Vec<_>>()
+                }),
             })
         })
         .collect();
@@ -194,9 +485,22 @@ pub async fn create(
             "max_concurrent must be positive",
         );
     }
+    let kind = match body.kind.as_deref().map(str::trim) {
+        None | Some("") => Kind::OpenAi,
+        Some(text) => match Kind::parse(text) {
+            Some(kind) => kind,
+            None => {
+                return error(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_request",
+                    "kind must be openai or opencode-go",
+                );
+            }
+        },
+    };
     let row = sqlx::query(
         "INSERT INTO connections (name, base_url, api_key, default_model, priority, max_concurrent, \
-         created_at) VALUES (?, ?, ?, ?, ?, ?, ?) RETURNING id",
+         kind, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?) RETURNING id",
     )
     .bind(&name)
     .bind(&base_url)
@@ -204,6 +508,7 @@ pub async fn create(
     .bind(&body.default_model)
     .bind(body.priority.unwrap_or(0))
     .bind(body.max_concurrent)
+    .bind(kind.label())
     .bind(crate::clock::now())
     .fetch_one(&st.pool)
     .await;
@@ -257,7 +562,7 @@ pub async fn health_check(
     }
     let row = sqlx::query(
         "SELECT id, name, base_url, api_key, default_model, enabled, priority, health, last_checked_at, \
-         max_concurrent FROM connections WHERE id = ?",
+         max_concurrent, models, kind FROM connections WHERE id = ?",
     )
     .bind(id)
     .fetch_optional(&st.pool)
@@ -297,7 +602,7 @@ async fn rounds(st: State) {
     loop {
         let rows = sqlx::query(
             "SELECT id, name, base_url, api_key, default_model, enabled, priority, health, last_checked_at, \
-             max_concurrent FROM connections WHERE enabled = 1",
+             max_concurrent, models, kind FROM connections WHERE enabled = 1",
         )
         .fetch_all(&st.pool)
         .await
@@ -317,6 +622,7 @@ async fn rounds(st: State) {
             });
         }
         while running.join_next().await.is_some() {}
+        prune_failures(&st).await;
         tokio::time::sleep(std::time::Duration::from_secs(30)).await;
     }
 }

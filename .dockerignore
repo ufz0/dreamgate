@@ -1,0 +1,10 @@
+# Kept out of what is sent to the build: build output, the runtime state and any database, which holds keys and
+# has no place in an image. The build itself copies only the manifest, the lockfile, the source and the
+# dashboard.
+target
+data
+.git
+.claude
+*.db
+*.db-wal
+*.db-shm

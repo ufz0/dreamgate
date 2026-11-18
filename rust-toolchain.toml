@@ -1,0 +1,7 @@
+# The toolchain CI pins in .github/workflows/ci.yml, named here so that rustup picks the same one locally.
+# rustfmt has to match: a different rustfmt can wrap differently, and `cargo fmt --check` in CI would then
+# fail on a change that was formatted before it was committed. A toolchain installed without rustup does
+# not read this file, so check `cargo --version` against the pin there.
+[toolchain]
+channel = "1.99"
+components = ["rustfmt", "clippy"]

@@ -20,7 +20,8 @@ src/        the gateway: one module per concern (api, auth, clock, db, gateway, 
             live, presence, registry, settings, state, stats, tokens, usage, users), plus
             lib.rs, the route table, and main.rs, which starts everything
 web/        the dashboard (plain html, css, js — no build step, no bundler)
-tests/      integration tests against an in-memory SQLite database
+tests/      integration tests against an in-memory SQLite database, and one that runs the binary
+deploy/     example systemd units, for the service and a daily backup; the Dockerfile is at the root, where `docker build .` finds it
 data/       runtime state, gitignored
 ```
 
@@ -46,8 +47,10 @@ changes to `web/` take effect on reload.
   `cargo fmt` before committing and leave the files as rustfmt writes them. Comments are wrapped by
   hand, because rustfmt does not reflow them. CI checks formatting with the rustfmt of the toolchain it
   pins, which is the one the code is formatted with; a different rustfmt can wrap differently, so the
-  check has to be the same one the change was written with. The pin cannot go below 1.88, because
-  packages in the lockfile require it.
+  check has to be the same one the change was written with. `rust-toolchain.toml` names the same
+  version, so rustup picks it locally; a toolchain installed another way does not read that file, so
+  compare `cargo --version` with the pin. The pin cannot go below 1.94, because sqlx in the lockfile
+  requires it, which `rust-version` in `Cargo.toml` states.
 - Comments are full sentences that explain *why*, not what. A comment that restates
   the code is noise; one that records a constraint the code cannot express is worth
   keeping. Match the style already in `src/db.rs` and `src/auth.rs`.
