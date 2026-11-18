@@ -69,14 +69,18 @@ pub const SCHEMA: &[&str] = &[
     // Each time a connection failed a request: it could not be reached or gave no answer (`unreachable`), its
     // answer broke off (`broken`), or its stream went quiet for the stall window (`stalled`), and whether the
     // request was then passed on to another connection. A usage row says which connection answered; this is
-    // what the rows cannot say, the connections that were asked first and did not. A table of its own, made on
-    // start like every other, so a database written before it gains it empty; a connection's failures go with
-    // it when it is removed, because they only mean something beside the connection.
+    // what the rows cannot say, the connections that were asked first and did not. A stream cut short after its
+    // head was sent has a usage row as well, which `usage_id` names, so its figures count it as a failure rather
+    // than as an answer that took that long; it is not a reference, because a failure says nothing more once
+    // the row is gone. A table of its own, made on start like every other, so a database written before it gains
+    // it empty; a connection's failures go with it when it is removed, because they only mean something beside
+    // the connection, and rows older than the figures' window are removed by the health round.
     "CREATE TABLE IF NOT EXISTS connection_failures (
         id INTEGER PRIMARY KEY,
         connection_id INTEGER NOT NULL REFERENCES connections(id) ON DELETE CASCADE,
         kind TEXT NOT NULL,
         passed_on INTEGER NOT NULL DEFAULT 0,
+        usage_id INTEGER,
         created_at TEXT NOT NULL
     )",
     "CREATE TABLE IF NOT EXISTS settings (
@@ -94,6 +98,8 @@ const INDEXES: &[&str] = &[
     "CREATE INDEX IF NOT EXISTS idx_usage_key ON usage (api_key_id)",
     "CREATE INDEX IF NOT EXISTS idx_usage_user ON usage (user_id)",
     "CREATE INDEX IF NOT EXISTS idx_failures_created ON connection_failures (created_at)",
+    // Removing a connection removes its failures, which would otherwise read the whole table to find them.
+    "CREATE INDEX IF NOT EXISTS idx_failures_connection ON connection_failures (connection_id)",
 ];
 
 async fn has_column<'e, E>(db: E, table: &str, column: &str) -> Result<bool, sqlx::Error>

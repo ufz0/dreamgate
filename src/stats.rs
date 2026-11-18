@@ -4,6 +4,7 @@ use axum::extract::State as AxumState;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Json, Response};
 use chrono::{Duration, SecondsFormat, Utc};
+use futures_util::TryStreamExt;
 use serde_json::json;
 use sqlx::{Column, Row};
 
@@ -11,9 +12,10 @@ use crate::api::{error, server_error};
 use crate::auth::Caller;
 use crate::state::State;
 
-// Usage rows are stored as UTC text, so time filters go through strftime rather than
-// raw string comparison. The column must be qualified wherever a join makes user_id
-// ambiguous.
+// Usage rows are stored as UTC text in one shape, `clock::now`'s. The buckets of the charts read a day or an hour
+// out of it with strftime; a filter on a moment compares the text with a moment written the same way, which
+// orders as the time does and can use the index on the column. The column must be qualified wherever a join
+// makes user_id ambiguous.
 fn scope_clause(scoped: bool, column: &str) -> String {
     if scoped {
         format!(" WHERE {column} = ?")
@@ -293,7 +295,7 @@ pub async fn recent(AxumState(st): AxumState<State>, caller: Caller) -> Response
 
 // How far back the figures for each connection look: long enough to cover a night, short enough that what
 // they say is about the connection as it is now.
-const CONNECTION_WINDOW_HOURS: i64 = 24;
+pub const CONNECTION_WINDOW_HOURS: i64 = 24;
 
 // Each connection's last day: what it answered, how many of those answers were errors, how often it failed a
 // request it was sent and how often that request was passed on to another connection, and how long its answers
@@ -325,12 +327,18 @@ async fn connection_figures(st: &State) -> Result<serde_json::Value, sqlx::Error
         .map(|row| row.get("id"))
         .collect();
 
+    // A stream that broke off or went quiet after its head was sent has a row, which its failure names. It is
+    // counted as the failure, not as an answer, and its time is not an answer's time: a stall would put the
+    // whole stall window into it.
+    const ANSWERED: &str = "connection_id IS NOT NULL AND created_at >= ? AND id NOT IN \
+         (SELECT usage_id FROM connection_failures WHERE usage_id IS NOT NULL AND created_at >= ?)";
     let mut answered: HashMap<i64, (i64, i64)> = HashMap::new();
-    for row in sqlx::query(
+    for row in sqlx::query(sqlx::AssertSqlSafe(format!(
         "SELECT connection_id, COUNT(*) AS answered, \
                 SUM(CASE WHEN status >= 400 THEN 1 ELSE 0 END) AS errors \
-         FROM usage WHERE connection_id IS NOT NULL AND created_at >= ? GROUP BY connection_id",
-    )
+         FROM usage WHERE {ANSWERED} GROUP BY connection_id"
+    )))
+    .bind(&since)
     .bind(&since)
     .fetch_all(&st.pool)
     .await?
@@ -361,22 +369,27 @@ async fn connection_figures(st: &State) -> Result<serde_json::Value, sqlx::Error
         );
     }
 
-    // SQLite has no percentile, so the latencies of the window are read in order and the ranks taken here. An
-    // answer that was an error is left out: a refusal that comes back at once would make a connection look
-    // fast.
+    // SQLite has no percentile, so the latencies of the window are read and the ranks taken here. An answer that
+    // was an error is left out: a refusal that comes back at once would make a connection look fast. A day of a
+    // busy gateway is many rows, so they are read one at a time and only the number kept, and each connection's
+    // are put in order here rather than by SQLite, which would sort the whole day before the first came back.
     let mut latencies: HashMap<(i64, bool), Vec<i64>> = HashMap::new();
-    for row in sqlx::query(
-        "SELECT connection_id, streamed, latency_ms FROM usage \
-         WHERE connection_id IS NOT NULL AND created_at >= ? AND status < 400 ORDER BY latency_ms",
-    )
-    .bind(&since)
-    .fetch_all(&st.pool)
-    .await?
-    {
+    let query = format!(
+        "SELECT connection_id, streamed, latency_ms FROM usage WHERE {ANSWERED} AND status < 400"
+    );
+    let mut rows = sqlx::query(sqlx::AssertSqlSafe(query))
+        .bind(&since)
+        .bind(&since)
+        .fetch(&st.pool);
+    while let Some(row) = rows.try_next().await? {
         latencies
             .entry((row.get("connection_id"), row.get::<i64, _>("streamed") != 0))
             .or_default()
             .push(row.get("latency_ms"));
+    }
+    drop(rows);
+    for values in latencies.values_mut() {
+        values.sort_unstable();
     }
     let timing = |id: i64, streamed: bool| {
         let sorted = latencies

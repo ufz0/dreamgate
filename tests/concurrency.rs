@@ -856,14 +856,26 @@ async fn a_stream_that_goes_quiet_is_closed_and_its_slot_is_given_back() {
         "nothing was reported for a stream closed at the silence"
     );
 
-    // A stream closed at the silence is written down against its connection, and counted for a scrape.
-    let stalled =
-        sqlx::query("SELECT COUNT(*) AS n FROM connection_failures WHERE kind = 'stalled'")
-            .fetch_one(&st.pool)
+    // A stream closed at the silence is written down against its connection, naming its row so the figures count
+    // it as a failure and not as an answer, and counted for a scrape. The failure is written just after the row.
+    let mut stalled = Vec::new();
+    for _ in 0..200 {
+        stalled = sqlx::query("SELECT usage_id FROM connection_failures WHERE kind = 'stalled'")
+            .fetch_all(&st.pool)
             .await
-            .unwrap()
-            .get::<i64, _>("n");
-    assert_eq!(stalled, 1);
+            .unwrap();
+        if !stalled.is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(stalled.len(), 1);
+    let row_id = sqlx::query("SELECT id FROM usage")
+        .fetch_one(&st.pool)
+        .await
+        .unwrap()
+        .get::<i64, _>("id");
+    assert_eq!(stalled[0].get::<Option<i64>, _>("usage_id"), Some(row_id));
     let scrape = router
         .clone()
         .oneshot(

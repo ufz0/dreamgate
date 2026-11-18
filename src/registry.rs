@@ -122,37 +122,108 @@ pub async fn health_readings(st: &State) -> Result<Vec<(i64, String, String)>, s
         .collect())
 }
 
-// Writes down that a connection failed a request, for its figures on the Connections view, and gives back the
-// row's id so the request can mark it as passed on if it goes on to another connection. A failure that cannot be
-// written is logged and otherwise let go: the request it belongs to is answered all the same.
-pub async fn record_failure(st: &State, connection_id: i64, kind: &str) -> Option<i64> {
-    let written = sqlx::query(
-        "INSERT INTO connection_failures (connection_id, kind, created_at) VALUES (?, ?, ?) RETURNING id",
-    )
-    .bind(connection_id)
-    .bind(kind)
-    .bind(crate::clock::now())
-    .fetch_one(&st.pool)
-    .await;
-    match written {
-        Ok(row) => Some(row.get::<i64, _>("id")),
-        Err(err) => {
-            tracing::warn!("a connection's failure could not be written down: {err}");
-            None
+// The connections one request was sent to that failed it, kept in memory while the request runs and written
+// together when it is over, so a failover goes on to the next connection without waiting for a write, and each
+// failure is written once, already knowing whether the request went on after it. The request's last task writes
+// them before it lets its slots go, which is what a stop waits for. A request whose client left drops them
+// instead, and they are written from there on a task of their own. A failure that cannot be written is logged
+// and otherwise let go: the request it belongs to is answered all the same.
+pub struct Failures {
+    st: State,
+    pending: Vec<Failure>,
+}
+
+struct Failure {
+    connection_id: i64,
+    kind: &'static str,
+    at: String,
+    passed_on: bool,
+    usage_id: Option<i64>,
+}
+
+impl Failures {
+    pub fn new(st: &State) -> Self {
+        Failures {
+            st: st.clone(),
+            pending: Vec::new(),
+        }
+    }
+
+    pub fn push(&mut self, connection_id: i64, kind: &'static str) {
+        self.pending.push(Failure {
+            connection_id,
+            kind,
+            at: crate::clock::now(),
+            passed_on: false,
+            usage_id: None,
+        });
+    }
+
+    // The request is going on to another connection after these failures, which is what a failover is.
+    pub fn passed_on(&mut self) {
+        for failure in &mut self.pending {
+            failure.passed_on = true;
+        }
+    }
+
+    // The row of the answer a failure cut short: a stream that broke off or went quiet after its head was sent.
+    // Its row says the connection answered, and this is how the figures know that answer was a failure, not an
+    // answer that took that long.
+    pub fn cut_short(&mut self, usage_id: i64) {
+        for failure in self.pending.iter_mut().filter(|failure| !failure.passed_on) {
+            failure.usage_id = Some(usage_id);
+        }
+    }
+
+    pub async fn write(&mut self) {
+        let pending = std::mem::take(&mut self.pending);
+        write_failures(&self.st, pending).await;
+    }
+}
+
+impl Drop for Failures {
+    fn drop(&mut self) {
+        if self.pending.is_empty() {
+            return;
+        }
+        let pending = std::mem::take(&mut self.pending);
+        let st = self.st.clone();
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(async move { write_failures(&st, pending).await });
         }
     }
 }
 
-// The request went on to another connection after these failures, which is what a failover is.
-pub async fn passed_on(st: &State, failures: &[i64]) {
-    for id in failures {
-        if let Err(err) = sqlx::query("UPDATE connection_failures SET passed_on = 1 WHERE id = ?")
-            .bind(id)
-            .execute(&st.pool)
-            .await
-        {
-            tracing::warn!("a failover could not be written down: {err}");
-        }
+async fn write_failures(st: &State, pending: Vec<Failure>) {
+    if pending.is_empty() {
+        return;
+    }
+    let mut insert = sqlx::QueryBuilder::new(
+        "INSERT INTO connection_failures (connection_id, kind, passed_on, usage_id, created_at) ",
+    );
+    insert.push_values(pending, |mut row, failure| {
+        row.push_bind(failure.connection_id)
+            .push_bind(failure.kind)
+            .push_bind(failure.passed_on as i64)
+            .push_bind(failure.usage_id)
+            .push_bind(failure.at);
+    });
+    if let Err(err) = insert.build().execute(&st.pool).await {
+        tracing::warn!("a connection's failures could not be written down: {err}");
+    }
+}
+
+// Nothing reads a failure older than the figures' window, so the table is kept to it rather than left to grow.
+async fn prune_failures(st: &State) {
+    let before = (chrono::Utc::now()
+        - chrono::Duration::hours(crate::stats::CONNECTION_WINDOW_HOURS))
+    .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    if let Err(err) = sqlx::query("DELETE FROM connection_failures WHERE created_at < ?")
+        .bind(before)
+        .execute(&st.pool)
+        .await
+    {
+        tracing::warn!("old connection failures could not be removed: {err}");
     }
 }
 
@@ -457,6 +528,7 @@ async fn rounds(st: State) {
             });
         }
         while running.join_next().await.is_some() {}
+        prune_failures(&st).await;
         tokio::time::sleep(std::time::Duration::from_secs(30)).await;
     }
 }

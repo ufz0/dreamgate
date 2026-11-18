@@ -5912,3 +5912,294 @@ async fn the_last_connection_to_fail_a_request_did_not_pass_it_on() {
         .collect();
     assert_eq!(counted, [(1, 1), (1, 0)]);
 }
+
+async fn figures_of(router: &Router, cookie: &str, connection: &Value) -> Value {
+    get_json(router, "/api/stats/connections", cookie).await["connections"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|figures| figures["id"] == connection["id"])
+        .cloned()
+        .unwrap()
+}
+
+async fn failures_written(pool: &SqlitePool, at_least: i64) -> Vec<Value> {
+    for _ in 0..200 {
+        let rows = sqlx::query(
+            "SELECT connection_id, kind, passed_on, usage_id FROM connection_failures ORDER BY id",
+        )
+        .fetch_all(pool)
+        .await
+        .unwrap();
+        if rows.len() as i64 >= at_least {
+            return rows
+                .iter()
+                .map(|row| {
+                    json!({
+                        "connection_id": row.get::<i64, _>("connection_id"),
+                        "kind": row.get::<String, _>("kind"),
+                        "passed_on": row.get::<i64, _>("passed_on") != 0,
+                        "usage_id": row.get::<Option<i64>, _>("usage_id"),
+                    })
+                })
+                .collect();
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    panic!("fewer than {at_least} failures were written");
+}
+
+// An upstream that answers every request with a head and then breaks off before the body it promised.
+async fn breaking_upstream() -> String {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        while let Ok((mut socket, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                let mut buf = [0u8; 8192];
+                let _ = socket.read(&mut buf).await;
+                let _ = socket
+                    .write_all(b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 100\r\n\r\n{\"x\":")
+                    .await;
+            });
+        }
+    });
+    format!("http://{addr}")
+}
+
+// An answer that was an error is counted among the connection's errors and left out of its times, and a row or
+// a failure older than the day is left out of the figures altogether.
+#[tokio::test]
+async fn an_error_answer_is_counted_but_not_timed_and_old_rows_are_left_out() {
+    let app = Router::new().route(
+        "/v1/chat/completions",
+        post(|| async {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": { "message": "no" } })),
+            )
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+    let st = test_state().await;
+    let router = build_router(st.clone());
+    let cookie = register(&router, "ada").await;
+    let ada = get_json(&router, "/api/me", &cookie).await["id"]
+        .as_i64()
+        .unwrap();
+    let (_, errs) = post_json(
+        &router,
+        "/api/connections",
+        &cookie,
+        json!({ "name": "errs", "base_url": format!("http://{addr}") }),
+    )
+    .await;
+    let (_, created) = post_json(&router, "/api/keys", &cookie, json!({ "name": "k" })).await;
+    let response = gateway_call(
+        &router,
+        created["key"].as_str().unwrap(),
+        json!({ "model": "m", "messages": [{ "role": "user", "content": "hi" }] }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    sqlx::query(
+        "INSERT INTO usage (user_id, connection_id, model, prompt_tokens, completion_tokens, total_tokens, \
+         latency_ms, status, created_at) VALUES (?, ?, 'm', 1, 1, 2, 5, 200, '2020-01-01T00:00:00Z')",
+    )
+    .bind(ada)
+    .bind(errs["id"].as_i64().unwrap())
+    .execute(&st.pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO connection_failures (connection_id, kind, created_at) VALUES (?, 'unreachable', '2020-01-01T00:00:00Z')",
+    )
+    .bind(errs["id"].as_i64().unwrap())
+    .execute(&st.pool)
+    .await
+    .unwrap();
+
+    let figures = figures_of(&router, &cookie, &errs).await;
+    assert_eq!(figures["answered"], 1);
+    assert_eq!(figures["errors"], 1);
+    assert_eq!(figures["failures"], 0);
+    assert_eq!(figures["single"]["count"], 0);
+    assert_eq!(figures["single"]["p50_ms"], Value::Null);
+}
+
+// A single answer that breaks off is a failure, passed on to the next connection; a stream that breaks off after
+// its head was sent has a row, but its failure names that row, so it is counted as a failure rather than as an
+// answer, and its time is not an answer's.
+#[tokio::test]
+async fn a_broken_answer_is_passed_on_and_a_broken_stream_is_not_an_answer() {
+    let st = test_state().await;
+    let router = build_router(st.clone());
+    let base_url = mock_upstream().await;
+    let cookie = register(&router, "ada").await;
+    let (_, broken) = post_json(
+        &router,
+        "/api/connections",
+        &cookie,
+        json!({ "name": "broken", "base_url": breaking_upstream().await, "priority": 0 }),
+    )
+    .await;
+    post_json(
+        &router,
+        "/api/connections",
+        &cookie,
+        json!({ "name": "up", "base_url": base_url, "priority": 1 }),
+    )
+    .await;
+    let (_, created) = post_json(&router, "/api/keys", &cookie, json!({ "name": "k" })).await;
+    let key = created["key"].as_str().unwrap().to_string();
+
+    let response = gateway_call(
+        &router,
+        &key,
+        json!({ "model": "m", "messages": [{ "role": "user", "content": "hi" }] }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let response = gateway_call(
+        &router,
+        &key,
+        json!({ "model": "m", "stream": true, "messages": [{ "role": "user", "content": "hi" }] }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let _ = response.into_body().collect().await;
+
+    let failures = failures_written(&st.pool, 2).await;
+    let stream_row = sqlx::query("SELECT id FROM usage WHERE streamed = 1")
+        .fetch_one(&st.pool)
+        .await
+        .unwrap()
+        .get::<i64, _>("id");
+    assert_eq!(failures[0]["kind"], "broken");
+    assert_eq!(failures[0]["passed_on"], true);
+    assert_eq!(failures[0]["usage_id"], Value::Null);
+    assert_eq!(failures[1]["kind"], "broken");
+    assert_eq!(failures[1]["passed_on"], false);
+    assert_eq!(failures[1]["usage_id"], stream_row);
+
+    let figures = figures_of(&router, &cookie, &broken).await;
+    assert_eq!(figures["failures"], 2);
+    assert_eq!(figures["passed_on"], 1);
+    assert_eq!(
+        figures["answered"], 0,
+        "a stream that broke off is not an answer"
+    );
+    assert_eq!(figures["streamed"]["count"], 0);
+}
+
+// A failure followed by a connection that was full is still passed on when the request reaches a third; a model
+// list that fails has nothing to pass on to; and a failure that cannot be written does not touch the request.
+#[tokio::test]
+async fn a_failure_before_a_full_connection_is_passed_on_and_a_lost_write_changes_nothing() {
+    let st = test_state().await;
+    let router = build_router(st.clone());
+    let base_url = mock_upstream().await;
+    let cookie = register(&router, "ada").await;
+    let (_, dead) = post_json(
+        &router,
+        "/api/connections",
+        &cookie,
+        json!({ "name": "dead", "base_url": "http://127.0.0.1:1", "priority": 0 }),
+    )
+    .await;
+    let (_, full) = post_json(
+        &router,
+        "/api/connections",
+        &cookie,
+        json!({ "name": "full", "base_url": base_url, "priority": 1, "max_concurrent": 1 }),
+    )
+    .await;
+    post_json(
+        &router,
+        "/api/connections",
+        &cookie,
+        json!({ "name": "up", "base_url": base_url, "priority": 2 }),
+    )
+    .await;
+    let _held = st
+        .limits
+        .for_connection(full["id"].as_i64().unwrap(), Some(1))
+        .try_acquire_owned()
+        .unwrap();
+    let (_, created) = post_json(&router, "/api/keys", &cookie, json!({ "name": "k" })).await;
+    let key = created["key"].as_str().unwrap().to_string();
+    let response = gateway_call(
+        &router,
+        &key,
+        json!({ "model": "m", "messages": [{ "role": "user", "content": "hi" }] }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let failures = failures_written(&st.pool, 1).await;
+    assert_eq!(failures[0]["connection_id"], dead["id"]);
+    assert_eq!(failures[0]["passed_on"], true);
+
+    // No list has been read, so the model list asks the first connection, which fails with nothing after it.
+    let response = models_call(&router, &key).await;
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    let failures = failures_written(&st.pool, 2).await;
+    assert_eq!(failures[1]["connection_id"], dead["id"]);
+    assert_eq!(failures[1]["passed_on"], false);
+
+    sqlx::query("DROP TABLE connection_failures")
+        .execute(&st.pool)
+        .await
+        .unwrap();
+    let response = gateway_call(
+        &router,
+        &key,
+        json!({ "model": "m", "messages": [{ "role": "user", "content": "hi" }] }),
+    )
+    .await;
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "a lost failure is not the request's"
+    );
+}
+
+// A database written before the figures gains their table and its indexes on start.
+#[tokio::test]
+async fn the_failures_table_is_added_to_a_database_written_before_it() {
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
+        .unwrap();
+    for statement in db::SCHEMA
+        .iter()
+        .filter(|statement| !statement.contains("connection_failures"))
+    {
+        sqlx::query(*statement).execute(&pool).await.unwrap();
+    }
+    for statement in db::SCHEMA {
+        sqlx::query(*statement).execute(&pool).await.unwrap();
+    }
+    db::migrate(&pool).await.unwrap();
+    let names: Vec<String> = sqlx::query(
+        "SELECT name FROM sqlite_master WHERE tbl_name = 'connection_failures' ORDER BY name",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap()
+    .iter()
+    .map(|row| row.get("name"))
+    .collect();
+    assert_eq!(
+        names,
+        [
+            "connection_failures",
+            "idx_failures_connection",
+            "idx_failures_created"
+        ]
+    );
+}
