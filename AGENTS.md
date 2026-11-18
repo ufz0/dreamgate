@@ -17,8 +17,8 @@ around it.
 
 ```
 src/        the gateway: one module per concern (api, auth, clock, db, gateway, keys, limits,
-            live, presence, registry, settings, state, stats, tokens, usage, users), plus
-            lib.rs, the route table, and main.rs, which starts everything
+            live, metrics, presence, registry, reservations, settings, shutdown, state, stats,
+            tokens, usage, users), plus lib.rs, the route table, and main.rs, which starts everything
 web/        the dashboard (plain html, css, js — no build step, no bundler)
 tests/      integration tests against an in-memory SQLite database, and one that runs the binary
 deploy/     example systemd units, for the service and a daily backup; the Dockerfile is at the root, where `docker build .` finds it
