@@ -118,10 +118,10 @@ fn upstream_failed(st: &State, conn: &Connection, err: &(dyn std::error::Error +
     tracing::warn!(connection = %conn.name, "upstream failed: {causes}");
 }
 
-// A disabled account cannot use a key at all. Both gateway endpoints read the account the same
+// A disabled account cannot use a key at all. Every gateway endpoint reads the account the same
 // way, so a key on its own cannot reach an upstream for an account that is turned off. Deleting an
 // account deletes its keys with it, so a key whose account is gone is a key that is being deleted,
-// and both endpoints answer it the way they answer a key that no longer exists.
+// and every endpoint answers it the way it answers a key that no longer exists.
 async fn account_row(st: &State, user_id: i64) -> Result<Option<SqliteRow>, sqlx::Error> {
     sqlx::query("SELECT username, enabled, daily_token_cap FROM users WHERE id = ?")
         .bind(user_id)
@@ -300,18 +300,114 @@ fn in_flight_note(in_flight: i64) -> String {
     }
 }
 
+// A model the client left blank names none, as leaving it out does.
+fn named(requested: Option<&str>) -> Option<&str> {
+    requested.filter(|model| !model.trim().is_empty())
+}
+
+// A generation is sent with the key's own model first, then the connection's default, and the model the
+// client asks for only when neither is set. An embedding is not: its vectors only mean something next to the
+// ones the same model made, and a key's or a connection's model is a model that generates, so the one the
+// client names is sent, and the other two fill in only when it names none.
 fn resolve_model(
+    endpoint: Endpoint,
     key_model: Option<&str>,
     conn: &Connection,
     requested: Option<&str>,
 ) -> Option<String> {
+    if endpoint == Endpoint::Embeddings
+        && let Some(requested) = named(requested)
+    {
+        return Some(requested.to_string());
+    }
     key_model
         .map(String::from)
         .or_else(|| conn.default_model.clone())
         .or_else(|| requested.map(String::from))
 }
 
-fn build_payload(body: &Value, model: Option<&str>) -> Value {
+// The OpenAI-compatible endpoints the gateway forwards. They share everything but where a request's input is,
+// where an answer's text is, and whether they stream; the rest of the path is the same for all three.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Endpoint {
+    Chat,
+    Completions,
+    Embeddings,
+}
+
+impl Endpoint {
+    fn path(self) -> &'static str {
+        match self {
+            Endpoint::Chat => "chat/completions",
+            Endpoint::Completions => "completions",
+            Endpoint::Embeddings => "embeddings",
+        }
+    }
+
+    // The estimate of what was sent in, used until an upstream reports its own count. A completion's input
+    // is its prompt and, for an editor filling in the middle of a file, the text after the cursor as well. Some
+    // servers take an embedding's input as chat messages, so those are read when there is no `input`.
+    fn prompt_tokens(self, body: &Value) -> i64 {
+        let field = |name: &str| body.get(name).unwrap_or(&Value::Null);
+        match self {
+            Endpoint::Chat => tokens::prompt_estimate(field("messages")),
+            Endpoint::Completions => {
+                tokens::input_estimate(field("prompt")) + tokens::input_estimate(field("suffix"))
+            }
+            Endpoint::Embeddings => match body.get("input").filter(|input| !input.is_null()) {
+                Some(input) => tokens::input_estimate(input),
+                None => tokens::prompt_estimate(field("messages")),
+            },
+        }
+    }
+
+    // An embedding is not a stream, whatever a request asks for, so nothing about streaming is added to it.
+    fn wants_stream(self, body: &Value) -> bool {
+        self != Endpoint::Embeddings && body.get("stream").and_then(Value::as_bool).unwrap_or(false)
+    }
+
+    // A single answer, read for what it reports and what it generated. An embedding's answer is mostly its
+    // vectors, which can be megabytes of numbers nothing here reads, so only the two fields the report comes
+    // from are kept and the rest is skipped without being built into a value.
+    fn parse_answer(self, bytes: &[u8]) -> Option<Value> {
+        if self == Endpoint::Embeddings {
+            #[derive(serde::Deserialize)]
+            struct Reported {
+                usage: Option<Value>,
+                timings: Option<Value>,
+            }
+            let reported = serde_json::from_slice::<Reported>(bytes).ok()?;
+            return Some(json!({ "usage": reported.usage, "timings": reported.timings }));
+        }
+        serde_json::from_str::<Value>(&String::from_utf8_lossy(bytes)).ok()
+    }
+
+    // The text a single answer generated, for the estimate when the upstream reports nothing. A chat answer
+    // is a message, a completion is text, and an embedding generates no text at all.
+    fn answer_text(self, parsed: Option<&Value>) -> String {
+        let choices = parsed
+            .and_then(|value| value.get("choices").and_then(Value::as_array))
+            .into_iter()
+            .flatten();
+        let texts: Vec<String> = match self {
+            Endpoint::Chat => choices
+                .filter_map(|choice| choice.get("message").map(text_of))
+                .collect(),
+            Endpoint::Completions => choices
+                .filter_map(|choice| choice.get("text").and_then(Value::as_str))
+                .map(str::to_string)
+                .collect(),
+            Endpoint::Embeddings => Vec::new(),
+        };
+        texts
+            .into_iter()
+            .filter(|text| !text.is_empty())
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+}
+
+fn build_payload(body: &Value, model: Option<&str>, wants_stream: bool) -> Value {
     let mut payload = body.clone();
     // When nothing names a model the body keeps what the client sent, so the upstream answers with its own
     // default rather than with a name nobody chose.
@@ -320,9 +416,7 @@ fn build_payload(body: &Value, model: Option<&str>) -> Value {
     }
     // Upstreams that support stream_options report real usage at the end of the
     // stream; without it the gateway has to estimate completion tokens.
-    if body.get("stream").and_then(Value::as_bool).unwrap_or(false)
-        && payload.get("stream_options").is_none()
-    {
+    if wants_stream && payload.get("stream_options").is_none() {
         payload["stream_options"] = json!({ "include_usage": true });
     }
     payload
@@ -458,10 +552,15 @@ fn scan_line(line: &[u8], generated: &mut String, report: &mut Report) {
         .into_iter()
         .flatten()
     {
-        let Some(delta) = choice.get("delta") else {
-            continue;
+        // A chat stream sends a delta; a completions stream sends the text itself.
+        let text = match choice.get("delta") {
+            Some(delta) => text_of(delta),
+            None => choice
+                .get("text")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
         };
-        let text = text_of(delta);
         if text.is_empty() {
             continue;
         }
@@ -696,6 +795,49 @@ pub async fn chat_completions(
     headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> Response {
+    forward(st, headers, body, Endpoint::Chat).await
+}
+
+pub async fn completions(
+    AxumState(st): AxumState<State>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Response {
+    forward(st, headers, body, Endpoint::Completions).await
+}
+
+pub async fn embeddings(
+    AxumState(st): AxumState<State>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Response {
+    forward(st, headers, body, Endpoint::Embeddings).await
+}
+
+// A path under /v1 that the gateway does not serve is answered the way an OpenAI-compatible server answers
+// one, as JSON a client can read, rather than as the empty answer of the dashboard's file server.
+pub async fn not_found(uri: axum::http::Uri) -> Response {
+    error(
+        StatusCode::NOT_FOUND,
+        "not_found",
+        format!(
+            "{} is not served here; the gateway serves /v1/chat/completions, /v1/completions, \
+             /v1/embeddings and /v1/models",
+            uri.path()
+        ),
+    )
+}
+
+// A served path asked for with a method it does not take.
+pub async fn method_not_allowed(uri: axum::http::Uri) -> Response {
+    error(
+        StatusCode::METHOD_NOT_ALLOWED,
+        "invalid_request",
+        format!("{} does not take this method", uri.path()),
+    )
+}
+
+async fn forward(st: State, headers: HeaderMap, body: Value, endpoint: Endpoint) -> Response {
     let started = Instant::now();
     if st.shutdown.phase() != Phase::Running {
         return shutting_down();
@@ -722,7 +864,7 @@ pub async fn chat_completions(
     // Counted from here, so a request that is refused by a limit still marks the account as
     // active; the guard is released when the request finishes, including for a stream.
     let present = presence::track(&st, key.user_id);
-    let prompt_tokens = tokens::prompt_estimate(body.get("messages").unwrap_or(&Value::Null));
+    let prompt_tokens = endpoint.prompt_tokens(&body);
     // Dropped without being settled, as on every early answer below, the hold is given back.
     let mut reservation = match enforce_limits(&st, &key, prompt_tokens).await {
         Ok(reservation) => reservation,
@@ -737,7 +879,7 @@ pub async fn chat_completions(
             "no enabled connection is available for this key",
         );
     }
-    let wants_stream = body.get("stream").and_then(Value::as_bool).unwrap_or(false);
+    let wants_stream = endpoint.wants_stream(&body);
     let requested = body.get("model").and_then(Value::as_str);
     // The request is admitted as a whole, before anything is asked of a connection, and the slots are held for
     // as long as it runs. Nothing is queued here: a connection that is full is skipped, so one slow
@@ -785,9 +927,9 @@ pub async fn chat_completions(
             full.push(conn.name.clone());
             continue;
         };
-        let model = resolve_model(key.model.as_deref(), conn, requested);
-        let url = registry::endpoint(&conn.base_url, "chat/completions");
-        let payload = build_payload(&body, model.as_deref());
+        let model = resolve_model(endpoint, key.model.as_deref(), conn, requested);
+        let url = registry::endpoint(&conn.base_url, endpoint.path());
+        let payload = build_payload(&body, model.as_deref(), wants_stream);
         // The row and the stream in flight name the model the gateway sent, and say unknown when it sent none.
         // The upstream's answer says which model it used, but that is not read here.
         let model = model.unwrap_or_else(|| String::from("unknown"));
@@ -895,20 +1037,12 @@ pub async fn chat_completions(
                 continue;
             }
         };
-        let parsed = serde_json::from_str::<Value>(&String::from_utf8_lossy(&bytes)).ok();
+        let parsed = endpoint.parse_answer(&bytes);
         let mut report = Report::default();
         if let Some(value) = parsed.as_ref() {
             read_report(value, &mut report);
         }
-        let completion_text = parsed
-            .as_ref()
-            .and_then(|value| value.get("choices").and_then(Value::as_array))
-            .into_iter()
-            .flatten()
-            .filter_map(|choice| choice.get("message").map(text_of))
-            .filter(|text| !text.is_empty())
-            .collect::<Vec<_>>()
-            .join(" ");
+        let completion_text = endpoint.answer_text(parsed.as_ref());
         let (prompt, completion, estimated) = if report.reported() {
             (
                 report.prompt.unwrap_or(prompt_tokens),
@@ -984,6 +1118,11 @@ pub async fn chat_completions(
             connection_id: cut.as_ref().map(|(id, _)| *id),
             model: match &cut {
                 Some((_, model)) => Some(model.clone()),
+                // No connection answered, so no one connection's default can be named; for an embedding the model
+                // the client named was sent to every connection tried, ahead of the key's.
+                None if endpoint == Endpoint::Embeddings => named(requested)
+                    .map(String::from)
+                    .or_else(|| key.model.clone()),
                 None => key.model.clone().or_else(|| requested.map(String::from)),
             },
             prompt_tokens,

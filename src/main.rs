@@ -78,7 +78,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     let bound = listener.local_addr()?;
     println!("DreamGate listening on {bound}");
-    println!("  gateway:   POST /v1/chat/completions (OpenAI compatible)");
+    println!(
+        "  gateway:   POST /v1/chat/completions, /v1/completions, /v1/embeddings (OpenAI compatible)"
+    );
     println!("  dashboard: http://{}/", dashboard_address(bound));
 
     let grace = Duration::from_secs(limits::env_number(

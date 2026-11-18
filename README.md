@@ -153,10 +153,11 @@ was taken by an older version.
    only visible in the API response. Left out, the default is used; a stated value has to be positive,
    because a capability of zero would admit nothing, which is not what leaving it out means.
 2. Create a key. A DreamGate key is what clients use — the upstream key stays server-side.
-   Optionally bind a key to one connection, pin a model, or set a requests-per-minute limit
-   and a token cap. An admin can set a token limit for any account from the Accounts view;
-   that limit counts the tokens used in the current day — the input and the generated text
-   together, as they are recorded in the usage row — and resets at 00:00 UTC, and it
+   Optionally bind a key to one connection, pin a model, or set a requests-per-minute limit and a token cap.
+   A pinned model is the one chat and completions are sent with; an embedding keeps the model its client
+   names, so a pin does not limit which embedding model a key can ask for. An admin can set a token limit for
+   any account from the Accounts view; that limit counts the tokens used in the current day — the input and
+   the generated text together, as they are recorded in the usage row — and resets at 00:00 UTC, and it
    applies on top of a key's own cap, so a key cannot be used to work around it. Clearing
    the value clears the limit. A key's own cap is the same sum over the life of the key. Splitting
    the figures on the Overview does not change what either limit counts.
@@ -197,6 +198,23 @@ curl -X POST http://127.0.0.1:8787/v1/chat/completions \
   -d '{"model":"qwen2.5","messages":[{"role":"user","content":"hi"}]}'
 ```
 
+Beside chat completions, the gateway forwards `POST /v1/completions` and `POST /v1/embeddings` the same way —
+the same keys, limits, routing, failover and recording — so a client's RAG embeddings and an editor's
+autocomplete go through it as well. One thing differs for an embedding: it is sent with the model the client
+names, because its vectors only mean something next to the ones the same model made, and a key's own model and a
+connection's default, which are models that generate, fill in only when the client names none. When an upstream
+reports nothing, the input is estimated from `prompt` and an editor's `suffix`, or from `input` (a string, a
+list of strings, token ids, each id one token, or parts with a `text` field), or from `messages` for a server
+that takes an embedding's input as chat; the output is estimated from the text a completion generated. An
+embedding generates no text, so its row records none, and it is never streamed, so nothing about streaming is
+added to its body. A row does not say which endpoint it came from, so the latency on the Overview and in
+`/metrics` mixes quick embeddings with generations. An upstream's answer is passed on whatever its status, so a
+connection that does not serve an endpoint answers a request for it with its own error, which is recorded like
+any answer; with connections that serve different endpoints, bind the key that a client uses for embeddings to a
+connection that serves them. Any path under `/v1` the gateway does not serve, `/v1` itself included, is answered
+404 `not_found` in the error shape an OpenAI client reads, and a served path asked with a method it does not
+take 405, rather than with the empty answer of the dashboard's file server.
+
 Streaming works as a straight pass-through, so a client that expects SSE gets SSE. When an
 upstream reports usage, DreamGate records those numbers; when it does not (several Ollama
 and llama.cpp builds), the gateway estimates them and marks the row as estimated. When
@@ -212,9 +230,9 @@ request — the request goes out without one, exactly as the client sent it, and
 own default. DreamGate does not put a name of its own in its place. The row for such a request, when a
 connection answered it, whatever the status, records the model as `unknown`, because what is recorded is the
 model the gateway sent, not the one the upstream answered with. A request that no connection answered, because
-every one it was sent to failed before answering, records the model the key pins or the request names, which
-here is none: its row has no model, the Activity table shows it as no model, and the usage by model counts it
-under `unknown`.
+every one it was sent to failed before answering, records the model the key pins or the request names — for an
+embedding, the one the request names first — which here is none: its row has no model, the Activity table shows
+it as no model, and the usage by model counts it under `unknown`.
 
 An estimate counts everything the model produced, not only the answer. Reasoning models put their
 working in `reasoning_content` (or `reasoning`) beside the reply, and that text is counted as
@@ -400,9 +418,11 @@ that does not answer within a second leaves those lines out, with a warning logg
 scrape past a scraper's own timeout. The counts are of this run of the process, kept in memory and starting at
 zero on a restart the way a Prometheus counter is expected to:
 
-- `dreamgate_responses_total{route, status, type}` — every answer the two gateway endpoints gave, with the error
-  type it carried, so a refusal at a limit or a full connection, which is deliberately not a usage row, is
-  counted here. A stream is counted by the status its head was sent with.
+- `dreamgate_responses_total{route, status, type}` — every answer the gateway endpoints gave, with the error type
+  it carried, so a refusal at a limit or a full connection, which is deliberately not a usage row, is counted
+  here. A stream is counted by the status its head was sent with. A path under `/v1` that is not served is
+  counted under `/v1/{*rest}`, or `/v1` and `/v1/` for those two, so a client cannot add a label for every path
+  it makes up.
 - `dreamgate_upstream_failures_total{connection}` — requests to a connection that failed before or while it
   answered, including the ones a request then fell over from and a stream cut midway by an error.
 - `dreamgate_tokens_total{direction, source}` — the input and the output of recorded requests, with what an
@@ -412,8 +432,9 @@ zero on a restart the way a Prometheus counter is expected to:
 - `dreamgate_usage_write_failures_total` and `dreamgate_stream_stalls_total` — rows that could not be written,
   which the caps then do not count, and streams closed for going quiet.
 - `dreamgate_in_flight`, `dreamgate_in_flight_limit` and `dreamgate_connection_in_flight{connection}` — the
-  completion requests admitted and not yet finished, for the gateway and for each enabled connection a request
-  has reached since the start. The model list is not admitted that way, so it is not in them.
+  chat, completion and embedding requests admitted and not yet finished, for the gateway and for each enabled
+  connection a request has reached since the start. The model list is not admitted that way, so it is not in
+  them.
 - `dreamgate_connection_up{connection}` — 1 when the last health check reached an enabled connection and 0 when
   it failed; a connection no check has reached yet is left out rather than reported as either, and so is one
   that is turned off, because no check reaches it.
@@ -577,8 +598,8 @@ a session or a DreamGate key.
   from another site carries no session cookie, so a cross-site form cannot act as the signed-in account.
 - Adding, removing or checking a connection is an admin action in the API as well as in the page, and
   the key a connection carries and its address are returned to an admin alone, because an address names an
-  internal host and port and can carry a credential of its own. A disabled account is refused at both
-  gateway endpoints, not only at the completion path.
+  internal host and port and can carry a credential of its own. A disabled account is refused at every
+  gateway endpoint, not only at the completion path.
 - A key, its account and its limits are read from the database on every request, and a read that fails — a
   write holding the database past the busy timeout, a disk that fails — answers 503 `unavailable` with a short
   reference and is logged under it, rather than letting the request through unchecked: a limit that could not
@@ -621,12 +642,17 @@ The suite runs the gateway against a mock OpenAI-compatible upstream and covers 
 recording, estimation when the upstream reports nothing including reasoning text, the `estimated` flag a
 recorded row carries in `/api/stats/recent` and in its event on `/api/live`, true for a row the gateway
 estimated and false for one the upstream reported, answered at once or streamed, SSE
-pass-through, that a client's reasoning level reaches the upstream unchanged, that a request naming no model
+pass-through, embeddings forwarded and recorded with the input the upstream reported or the gateway's estimate of
+it, no output and nothing about streaming added, legacy completions forwarded single and streamed with the
+generated text estimated when nothing is reported, a single completion estimated from its prompt, its suffix and
+the text it generated, an embedding sent with the model the client names whatever the key's or the connection's
+model, an unknown path or method under `/v1`, and `/v1` itself, answered as JSON,
+that a client's reasoning level reaches the upstream unchanged, that a request naming no model
 reaches the upstream without one and is recorded as `unknown`, upstream failover,
 a connection marked down being tried after the ones that are not rather than skipped, including when every
 connection is marked down, and a connection that is full passing the request on to one marked down,
 with a failure there naming the full one beside it, the model list asking a connection that is up before one
-marked down, an upstream that fails named by its connection and not by its address at both gateway endpoints,
+marked down, an upstream that fails named by its connection and not by its address at the gateway endpoints,
 the round of health checks marking a connection that answers,
 the model recorded for a streamed request when nothing is pinned to a key or a connection,
 per-key limits and their validation, the per-key, per-account and per-model figures carrying the input and the
@@ -654,7 +680,7 @@ with a connection that does not exist answered as a mistake in what was sent, a 
 with a database that refuses a connection or an account answered as a server error with a reference and none
 of the driver's text, the model list refusing a
 disabled account the same way the completion path does, a request refused rather than let through when its
-key's per-minute count, its cap or its account's day cannot be read, both gateway endpoints refusing a key
+key's per-minute count, its cap or its account's day cannot be read, the gateway endpoints refusing a key
 whose account cannot be read and answering one whose account is gone as unknown, sign-in attempts being
 bounded per account, a
 session refused past the window the cookie lasts, the cookie marked Secure only when the request came

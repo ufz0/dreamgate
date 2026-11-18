@@ -782,8 +782,9 @@ function connectionOptions() {
   return [{ value: '', label: 'Any enabled connection' }, ...state.connections.map((c) => ({ value: String(c.id), label: c.name }))];
 }
 
-// The gateway takes a key's own model first, then the default of the connection that serves it, and
-// the model the client asks for only when neither is set. A key that is not bound to one connection can
+// For chat and completions, the gateway takes a key's own model first, then the default of the connection that
+// serves it, and the model the client asks for only when neither is set; an embedding takes the model the
+// client asks for first, which this column does not show. A key that is not bound to one connection can
 // be served by any, so it can only say which of the two it may be, and so can a key whose connection is
 // marked down, because the gateway starts with another one.
 function keyModel(key, bound) {
@@ -890,7 +891,7 @@ function renderConnect() {
   const key = state.keys.find((k) => k.key === state.connectKey) || state.keys[0];
   $('connect-model').textContent = key
     ? key.model
-      ? `This key always resolves to ${key.model}. Use GET ${base}/models to see what the connection serves.`
+      ? `This key resolves to ${key.model} for chat and completions; an embedding uses the model the client names. Use GET ${base}/models to see what the connection serves.`
       : `Use whatever the key resolves to, or list it with GET ${base}/models.`
     : 'Create a key first. The key is what the client sends.';
 

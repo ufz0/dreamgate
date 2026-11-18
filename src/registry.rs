@@ -87,8 +87,8 @@ pub async fn candidates(st: &State, preferred: Option<i64>) -> Vec<Connection> {
     // every 30 seconds, so one marked down may be answering again, and leaving out every connection
     // that is marked down would send a request nowhere when all of them are. The sort is stable, so
     // the connections that are not down keep their order — the key's own connection first, then
-    // priority — and the ones that are down follow in that same order. Both gateway endpoints read
-    // this one order: a completion tries each in turn, and the model list asks the first.
+    // priority — and the ones that are down follow in that same order. Every gateway endpoint reads
+    // this one order: a request tries each in turn, and the model list asks the first.
     all.sort_by_key(|conn| conn.health == "down");
     all
 }
