@@ -66,7 +66,39 @@ pub struct Ask {
     pub read_at: Instant,
     pub rpm: Option<Reading>,
     pub key_cap: Option<Reading>,
+    // The key's own budgets for the current day and the current month, in UTC.
+    pub key_day_cap: Option<Reading>,
+    pub key_month_cap: Option<Reading>,
     pub day_cap: Option<Reading>,
+}
+
+// Which token limit a figure is about: the key's cap over its life, its day, its month, or its account's day.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Window {
+    Key,
+    KeyDay,
+    KeyMonth,
+    AccountDay,
+}
+
+impl Window {
+    pub fn label(self) -> &'static str {
+        match self {
+            Window::Key => "key",
+            Window::KeyDay => "key-day",
+            Window::KeyMonth => "key-month",
+            Window::AccountDay => "account-day",
+        }
+    }
+}
+
+// What was left of a limit when the request was admitted, before it: of the token limit with the least left,
+// and of the requests in the minute. Requests still running count by their estimated input, as they do for the
+// limits themselves.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Left {
+    pub tokens: Option<(Window, i64, i64)>,
+    pub requests: Option<(i64, i64)>,
 }
 
 #[derive(Clone, Copy)]
@@ -82,6 +114,8 @@ pub struct Reading {
 pub enum Refusal {
     RateLimit { limit: i64 },
     KeyCap { cap: i64, in_flight: i64 },
+    KeyDayCap { cap: i64, in_flight: i64 },
+    KeyMonthCap { cap: i64, in_flight: i64 },
     DayCap { cap: i64, in_flight: i64 },
     // The rows were read too long ago for what they missed to still be known.
     Stale,
@@ -91,7 +125,11 @@ impl Reservations {
     pub fn reserve(self: &Arc<Self>, ask: Ask) -> Result<Reservation, Refusal> {
         // A key with no limit and an account with no daily limit have nothing to be held against, so they do
         // not take the lock at all.
-        if ask.rpm.is_none() && ask.key_cap.is_none() && ask.day_cap.is_none() {
+        let key_limited = ask.rpm.is_some()
+            || ask.key_cap.is_some()
+            || ask.key_day_cap.is_some()
+            || ask.key_month_cap.is_some();
+        if !key_limited && ask.day_cap.is_none() {
             return Ok(Reservation::inert());
         }
         let mut inner = self.inner.lock().expect("reservations");
@@ -104,39 +142,55 @@ impl Reservations {
         inner.prune(now);
 
         let key = inner.keys.get(&ask.key_id);
+        let mut left = Left {
+            tokens: None,
+            requests: None,
+        };
         if let Some(rpm) = ask.rpm {
             let unseen = key.map_or(0, |held| {
                 held.values()
                     .filter(|h| unseen_by(h.stage, rpm.seen, now, true))
                     .count()
             }) as i64;
-            if rpm.used.saturating_add(unseen) >= rpm.limit {
+            let used = rpm.used.saturating_add(unseen);
+            if used >= rpm.limit {
                 return Err(Refusal::RateLimit { limit: rpm.limit });
             }
+            left.requests = Some((rpm.limit, rpm.limit - used));
         }
-        if let Some(cap) = ask.key_cap {
-            let in_flight = held_tokens(key, cap.seen, now);
-            if cap.used.saturating_add(in_flight) >= cap.limit {
-                return Err(Refusal::KeyCap {
-                    cap: cap.limit,
-                    in_flight,
+        let caps = [
+            (ask.key_cap, Window::Key, key),
+            (ask.key_day_cap, Window::KeyDay, key),
+            (ask.key_month_cap, Window::KeyMonth, key),
+            (
+                ask.day_cap,
+                Window::AccountDay,
+                inner.accounts.get(&ask.user_id),
+            ),
+        ];
+        for (cap, window, held) in caps {
+            let Some(cap) = cap else { continue };
+            let in_flight = held_tokens(held, cap.seen, now);
+            let used = cap.used.saturating_add(in_flight);
+            if used >= cap.limit {
+                let (cap, in_flight) = (cap.limit, in_flight);
+                return Err(match window {
+                    Window::Key => Refusal::KeyCap { cap, in_flight },
+                    Window::KeyDay => Refusal::KeyDayCap { cap, in_flight },
+                    Window::KeyMonth => Refusal::KeyMonthCap { cap, in_flight },
+                    Window::AccountDay => Refusal::DayCap { cap, in_flight },
                 });
             }
-        }
-        if let Some(cap) = ask.day_cap {
-            let in_flight = held_tokens(inner.accounts.get(&ask.user_id), cap.seen, now);
-            if cap.used.saturating_add(in_flight) >= cap.limit {
-                return Err(Refusal::DayCap {
-                    cap: cap.limit,
-                    in_flight,
-                });
+            let remaining = cap.limit - used;
+            if left.tokens.is_none_or(|(_, _, least)| remaining < least) {
+                left.tokens = Some((window, cap.limit, remaining));
             }
         }
 
         inner.next += 1;
         let id = inner.next;
         let prompt = ask.prompt_tokens.max(0);
-        if ask.rpm.is_some() || ask.key_cap.is_some() {
+        if key_limited {
             inner.keys.entry(ask.key_id).or_default().insert(
                 id,
                 Held {
@@ -162,6 +216,7 @@ impl Reservations {
             per_minute: ask.rpm.is_some(),
             sent: false,
             settled: false,
+            left,
         })
     }
 }
@@ -217,6 +272,7 @@ pub struct Reservation {
     per_minute: bool,
     sent: bool,
     settled: bool,
+    left: Left,
 }
 
 impl Reservation {
@@ -229,7 +285,15 @@ impl Reservation {
             per_minute: false,
             sent: false,
             settled: true,
+            left: Left {
+                tokens: None,
+                requests: None,
+            },
         }
+    }
+
+    pub fn left(&self) -> Left {
+        self.left
     }
 
     // The request is about to be sent to a connection.
@@ -306,8 +370,50 @@ mod tests {
             read_at: Instant::now(),
             rpm,
             key_cap,
+            key_day_cap: None,
+            key_month_cap: None,
             day_cap: None,
         }
+    }
+
+    // A key's day and month hold the requests running against them as its whole-life cap does, and what is left
+    // is told of the token limit with the least left.
+    #[test]
+    fn a_keys_day_and_month_hold_what_is_running_and_the_least_left_is_told() {
+        let reservations = Arc::new(Reservations::default());
+        let windows = |day: Option<Reading>, month: Option<Reading>| Ask {
+            key_day_cap: day,
+            key_month_cap: month,
+            ..ask(None, None)
+        };
+        let first = reservations
+            .reserve(windows(reading(12, 0, 1), reading(100, 40, 1)))
+            .unwrap();
+        assert_eq!(first.left().tokens, Some((Window::KeyDay, 12, 12)));
+        let second = reservations
+            .reserve(windows(reading(12, 0, 1), reading(100, 40, 1)))
+            .unwrap();
+        assert_eq!(second.left().tokens, Some((Window::KeyDay, 12, 7)));
+        let third = reservations
+            .reserve(windows(reading(12, 0, 1), None))
+            .unwrap();
+        assert_eq!(third.left().tokens, Some((Window::KeyDay, 12, 2)));
+        assert_eq!(
+            reservations.reserve(windows(reading(12, 0, 1), None)).err(),
+            Some(Refusal::KeyDayCap {
+                cap: 12,
+                in_flight: 15
+            })
+        );
+        assert_eq!(
+            reservations
+                .reserve(windows(None, reading(50, 40, 1)))
+                .err(),
+            Some(Refusal::KeyMonthCap {
+                cap: 50,
+                in_flight: 15
+            })
+        );
     }
 
     // The rows a restart leaves behind add to what is running, rather than standing in for it.

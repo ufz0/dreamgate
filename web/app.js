@@ -973,6 +973,15 @@ function keyTimes(key) {
     : `${esc(used)} · <span class="danger">expired ${esc(at)}</span>`;
 }
 
+// A key's limits, each token limit with what it has used of it, input and output together as the limit counts.
+function keyLimits(key) {
+  const lines = [key.rpm_limit ? `${key.rpm_limit}/min` : 'no rate limit'];
+  lines.push(key.token_cap ? `${nf.format(key.token_cap)} input + output tokens` : 'no token cap');
+  if (key.daily_token_cap) lines.push(`${nf.format(key.used_today)} of ${nf.format(key.daily_token_cap)} input + output tokens today`);
+  if (key.monthly_token_cap) lines.push(`${nf.format(key.used_this_month)} of ${nf.format(key.monthly_token_cap)} input + output tokens this month`);
+  return lines.map(esc).join('<br>');
+}
+
 function keyRow(key, showOwner) {
   // A binding to a disabled connection does not hold: the key uses another one.
   const bound = key.connection_id ? state.connections.find((c) => c.id === key.connection_id) : null;
@@ -989,7 +998,7 @@ function keyRow(key, showOwner) {
     </td>
     <td>${binding}</td>
     <td>${esc(keyModel(key, bound))}</td>
-    <td>${key.rpm_limit ? `${key.rpm_limit}/min` : 'no rate limit'}<br>${key.token_cap ? `${nf.format(key.token_cap)} input + output tokens` : 'no token cap'}</td>
+    <td>${keyLimits(key)}</td>
     <td class="num">${nf.format(key.requests)}</td>
     <td class="num">${nf.format(key.prompt_tokens)}</td>
     <td class="num">${nf.format(key.completion_tokens)}</td>
@@ -1712,6 +1721,8 @@ $('key-form').addEventListener('submit', async (event) => {
     model: data.model || null,
     rpm_limit: data.rpm_limit ? Number(data.rpm_limit) : null,
     token_cap: data.token_cap ? Number(data.token_cap) : null,
+    daily_token_cap: data.daily_token_cap ? Number(data.daily_token_cap) : null,
+    monthly_token_cap: data.monthly_token_cap ? Number(data.monthly_token_cap) : null,
     expires_at: data.expires_at || null,
   };
   try {

@@ -25,13 +25,15 @@ username, the email column is dropped, a password column that was required is re
 left empty, the approval flag is added, the `max_concurrent` column is added to connections and left
 empty for the rows written before it, the setup code columns (`setup_code_hash`,
 `setup_code_expires_at`) are added to accounts and left empty, an `expires_at` column is added to
-keys and left empty, so a key written before it does not expire, and existing accounts keep their
-limits and are enabled by default. A connection row with no `max_concurrent` keeps its meaning: it
-never stated a capability, so the default applies to it, which is not the same as a capability of
-one. An account with no setup code keeps its meaning too where it has a password, which it signs in
-with as before; one made by an admin before setup codes that never got a password can no longer be
-claimed by whoever signs in first, and waits for an admin to give it a code. A table that has to be
-rebuilt for this is rebuilt in one transaction, so a start that stops partway, on a full disk or in a crash,
+keys and left empty, so a key written before it does not expire, the `daily_token_cap` and
+`monthly_token_cap` columns are added to keys and left empty, so a key written before them has
+neither limit, and existing accounts keep their limits and are enabled by default. A connection row
+with no `max_concurrent` keeps its meaning: it never stated a capability, so the default applies to
+it, which is not the same as a capability of one. An account with no setup code keeps its meaning
+too where it has a password, which it signs in with as before; one made by an admin before setup
+codes that never got a password can no longer be claimed by whoever signs in first, and waits for an
+admin to give it a code. A table that has to be rebuilt for this is rebuilt in one transaction, so a
+start that stops partway, on a full disk or in a crash,
 leaves that table as it was, and the next start migrates whatever is still in an older shape; each step
 reads the shape before it acts, so one that already finished is not run again. A new table that an older start left
 beside the old one when it stopped is dropped and made again from the old one, which still holds every
@@ -158,15 +160,33 @@ was taken by an older version.
    only visible in the API response. Left out, the default is used; a stated value has to be positive,
    because a capability of zero would admit nothing, which is not what leaving it out means.
 2. Create a key. A DreamGate key is what clients use — the upstream key stays server-side.
-   Optionally bind a key to one connection, pin a model, give it an expiry, or set a requests-per-minute limit
-   and a token cap.
+   Optionally bind a key to one connection, pin a model, give it an expiry, or set a requests-per-minute limit,
+   a token cap over its life, and token limits for a day and for a month.
    A pinned model is the one chat and completions are sent with; an embedding keeps the model its client
    names, so a pin does not limit which embedding model a key can ask for. An admin can set a token limit for
    any account from the Accounts view; that limit counts the tokens used in the current day — the input and
    the generated text together, as they are recorded in the usage row — and resets at 00:00 UTC, and it
    applies on top of a key's own cap, so a key cannot be used to work around it. Clearing
-   the value clears the limit. A key's own cap is the same sum over the life of the key. Splitting
-   the figures on the Overview does not change what either limit counts.
+   the value clears the limit. A key's own cap is the same sum over the life of the key. A key can also have
+   a daily and a monthly token limit (`daily_token_cap`, `monthly_token_cap`), the same sum over the current
+   day and the current calendar month in UTC, from 00:00 on the first; a row from before either began counts
+   toward neither, and a key that reaches one is answered 429 `token_cap` with a message that names it. A
+   change to a key sets a day or a month limit, or removes it with null; its per-minute limit and its cap
+   over its life can be changed but not removed, as before. A limit given as less than one is refused, on a
+   key that is being made as on one that is being changed. Splitting the figures on the Overview does not
+   change what any of these limits counts.
+
+   Every answer to a request held against a limit, its key's or its account's, says what was left of its
+   limits when the request was admitted, before it: `x-dreamgate-requests-limit` and
+   `x-dreamgate-requests-remaining` for the requests in the minute, and `x-dreamgate-tokens-limit`,
+   `x-dreamgate-tokens-remaining` and `x-dreamgate-tokens-window` (`key`, `key-day`, `key-month` or
+   `account-day`) for whichever token limit has the least left, the account's daily limit included. Requests
+   still running count by their estimated input, as they do for the limits. Once a fifth or less of that
+   token limit is left, `x-dreamgate-budget-warning` says so in words. The warning names the limit by what
+   it is, not by the key's name, so the header stays plain text. A request with no limit on its key or its
+   account gets none of these, and neither does a request that is refused: it was never held, and its
+   message names the limit it reached. The names are the gateway's own rather than the `x-ratelimit-*` an
+   OpenAI client reads, because those mean a window of a minute.
 
    The limits hold when requests arrive together. The rows are written when a request ends, so on their own
    they cannot see a request that is still running; a request is therefore checked and held in one step, in
@@ -328,18 +348,17 @@ as it always did, and a request that finds every connection it could use full is
 `connection_full`. A connection marked down is one a request could use, tried after the others, so when every
 connection that is not marked down is full and one that is has a free slot, the request is sent there. If that
 connection is down in fact, the answer is the 502 of a request that was sent and got no answer, recorded
-like any other — its estimated input counts toward the key's cap and the account's day — rather than the 429
-the request would otherwise have been given, and it can take up to the connect timeout, or longer for a host
-that accepts and never answers, to find that out; the connections that were full are named in that answer
-beside the one that failed. A request that finds the gateway as a whole full is answered with 503 `overloaded`.
-Neither the 429 nor the 503 `overloaded` is recorded as usage, because nothing crossed the gate; a request that
-was sent to a connection and failed there is recorded as it always was. An admission that answered by queueing
-would hide the queue behind a long latency, so the overload is visible to the client and a client that wants the
-request processed retries.
-Admission is checked after the key and the account lookups, which is what the rest of the path has always
-done — a request turned away at a limit still reads those two rows and still marks its account as generating
-for a few instructions — and a request can still wait for a database connection, because the global limit is
-larger than the pool.
+like any other — its estimated input counts toward the key's cap, its day and its month, and the account's day
+— rather than the 429 the request would otherwise have been given, and it can take up to the connect timeout,
+or longer for a host that accepts and never answers, to find that out; the connections that were full are
+named in that answer beside the one that failed. A request that finds the gateway as a whole full is answered
+with 503 `overloaded`. Neither the 429 nor the 503 `overloaded` is recorded as usage, because nothing crossed
+the gate; a request that was sent to a connection and failed there is recorded as it always was. An admission
+that answered by queueing would hide the queue behind a long latency, so the overload is visible to the client
+and a client that wants the request processed retries. Admission is checked after the key and the account
+lookups, which is what the rest of the path has always done — a request turned away at a limit still reads
+those two rows and still marks its account as generating for a few instructions — and a request can still wait
+for a database connection, because the global limit is larger than the pool.
 
 A stated capability can only be changed by writing it to the database, because the connection routes create,
 list, delete and check; a value changed while the process is running takes effect on the next start, since a
@@ -590,13 +609,15 @@ URL hash (`#/overview`, `#/activity`, `#/keys`, `#/connections`, `#/connect`, `#
   turns approval on or off, and makes an account without opening registration; the setup code for it, and for
   every new one, is shown once in a dialog with a copy button.
 
-Every token figure on the page says which side of a request it counts: input tokens, what was sent in;
-output tokens, what the model generated; or the two together, where a figure is measured against a limit or
-a chart has always counted both. A key's token cap and an account's daily limit say that they count both,
-and so does the message a request is refused with when it reaches either. The tables and the live traffic
-feed show the two sides as separate columns rather than one sum, and `/api/keys`, `/api/keys/others` and the
-per-account and per-model rows of `/api/stats/summary` carry `prompt_tokens` and `completion_tokens` beside
-the total they already had.
+Every token figure on the page says which side of a request it counts: input tokens, what was sent in; output
+tokens, what the model generated; or the two together, where a figure is measured against a limit or a chart
+has always counted both. A key's token cap, its daily and monthly limits, and an account's daily limit say
+that they count both, and so does the message a request is refused with when it reaches any of them. The
+tables and the live traffic feed show the two sides as separate columns rather than one sum, and `/api/keys`,
+`/api/keys/others` and the per-account and per-model rows of `/api/stats/summary` carry `prompt_tokens` and
+`completion_tokens` beside the total they already had. A key in `/api/keys` and `/api/keys/others` also
+carries its `daily_token_cap` and `monthly_token_cap`, and what it has used of each, `used_today` and
+`used_this_month`, input and output together.
 
 A recorded row whose counts the gateway estimated, because the upstream reported none, is marked the way a
 stream's estimate is: its input and its output tokens each carry a ~ in the Activity table, the live traffic
@@ -807,15 +828,19 @@ was, the failures written when the client leaves, a connection removed while the
 losing the others, the health round removing failures older than the day, an admin's alone, gone with the
 connection when it is removed, and the table and its indexes added to a database written before them — the
 model recorded for a streamed request when nothing is pinned to a key or a connection, per-key limits and their
-validation, a key's expiry refused when it has passed or is past the year 9999, refusing the key at the gateway
-and the model list once it has, set with an offset and kept in UTC, left as it is when a change leaves it out or
-is refused for another field, cleared with null or an empty string and left empty on a key written before it, a
-key's last use, not moved by a model list or a refused request, rotation keeping the id and the usage and
-refusing the old secret, refused without a JSON body and not found for a key that does not exist, an admin not
-given another account's new key or its key in the list, a member rotating their own key and given it, and a
-member unable to rotate another's, the per-key, per-account and per-model figures carrying the input and the
-output apart, including for a key or an account with no usage and after a key is deleted, the keys list being
-the caller's own with the other
+validation, a key's daily and monthly limits refused with their own messages, a row at the first second of the
+day or of the month counting toward it and one in the second before not, in the list and at the gateway, a day
+or a month limit removed with null, the headers saying what was left with a warning at a fifth, none for a
+request with no limit, a limit below one refused on a change, the day and month added to a key written before
+them, the holds of a key's day and month counting the requests running, a key's expiry refused when it has
+passed or is past the year 9999, refusing the key at the gateway and the model list once it has, set with an
+offset and kept in UTC, left as it is when a change leaves it out or is refused for another field, cleared
+with null or an empty string and left empty on a key written before it, a key's last use, not moved by a model
+list or a refused request, rotation keeping the id and the usage and refusing the old secret, refused without
+a JSON body and not found for a key that does not exist, an admin not given another account's new key or its
+key in the list, a member rotating their own key and given it, and a member unable to rotate another's, the
+per-key, per-account and per-model figures carrying the input and the output apart, including for a key or an
+account with no usage and after a key is deleted, the keys list being the caller's own with the other
 accounts read by an admin alone, per-account daily token limits including the day
 boundary and the admin-only rule for setting one, the admin/user scoping of the stats
 queries and the split between a caller's own figures and the platform total, every account listed for an admin

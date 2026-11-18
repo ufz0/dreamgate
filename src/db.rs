@@ -49,7 +49,9 @@ pub const SCHEMA: &[&str] = &[
         rpm_limit INTEGER,
         token_cap INTEGER,
         created_at TEXT NOT NULL,
-        expires_at TEXT
+        expires_at TEXT,
+        daily_token_cap INTEGER,
+        monthly_token_cap INTEGER
     )",
     "CREATE TABLE IF NOT EXISTS usage (
         id INTEGER PRIMARY KEY,
@@ -99,6 +101,9 @@ pub const SCHEMA: &[&str] = &[
 const INDEXES: &[&str] = &[
     "CREATE INDEX IF NOT EXISTS idx_usage_created ON usage (created_at)",
     "CREATE INDEX IF NOT EXISTS idx_usage_key ON usage (api_key_id)",
+    // A key's day and month limits sum its rows from a moment on; without the time beside the key the read would
+    // pass over every row the key ever had.
+    "CREATE INDEX IF NOT EXISTS idx_usage_key_created ON usage (api_key_id, created_at)",
     "CREATE INDEX IF NOT EXISTS idx_usage_user ON usage (user_id)",
     "CREATE INDEX IF NOT EXISTS idx_failures_created ON connection_failures (created_at)",
     // Removing a connection removes its failures, which would otherwise read the whole table to find them.
@@ -288,6 +293,7 @@ pub async fn migrate(pool: &SqlitePool) -> Result<(), sqlx::Error> {
     add_connection_models(pool).await?;
     add_key_expiry(pool).await?;
     add_setup_codes(pool).await?;
+    add_key_windows(pool).await?;
     relax_key_reference(pool).await?;
     for statement in INDEXES {
         sqlx::query(*statement).execute(pool).await?;
@@ -351,6 +357,21 @@ async fn add_key_expiry(pool: &SqlitePool) -> Result<(), sqlx::Error> {
     sqlx::query("ALTER TABLE api_keys ADD COLUMN expires_at TEXT")
         .execute(pool)
         .await?;
+    Ok(())
+}
+
+// A key can have a token limit for each day and each month in UTC, beside the cap over its whole life. Both are
+// nullable, so a key written before them keeps its meaning: no limit for either.
+async fn add_key_windows(pool: &SqlitePool) -> Result<(), sqlx::Error> {
+    for column in ["daily_token_cap", "monthly_token_cap"] {
+        if has_column(pool, "api_keys", column).await? {
+            continue;
+        }
+        let statement = format!("ALTER TABLE api_keys ADD COLUMN {column} INTEGER");
+        sqlx::query(sqlx::AssertSqlSafe(statement.as_str()))
+            .execute(pool)
+            .await?;
+    }
     Ok(())
 }
 
