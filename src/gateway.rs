@@ -1118,8 +1118,8 @@ async fn forward(st: State, headers: HeaderMap, body: Value, endpoint: Endpoint)
             connection_id: cut.as_ref().map(|(id, _)| *id),
             model: match &cut {
                 Some((_, model)) => Some(model.clone()),
-                // No connection answered, so no connection's default was sent; for an embedding the model the
-                // client named was, ahead of the key's.
+                // No connection answered, so no one connection's default can be named; for an embedding the model
+                // the client named was sent to every connection tried, ahead of the key's.
                 None if endpoint == Endpoint::Embeddings => named(requested)
                     .map(String::from)
                     .or_else(|| key.model.clone()),
