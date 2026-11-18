@@ -495,18 +495,25 @@ URL hash (`#/overview`, `#/activity`, `#/keys`, `#/connections`, `#/connect`, `#
 - **Activity** — the recorded requests, newest first, with each one's date and time in UTC, its input and
   output tokens, latency and status, fifty to a page with older pages loaded on request, plus usage by model
   for the eight models with the most tokens, input and output together, each split into the two: every
-  account's for an admin, and otherwise this account's own. The page says which. The requests can be
-  narrowed by key, account (for an admin), connection, model, outcome — answered, or an error status — and
-  whole days in UTC, both included; while a filter is set, a row that arrives is not put at the top, because
-  it may not match. **Export CSV** downloads every request the filters match, not only the pages shown, with
-  the account, key, connection, model, status, whether it streamed, whether the counts are the gateway's
-  estimate, the tokens, the cache hit and the times; a figure nothing reported is an empty cell rather than
-  a zero, and a name that starts like a spreadsheet formula is written with an apostrophe before it so it
-  opens as text. The history is `/api/stats/activity`, with `key`, `user`, `connection`, `model`, `outcome`
-  (`ok` or `error`), `since` and `until` (`YYYY-MM-DD`), `limit` (up to 500) and `before` (the `next` the
-  previous page gave); the file is `/api/stats/activity.csv` with the same filters. A member's history is
-  its own account's, and asking for another account's is refused; a filter that cannot be read is answered
-  400 rather than ignored.
+  account's for an admin, and otherwise this account's own. The page says which. The requests can be narrowed
+  by key, account (for an admin), connection, model, outcome — answered, or an error status — and whole days
+  in UTC, both included; while a filter is set, a row that arrives is not put at the top, because it may not
+  match. While none is set, rows that arrive go on top and the view keeps the newest 500, so a page left open
+  does not grow without end; the ones it lets go are still there with "Load older". Signing out drops the rows
+  and the filters, so whoever signs in next starts from their own. **Export CSV** downloads every request the
+  filters on the form match, not only the pages shown, applying them first so a filter the server refuses, or
+  a session that has ended, is reported on the page rather than as a failed download. The file has the
+  account, key, connection, model, status, whether it streamed, whether the counts are the gateway's estimate,
+  the tokens, the cache hit and the times; a figure nothing reported is an empty cell rather than a zero, and
+  a name that starts like a spreadsheet formula is written with an apostrophe before it so it opens as text —
+  at its start and after every `;`, because a spreadsheet in a locale that separates lists with `;` splits the
+  cell there. The file is UTF-8 without a byte-order mark, which some spreadsheets need to be told when they
+  open it. The history is `/api/stats/activity`, with `key`, `user`, `connection`, `model`, `outcome` (`ok` or
+  `error`), `since` and `until` (`YYYY-MM-DD`), `limit` (a whole number from 1, fifty when left out and read
+  as 500 above that) and `before` (the `next` the previous page gave); the file is `/api/stats/activity.csv`
+  with the same filters. A member's history is its own account's, and asking for another account's is refused;
+  a value left empty is left out, a value that cannot be read is answered 400 rather than ignored, and a
+  parameter the history does not take is ignored.
 - **Keys** — create, copy, disable and delete keys, with per-key usage split into input and output
   tokens (a key's token cap counts the two together), and a note when a key's binding points at a
   connection that is turned off. A key that is turned off stays listed and reads dimmer than the keys
@@ -725,7 +732,11 @@ breaks off leaving the last one, the model list merging the lists in the order a
 a check read and a connection marked down included, the activity history paged by row with each page naming the
 next, narrowed by key, account, model, outcome and whole UTC days, a member's history being its own and another
 account's refused, a filter that cannot be read refused, the CSV export carrying every matching row across the
-pages it is read in with empty cells for what nothing reported, quoting and a formula written as text, each
+pages it is read in with empty cells for what nothing reported, quoting and a formula written as text at a cell's
+start and after a `;`, a page larger than the most read as the most, a limit that cannot be read refused, a
+value left empty left out, a connection filter, a key deleted through the API reading as none with its row kept,
+a day ending before the first second of the next, a member's export its own rows and another account's key id
+giving it none, each
 connection's figures for the last day — a failure it
 passed on and one it could not, a failure before a full connection still passed on, a model list's failure
 never passed on, a single answer that broke off passed on and a stream that broke off counted as a failure and

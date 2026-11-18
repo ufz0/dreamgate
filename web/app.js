@@ -63,7 +63,7 @@ const state = {
   connectionFiguresError: null,
   // The Activity view's rows, read a page at a time with the filters that were applied, and the id to read the
   // page after them from.
-  activity: { filters: {}, rows: [], next: null, loaded: false },
+  activity: { filters: {}, rows: [], next: null, loaded: false, loading: false, arrived: [] },
   keyOwner: '',
   connections: [],
   events: [],
@@ -289,6 +289,7 @@ function renderNav() {
 async function load() {
   // What was in flight belongs to the session that was open before; this one is told its own.
   state.progress = { shares: [], streams: [] };
+  resetActivity();
   state.settings = await api('/api/settings');
   state.summary = await api('/api/stats/summary');
   state.keys = (await api('/api/keys')).keys;
@@ -447,7 +448,7 @@ function subscribe() {
     state.events.unshift(payload.event);
     state.events = state.events.slice(0, 50);
     // A row that arrives belongs at the top of the Activity view only while nothing narrows what it shows.
-    if (state.activity.loaded && !activityFiltered()) state.activity.rows.unshift(payload.event);
+    if (!activityFiltered()) arriveInActivity(payload.event);
     const event = payload.event;
     retireStream(event.stream);
     // Every event counts toward the total the gate has produced, but only the caller's own events
@@ -770,6 +771,41 @@ function renderFeed(arrived) {
 
 // Activity
 
+// How many rows the Activity view keeps while new ones arrive. A page left open on a busy gateway would otherwise
+// hold every row since it was opened and rebuild the whole table for each one; the rows let go are still there
+// with "Load older", which goes on from the last row kept.
+const ACTIVITY_KEPT = 500;
+
+// The rows are the signed-in account's own, or every account's for an admin, so none of them, nor the filters
+// they were read with, outlive the session they were read in.
+function resetActivity() {
+  state.activity = { filters: {}, rows: [], next: null, loaded: false, loading: false, arrived: [] };
+  $('activity-filters').reset();
+  for (const id of ['activity-key', 'activity-user', 'activity-connection']) $(id).innerHTML = '';
+}
+
+// A row that arrives while the first page is being read may have been written after the read, so it is kept and
+// put on top of the page once the page is in, unless the page already has it.
+function arriveInActivity(event) {
+  const activity = state.activity;
+  if (activity.loading) {
+    activity.arrived.push(event);
+    return;
+  }
+  if (!activity.loaded) return;
+  activity.rows.unshift(event);
+  if (activity.rows.length > ACTIVITY_KEPT) {
+    activity.rows.length = ACTIVITY_KEPT;
+    activity.next = activity.rows[ACTIVITY_KEPT - 1].id;
+  }
+}
+
+// What the form shows, which is what Show, Export CSV and a new page read, so neither reads a filter other than
+// the one on the screen.
+function formFilters() {
+  return Object.fromEntries([...new FormData($('activity-filters'))].filter(([, value]) => value));
+}
+
 function activityFiltered() {
   return Object.values(state.activity.filters).some(Boolean);
 }
@@ -782,10 +818,28 @@ function activityQuery(extra = {}) {
 
 // The first page with the filters as they are, or the page after the rows already shown.
 async function loadActivity(older) {
-  const page = await api(`/api/stats/activity?${activityQuery(older ? { before: state.activity.next } : {})}`);
-  state.activity.rows = older ? state.activity.rows.concat(page.events) : page.events;
-  state.activity.next = page.next;
-  state.activity.loaded = true;
+  const activity = state.activity;
+  if (!older) {
+    activity.loading = true;
+    activity.arrived = [];
+  }
+  try {
+    const page = await api(`/api/stats/activity?${activityQuery(older ? { before: activity.next } : {})}`);
+    if (older) {
+      activity.rows = activity.rows.concat(page.events);
+    } else {
+      const newest = page.events[0]?.id ?? 0;
+      const arrived = activityFiltered() ? [] : activity.arrived.filter((event) => event.id > newest);
+      activity.rows = arrived.sort((a, b) => b.id - a.id).concat(page.events);
+    }
+    activity.next = page.next;
+    activity.loaded = true;
+  } finally {
+    if (!older) {
+      activity.loading = false;
+      activity.arrived = [];
+    }
+  }
 }
 
 function fillSelect(select, options, current) {
@@ -793,15 +847,17 @@ function fillSelect(select, options, current) {
 }
 
 // The filters offer what the caller can see: its own keys, and for an admin every account's keys and the
-// accounts themselves.
+// accounts themselves. A select that is already filled keeps what it shows, which may be a choice not applied
+// yet, so a row arriving does not undo it.
 function renderActivityFilters() {
   const admin = state.me.role === 'admin';
   const f = state.activity.filters;
+  const shown = (select, applied) => (select.options.length ? select.value : applied || '');
   const keys = [...state.keys, ...(admin ? state.otherKeys : [])];
-  fillSelect($('activity-key'), [{ value: '', label: 'Any' }, ...keys.map((k) => ({ value: String(k.id), label: k.owner ? `${k.name} (${k.owner})` : k.name }))], f.key || '');
+  fillSelect($('activity-key'), [{ value: '', label: 'Any' }, ...keys.map((k) => ({ value: String(k.id), label: k.owner ? `${k.name} (${k.owner})` : k.name }))], shown($('activity-key'), f.key));
   $('activity-user-field').hidden = !admin;
-  if (admin) fillSelect($('activity-user'), [{ value: '', label: 'Any' }, ...state.summary.users.map((u) => ({ value: String(u.id), label: u.username }))], f.user || '');
-  fillSelect($('activity-connection'), [{ value: '', label: 'Any' }, ...state.connections.map((c) => ({ value: String(c.id), label: c.name }))], f.connection || '');
+  if (admin) fillSelect($('activity-user'), [{ value: '', label: 'Any' }, ...state.summary.users.map((u) => ({ value: String(u.id), label: u.username }))], shown($('activity-user'), f.user));
+  fillSelect($('activity-connection'), [{ value: '', label: 'Any' }, ...state.connections.map((c) => ({ value: String(c.id), label: c.name }))], shown($('activity-connection'), f.connection));
   $('activity-models').innerHTML = state.summary.models.map((m) => `<option value="${esc(m.model)}"></option>`).join('');
 }
 
@@ -1478,6 +1534,7 @@ $('sign-out').addEventListener('click', async () => {
   // for whoever signs in next.
   state.progress = { shares: [], streams: [] };
   names.clear();
+  resetActivity();
   showAuth();
 });
 
@@ -1487,7 +1544,7 @@ window.addEventListener('hashchange', () => {
 
 $('activity-filters').addEventListener('submit', async (event) => {
   event.preventDefault();
-  state.activity.filters = Object.fromEntries([...new FormData(event.target)].filter(([, value]) => value));
+  state.activity.filters = formFilters();
   try {
     await loadActivity(false);
     renderActivity();
@@ -1496,8 +1553,10 @@ $('activity-filters').addEventListener('submit', async (event) => {
   }
 });
 
+// Every control is emptied rather than reset, because a reset puts a select back on the option the page marked
+// as the applied one.
 $('activity-clear').addEventListener('click', async () => {
-  $('activity-filters').reset();
+  for (const field of $('activity-filters').elements) if (field.name) field.value = '';
   state.activity.filters = {};
   try {
     await loadActivity(false);
@@ -1516,9 +1575,19 @@ $('activity-older').addEventListener('click', async () => {
   }
 });
 
-// The export is the filters as applied, every matching row rather than the pages shown, downloaded with the
-// session the page already has.
-$('activity-export').addEventListener('click', () => {
+// The export is the filters the form shows, every matching row rather than the pages shown, downloaded with the
+// session the page already has. They are applied first, which reads a page with them: a download that fails
+// says nothing on the page, so a filter the server refuses, or a session that has ended, is reported here
+// instead.
+$('activity-export').addEventListener('click', async () => {
+  state.activity.filters = formFilters();
+  try {
+    await loadActivity(false);
+    renderActivity();
+  } catch (err) {
+    report(err);
+    return;
+  }
   const link = document.createElement('a');
   link.href = `/api/stats/activity.csv?${activityQuery()}`;
   link.download = 'dreamgate-activity.csv';

@@ -6481,6 +6481,10 @@ async fn the_activity_export_is_every_matching_row_as_csv() {
         lines[2]
     );
 
+    // A page larger than the most is read as the most.
+    let (_, page) = get_status_json(&router, "/api/stats/activity?limit=600", &admin).await;
+    assert_eq!(page["events"].as_array().unwrap().len(), 500);
+
     let response = call(
         &router,
         Request::get("/api/stats/activity.csv?outcome=error")
@@ -6491,4 +6495,141 @@ async fn the_activity_export_is_every_matching_row_as_csv() {
     .await;
     let bytes = response.into_body().collect().await.unwrap().to_bytes();
     assert_eq!(String::from_utf8_lossy(&bytes).matches("\r\n").count(), 2);
+}
+
+async fn csv_lines(router: &Router, path: &str, cookie: &str) -> (StatusCode, Vec<String>) {
+    let response = call(
+        router,
+        Request::get(path)
+            .header("cookie", cookie)
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    let status = response.status();
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    let text = String::from_utf8_lossy(&bytes).to_string();
+    (
+        status,
+        text.split("\r\n")
+            .filter(|line| !line.is_empty())
+            .map(String::from)
+            .collect(),
+    )
+}
+
+// The history narrowed by connection, a key deleted through the API reading as none, a day's bound ending at the
+// day after it, a limit that cannot be read refused, and a member's export and another account's key id giving
+// the member nothing that is not its own.
+#[tokio::test]
+async fn the_activity_filters_read_a_connection_a_deleted_key_and_the_end_of_a_day() {
+    let st = test_state().await;
+    let router = build_router(st.clone());
+    let admin = register(&router, "ada").await;
+    open_registration(&router, &admin).await;
+    no_approval(&router, &admin).await;
+    let member = register(&router, "ben").await;
+    let ada = get_json(&router, "/api/me", &admin).await["id"]
+        .as_i64()
+        .unwrap();
+    let ben = get_json(&router, "/api/me", &member).await["id"]
+        .as_i64()
+        .unwrap();
+    let (_, connection) = post_json(
+        &router,
+        "/api/connections",
+        &admin,
+        json!({ "name": "c", "base_url": "http://127.0.0.1:1" }),
+    )
+    .await;
+    let (_, gone) = post_json(&router, "/api/keys", &admin, json!({ "name": "gone" })).await;
+    let gone_id = gone["id"].as_i64().unwrap();
+
+    insert_usage(
+        &st.pool,
+        ada,
+        Some(gone_id),
+        "m1",
+        200,
+        "2026-03-02T23:59:59Z",
+    )
+    .await;
+    insert_usage(&st.pool, ada, None, "m2", 200, "2026-03-03T00:00:00Z").await;
+    insert_usage(&st.pool, ben, None, "m3", 200, "2026-03-03T01:00:00Z").await;
+    sqlx::query("UPDATE usage SET connection_id = ? WHERE model = 'm2'")
+        .bind(connection["id"].as_i64().unwrap())
+        .execute(&st.pool)
+        .await
+        .unwrap();
+    let (status, _) = send_json(
+        &router,
+        http::Method::DELETE,
+        &format!("/api/keys/{gone_id}"),
+        &admin,
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let models = |body: &Value| -> Vec<String> {
+        body["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|event| event["model"].as_str().unwrap().to_string())
+            .collect()
+    };
+    let (_, body) = get_status_json(
+        &router,
+        &format!("/api/stats/activity?connection={}", connection["id"]),
+        &admin,
+    )
+    .await;
+    assert_eq!(models(&body), ["m2"]);
+    assert_eq!(body["events"][0]["connection"], "c");
+    let (_, body) = get_status_json(&router, "/api/stats/activity?until=2026-03-02", &admin).await;
+    assert_eq!(
+        models(&body),
+        ["m1"],
+        "the first second of the next day is not in it"
+    );
+    assert_eq!(
+        body["events"][0]["key"],
+        Value::Null,
+        "the key was deleted, the row kept"
+    );
+    let (_, body) = get_status_json(&router, "/api/stats/activity?since=2026-03-03", &admin).await;
+    assert_eq!(models(&body), ["m3", "m2"]);
+    let (_, body) = get_status_json(&router, "/api/stats/activity?limit=&before=", &admin).await;
+    assert_eq!(
+        models(&body),
+        ["m3", "m2", "m1"],
+        "a value left empty is left out"
+    );
+    for query in ["limit=0", "limit=-3", "limit=abc"] {
+        let (status, _) =
+            get_status_json(&router, &format!("/api/stats/activity?{query}"), &admin).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{query}");
+    }
+
+    // A member's export is its own rows, and another account's key id narrows its own rows to none rather than
+    // reading the other account's.
+    let (status, lines) = csv_lines(&router, "/api/stats/activity.csv", &member).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(lines.len(), 2, "{lines:?}");
+    assert!(lines[1].contains(",ben,"), "{}", lines[1]);
+    let (status, _) = csv_lines(
+        &router,
+        &format!("/api/stats/activity.csv?user={ada}"),
+        &member,
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let (_, body) = get_status_json(
+        &router,
+        &format!("/api/stats/activity?key={gone_id}"),
+        &member,
+    )
+    .await;
+    assert_eq!(body["events"], json!([]));
 }

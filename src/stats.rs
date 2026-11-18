@@ -457,7 +457,15 @@ pub async fn activity(
         Ok(filter) => filter,
         Err(refused) => return *refused,
     };
-    let before = match query.get("before").map(|value| value.trim().parse::<i64>()) {
+    // Read like the filters: left empty is left out, and a value that cannot be read is refused rather than
+    // replaced by a guess. A page larger than the most is read as the most.
+    let given = |name: &str| {
+        query
+            .get(name)
+            .map(|value| value.trim())
+            .filter(|value| !value.is_empty())
+    };
+    let before = match given("before").map(str::parse::<i64>) {
         None => None,
         Some(Ok(before)) => Some(before),
         Some(Err(_)) => {
@@ -468,11 +476,17 @@ pub async fn activity(
             );
         }
     };
-    let limit = query
-        .get("limit")
-        .and_then(|value| value.trim().parse::<i64>().ok())
-        .unwrap_or(ACTIVITY_PAGE)
-        .clamp(1, ACTIVITY_PAGE_MOST);
+    let limit = match given("limit").map(str::parse::<i64>) {
+        None => ACTIVITY_PAGE,
+        Some(Ok(limit)) if limit >= 1 => limit.min(ACTIVITY_PAGE_MOST),
+        Some(_) => {
+            return error(
+                StatusCode::BAD_REQUEST,
+                "invalid_request",
+                "limit must be a whole number of at least 1",
+            );
+        }
+    };
     // One more than the page is read, so whether there is an older page is known without a second query.
     let rows = match activity_query(&filter, before, limit + 1)
         .build()
@@ -588,13 +602,21 @@ fn csv_line(event: &serde_json::Value) -> String {
 
 // A cell is quoted when it holds what would end it, the way RFC 4180 writes one. A name starting with what a
 // spreadsheet reads as a formula is written with an apostrophe before it, because key and model names are chosen
-// by whoever made them and the file is opened by an admin.
+// by whoever made them and the file is opened by an admin. A spreadsheet whose locale separates a list with `;`,
+// as German and Austrian ones do, splits the cell there and pays no attention to the quotes, so each part after
+// a `;` is guarded as the start of a cell as well.
 fn csv_text(text: &str) -> String {
-    let text = if text.starts_with(['=', '+', '-', '@', '\t', '\r']) {
-        format!("'{text}")
-    } else {
-        text.to_string()
-    };
+    const FORMULA: [char; 6] = ['=', '+', '-', '@', '\t', '\r'];
+    let mut guarded = String::with_capacity(text.len() + 1);
+    let mut starts_cell = true;
+    for c in text.chars() {
+        if starts_cell && FORMULA.contains(&c) {
+            guarded.push('\'');
+        }
+        guarded.push(c);
+        starts_cell = c == ';';
+    }
+    let text = guarded;
     if text.contains([',', '"', '\n', '\r']) {
         format!("\"{}\"", text.replace('"', "\"\""))
     } else {
@@ -752,6 +774,8 @@ mod tests {
         assert_eq!(csv_text("say \"hi\""), "\"say \"\"hi\"\"\"");
         assert_eq!(csv_text("=SUM(A1)"), "'=SUM(A1)");
         assert_eq!(csv_text("-1,2"), "\"'-1,2\"");
+        assert_eq!(csv_text("x;=1+1;"), "x;'=1+1;");
+        assert_eq!(csv_text("a;b"), "a;b");
     }
 
     #[test]
