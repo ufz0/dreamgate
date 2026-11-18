@@ -1,3 +1,4 @@
+use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 
 use axum::body::{Body, Bytes};
@@ -13,6 +14,7 @@ use crate::api::{error, logged};
 use crate::limits::Admission;
 use crate::presence::{self, Active};
 use crate::registry::{self, Connection};
+use crate::shutdown::Phase;
 use crate::state::State;
 use crate::tokens;
 use crate::usage::{self, UsageRow};
@@ -63,6 +65,17 @@ async fn lookup_key(st: &State, raw: &str) -> Result<Option<KeyInfo>, sqlx::Erro
         rpm_limit: row.get::<Option<i64>, _>("rpm_limit"),
         token_cap: row.get::<Option<i64>, _>("token_cap"),
     }))
+}
+
+// A request that arrives while the process is stopping is turned away rather than started, because it
+// could not be given the time to finish. 503 tells a client to try again, which reaches the process that
+// comes next. The same answer goes to a request the gateway ended because it was stopping.
+fn shutting_down() -> Response {
+    error(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "shutting_down",
+        "the gateway is shutting down; try again in a moment",
+    )
 }
 
 fn unknown_key() -> Response {
@@ -415,6 +428,12 @@ fn stream_body(
     prompt_tokens: i64,
 ) -> impl futures_util::Stream<Item = Result<Bytes, BoxError>> {
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, BoxError>>(64);
+    // Why the stream was ended, when it was ended rather than finished. It is not sent down the channel: a
+    // client that has stopped reading leaves the channel full, and waiting to hand it the error would keep the
+    // row from being written. It is given to the client after whatever is still queued instead, when the
+    // channel closes, so a client that is reading sees it in the same place it always did.
+    let ending: Arc<OnceLock<String>> = Arc::default();
+    let ended = ending.clone();
     tokio::spawn(async move {
         let mut buffer: Vec<u8> = Vec::new();
         let mut generated = String::new();
@@ -437,8 +456,30 @@ fn stream_body(
         // socket dying on the client's side. Silence for the window is a dead connection, and the request
         // should not hold its slot for one forever.
         let stall = ctx.st.limits.stream_stall();
+        // A stream still running when the grace window for stopping has passed is ended, so the process
+        // can stop with its row written rather than lost. It is read first, so a stream that keeps
+        // producing cannot keep the stop waiting.
+        let closing = ctx.st.shutdown.reached(Phase::Closing);
+        tokio::pin!(closing);
+        // As with a stream that went quiet, the client already has a 200, so the stream ends as an error and
+        // the client can tell the answer was cut.
+        let cut_short = |ctx: &StreamContext| {
+            tracing::warn!(
+                "the gateway is stopping and the stream was ended: {}",
+                ctx.model
+            );
+            let _ = ended.set(String::from("the gateway is shutting down"));
+        };
         loop {
-            let chunk = match tokio::time::timeout(stall, incoming.next()).await {
+            let next = tokio::select! {
+                biased;
+                _ = &mut closing => {
+                    cut_short(&ctx);
+                    break;
+                }
+                next = tokio::time::timeout(stall, incoming.next()) => next,
+            };
+            let chunk = match next {
                 Ok(Some(chunk)) => chunk,
                 Ok(None) => break,
                 Err(_) => {
@@ -450,9 +491,7 @@ fn stream_body(
                     // The client has already been sent a 200, so there is no status left to change: the stream
                     // ends as an error rather than as a completed answer, which is what lets a client tell an
                     // answer that was cut from one that finished.
-                    let _ = tx
-                        .send(Err(BoxError::from("the upstream went quiet")))
-                        .await;
+                    let _ = ended.set(String::from("the upstream went quiet"));
                     break;
                 }
             };
@@ -472,7 +511,17 @@ fn stream_body(
                         report.prompt.is_none(),
                         report.completion.is_none(),
                     );
-                    if tx.send(Ok(bytes)).await.is_err() {
+                    // A client that has stopped reading without leaving fills the channel, and the send waits
+                    // for it; the stop does not, so a stream held up that way is still ended and recorded.
+                    let sent = tokio::select! {
+                        biased;
+                        _ = &mut closing => {
+                            cut_short(&ctx);
+                            break;
+                        }
+                        sent = tx.send(Ok(bytes)) => sent,
+                    };
+                    if sent.is_err() {
                         // The client disconnected mid-stream. The row is still written, with whatever
                         // the upstream had reported up to there; the final usage chunk, which is where a
                         // cache hit and the timings appear, is not.
@@ -482,7 +531,7 @@ fn stream_body(
                 Err(err) => {
                     let err = err.without_url();
                     upstream_failed(&ctx.st, &ctx.conn, &err);
-                    let _ = tx.send(Err(BoxError::from(err))).await;
+                    let _ = ended.set(err.to_string());
                     break;
                 }
             }
@@ -534,8 +583,17 @@ fn stream_body(
         drop(ctx.present);
         drop(ctx.admission);
     });
-    stream::unfold(rx, |mut rx| async move {
-        rx.recv().await.map(|item| (item, rx))
+    stream::unfold(Some(rx), move |rx| {
+        let ending = ending.clone();
+        async move {
+            let mut rx = rx?;
+            match rx.recv().await {
+                Some(item) => Some((item, Some(rx))),
+                None => ending
+                    .get()
+                    .map(|reason| (Err(BoxError::from(reason.clone())), None)),
+            }
+        }
     })
 }
 
@@ -545,6 +603,9 @@ pub async fn chat_completions(
     Json(body): Json<Value>,
 ) -> Response {
     let started = Instant::now();
+    if st.shutdown.phase() != Phase::Running {
+        return shutting_down();
+    }
     let Some(raw) = virtual_key(&headers) else {
         return error(
             StatusCode::UNAUTHORIZED,
@@ -588,6 +649,10 @@ pub async fn chat_completions(
     // request that has already reached a connection answering as that connection failed: once something has
     // crossed the gate it is recorded, so it cannot be turned into an overload on the next attempt.
     let Some(global) = st.limits.try_global() else {
+        // A gateway that is full while it stops says it is stopping, which is the answer that lasts.
+        if st.shutdown.phase() != Phase::Running {
+            return shutting_down();
+        }
         return error(
             StatusCode::SERVICE_UNAVAILABLE,
             "overloaded",
@@ -597,12 +662,21 @@ pub async fn chat_completions(
             ),
         );
     };
+    // The check at the top can be passed just before the process starts to stop, by a request that then waits
+    // on the database for its key and its limits. Admitted after the drain has found every slot back, nothing
+    // would wait for it or end it, so the phase is read again once the request holds its slot.
+    if st.shutdown.phase() != Phase::Running {
+        return shutting_down();
+    }
     let mut last_error = String::from("no connection responded");
     // Connections that were already at their limit when this request arrived. They are remembered so that a
     // request which never reached an upstream can be answered as an overload rather than as a failure of an
     // upstream that was never asked.
     let mut full: Vec<String> = Vec::new();
     let mut attempted = false;
+    // The connection a request was waiting on when the gateway ended it because it was stopping, and the model
+    // it was sent there with.
+    let mut cut: Option<(i64, String)> = None;
 
     // The connections come in the order they are tried: the key's own first, then priority, with the ones
     // marked down after the rest (`registry::candidates`). Each is tried once.
@@ -641,16 +715,28 @@ pub async fn chat_completions(
         // The error is what the client is told, so the URL is taken out of it first: it names an internal
         // host and port, and a credential when a connection carries one in its address. The connection is
         // named instead.
-        let sent = if wants_stream {
-            tokio::time::timeout(st.limits.stream_stall(), request.send())
-                .await
-                .map_err(|_| BoxError::from("nothing arrived within the stall window"))
-                .and_then(|result| result.map_err(|err| BoxError::from(err.without_url())))
-        } else {
-            request
-                .send()
-                .await
-                .map_err(|err| BoxError::from(err.without_url()))
+        let sending = async {
+            if wants_stream {
+                tokio::time::timeout(st.limits.stream_stall(), request.send())
+                    .await
+                    .map_err(|_| BoxError::from("nothing arrived within the stall window"))
+                    .and_then(|result| result.map_err(|err| BoxError::from(err.without_url())))
+            } else {
+                request
+                    .send()
+                    .await
+                    .map_err(|err| BoxError::from(err.without_url()))
+            }
+        };
+        // A request still waiting on its answer when the grace window for stopping has passed is ended, so
+        // the process can stop with its row written rather than lost.
+        let sent = tokio::select! {
+            biased;
+            sent = sending => sent,
+            _ = st.shutdown.reached(Phase::Closing) => {
+                cut = Some((conn.id, model.clone()));
+                break;
+            }
         };
         let upstream = match sent {
             Ok(upstream) => upstream,
@@ -688,7 +774,15 @@ pub async fn chat_completions(
             return out;
         }
 
-        let bytes = match upstream.bytes().await {
+        let read = tokio::select! {
+            biased;
+            read = upstream.bytes() => read,
+            _ = st.shutdown.reached(Phase::Closing) => {
+                cut = Some((conn.id, model.clone()));
+                break;
+            }
+        };
+        let bytes = match read {
             Ok(bytes) => bytes,
             Err(err) => {
                 let err = err.without_url();
@@ -779,17 +873,22 @@ pub async fn chat_completions(
         &UsageRow {
             api_key_id: key.id,
             user_id: key.user_id,
-            connection_id: None,
-            model: key.model.clone().or_else(|| requested.map(String::from)),
+            // The connection that was working on the request when the gateway ended it, with the model it was
+            // sent there with, and none when no connection answered.
+            connection_id: cut.as_ref().map(|(id, _)| *id),
+            model: match &cut {
+                Some((_, model)) => Some(model.clone()),
+                None => key.model.clone().or_else(|| requested.map(String::from)),
+            },
             prompt_tokens,
             completion_tokens: 0,
             total_tokens: prompt_tokens,
-            // Nothing reached an engine, so there is nothing it could have reported about the request.
+            // No answer came back, so there is nothing an engine reported about the request.
             cached_tokens: None,
             prompt_ms: None,
             generation_ms: None,
             latency_ms: started.elapsed().as_millis() as i64,
-            status: 502,
+            status: if cut.is_some() { 503 } else { 502 },
             streamed: wants_stream,
             estimated: true,
             created_at: crate::clock::now(),
@@ -797,6 +896,10 @@ pub async fn chat_completions(
         },
     )
     .await;
+    // Ended by the gateway because it was stopping, not by a connection that failed.
+    if cut.is_some() {
+        return shutting_down();
+    }
     // A connection that was full was passed over for one that then failed, which can be one marked down,
     // tried last. The answer is what that one did, and the full ones are named beside it, so the client is
     // not told only half of why nothing answered.
@@ -810,6 +913,9 @@ pub async fn chat_completions(
 }
 
 pub async fn list_models(AxumState(st): AxumState<State>, headers: HeaderMap) -> Response {
+    if st.shutdown.phase() != Phase::Running {
+        return shutting_down();
+    }
     let Some(raw) = virtual_key(&headers) else {
         return error(
             StatusCode::UNAUTHORIZED,

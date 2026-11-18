@@ -113,6 +113,21 @@ impl Limits {
         self.global_size
     }
 
+    // Whether every slot of the gateway as a whole came back within `timeout`. A request that reached a
+    // connection gives its slots back only after its row is written, so every slot back is every such request
+    // recorded. The one exception is a single answer whose client left while it waited: the request is dropped
+    // with the connection to the client and never recorded, so there is nothing for the drain to wait for. The
+    // slots are looked at rather than taken, so what is in flight still reads as it is while the drain waits,
+    // in the log and in a scrape.
+    pub async fn drained(&self, timeout: Duration) -> bool {
+        let every = async {
+            while self.global.available_permits() < self.global_size {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        };
+        tokio::time::timeout(timeout, every).await.is_ok()
+    }
+
     // How many requests hold a slot of the gateway as a whole right now.
     pub fn in_flight(&self) -> usize {
         self.global_size

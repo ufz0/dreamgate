@@ -10,6 +10,7 @@ pub mod metrics;
 pub mod presence;
 pub mod registry;
 pub mod settings;
+pub mod shutdown;
 pub mod state;
 pub mod stats;
 pub mod tokens;

@@ -11,6 +11,7 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, post},
 };
+use dreamgate::shutdown::Phase;
 use dreamgate::{build_router, db, limits, live, metrics, state::State};
 use futures_util::{future::join_all, stream};
 use http_body_util::BodyExt;
@@ -63,6 +64,7 @@ async fn test_state(limits: limits::Limits, pool: u32) -> State {
         attempts: Default::default(),
         limits: Arc::new(limits),
         metrics: Default::default(),
+        shutdown: Default::default(),
     }
 }
 
@@ -1016,6 +1018,234 @@ async fn usage_records_written_by_many_requests_at_once_are_all_there_and_do_not
         assert_eq!(row["prompt_tokens"], json!(marker));
         assert_eq!(row["completion_tokens"], json!(marker));
     }
+}
+
+async fn get_status(router: &Router, path: &str) -> (StatusCode, String) {
+    let response = router
+        .clone()
+        .oneshot(
+            axum::http::Request::get(path)
+                .header("authorization", "Bearer dreamgate_test")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status();
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    (status, String::from_utf8_lossy(&bytes).to_string())
+}
+
+// Once the process is told to stop, nothing new is started: a request that could not be given the time to
+// finish is turned away with 503 and not recorded, the model list the same, and the health check says the
+// process is draining so a load balancer stops sending it requests.
+#[tokio::test]
+async fn a_request_that_arrives_while_the_gateway_is_stopping_is_turned_away() {
+    let mock = Mock::new(0, 1);
+    let st = test_state(test_limits(8, 8), 4).await;
+    let base_url = mock_upstream(&mock).await;
+    seed(&st, "ada", &base_url, "dreamgate_test", None).await;
+    let router = build_router(st.clone());
+
+    st.shutdown.advance(Phase::Draining);
+    let response = gateway_call(&router, "dreamgate_test", 1, false).await;
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    let body: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(body["error"]["type"], "shutting_down");
+    assert_eq!(
+        get_status(&router, "/v1/models").await.0,
+        StatusCode::SERVICE_UNAVAILABLE
+    );
+    assert_eq!(
+        get_status(&router, "/health").await,
+        (StatusCode::SERVICE_UNAVAILABLE, "draining".to_string())
+    );
+    assert_eq!(row_count(&st.pool).await, 0, "nothing was started");
+    assert_eq!(mock.peak(), 0);
+}
+
+// A stream that is running when the process is told to stop is let finish, and the drain only ends once its
+// row is written: every slot of the gateway coming back is every admitted request recorded.
+#[tokio::test]
+async fn a_request_in_flight_when_stopping_begins_finishes_and_is_recorded_before_the_drain_ends() {
+    let mock = Mock::new(80, 5);
+    let st = test_state(test_limits(8, 8), 4).await;
+    let base_url = mock_upstream(&mock).await;
+    seed(&st, "ada", &base_url, "dreamgate_test", None).await;
+    let router = build_router(st.clone());
+
+    let running = gateway_call(&router, "dreamgate_test", 7, true).await;
+    assert_eq!(running.status(), StatusCode::OK);
+    let reading = tokio::spawn(async move { running.into_body().collect().await.is_ok() });
+    st.shutdown.advance(Phase::Draining);
+
+    // The drain looks at the slots rather than taking them, so while it waits what is in flight reads as the
+    // one stream, not as every slot of the gateway.
+    let limits = st.limits.clone();
+    let drain = tokio::spawn(async move { limits.drained(Duration::from_secs(10)).await });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(st.limits.in_flight(), 1);
+    assert!(drain.await.unwrap());
+    assert_eq!(
+        row_count(&st.pool).await,
+        1,
+        "the drain ended before the row was written"
+    );
+    assert!(
+        reading.await.unwrap(),
+        "the stream did not end as it should"
+    );
+    let rows = wait_for_rows(&st.pool, 1).await;
+    assert_eq!(rows[0]["estimated"], false, "the stream finished whole");
+    assert!(!mock.cut_short());
+}
+
+// A stream still running when the grace window has passed is ended so the process can stop, and its row is
+// written with what was known when it was cut: no usage chunk arrived, so the counts are the gateway's
+// estimate. The client sees the stream end as an error, which is how it tells a cut answer from a finished one.
+#[tokio::test]
+async fn a_stream_still_running_when_the_grace_window_passes_is_ended_and_recorded() {
+    let mock = Mock::new(200, 100);
+    let st = test_state(test_limits(8, 8), 4).await;
+    let base_url = mock_upstream(&mock).await;
+    seed(&st, "ada", &base_url, "dreamgate_test", None).await;
+    let router = build_router(st.clone());
+
+    let running = gateway_call(&router, "dreamgate_test", 3, true).await;
+    assert_eq!(running.status(), StatusCode::OK);
+    let reading = tokio::spawn(async move { running.into_body().collect().await.is_ok() });
+    st.shutdown.advance(Phase::Draining);
+    st.shutdown.advance(Phase::Closing);
+
+    let started = Instant::now();
+    assert!(st.limits.drained(Duration::from_secs(10)).await);
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "the stream was let run rather than ended"
+    );
+    assert_eq!(row_count(&st.pool).await, 1);
+    assert!(
+        !reading.await.unwrap(),
+        "a cut stream ended as if it had finished"
+    );
+    let rows = wait_for_rows(&st.pool, 1).await;
+    assert_eq!(rows[0]["estimated"], true);
+    assert_eq!(rows[0]["streamed"], true);
+}
+
+// A client that keeps its connection but stops reading leaves the stream's channel full, and the stream task
+// waiting to hand it the next chunk. The stop does not wait for that client: the stream is ended at Closing all
+// the same, its row written and its slot given back, so the drain is not held to its deadline and the row is
+// not lost.
+#[tokio::test]
+async fn a_stream_whose_client_stopped_reading_is_still_ended_and_recorded() {
+    let mock = Mock::new(0, 2000);
+    let st = test_state(test_limits(8, 8), 4).await;
+    let base_url = mock_upstream(&mock).await;
+    seed(&st, "ada", &base_url, "dreamgate_test", None).await;
+    let router = build_router(st.clone());
+
+    let held = gateway_call(&router, "dreamgate_test", 3, true).await;
+    assert_eq!(held.status(), StatusCode::OK);
+    // Long enough for the upstream to have filled the channel the response is not reading.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    st.shutdown.advance(Phase::Draining);
+    st.shutdown.advance(Phase::Closing);
+
+    assert!(
+        st.limits.drained(Duration::from_secs(3)).await,
+        "the stream waited on a client that does not read"
+    );
+    assert_eq!(row_count(&st.pool).await, 1);
+    // What was queued still reaches the client, and then the error that says the answer was cut.
+    let mut body = held.into_body();
+    let mut ended_with_error = false;
+    while let Some(frame) = body.frame().await {
+        if frame.is_err() {
+            ended_with_error = true;
+            break;
+        }
+    }
+    assert!(ended_with_error, "a cut stream ended as if it had finished");
+}
+
+// A request can pass the check at the top just before the process starts to stop and then wait on the
+// database for its key. If the drain has found every slot back in the meantime, nothing would wait for that
+// request or end it, so once it holds its slot it reads the phase again and is turned away, before it
+// reaches a connection.
+#[tokio::test]
+async fn a_request_that_waited_on_the_database_while_the_drain_ended_is_turned_away() {
+    let mock = Mock::new(0, 2);
+    let st = test_state(test_limits(8, 8), 1).await;
+    let base_url = mock_upstream(&mock).await;
+    seed(&st, "ada", &base_url, "dreamgate_test", None).await;
+    let router = build_router(st.clone());
+
+    let held = st.pool.acquire().await.unwrap();
+    let waiting = {
+        let router = router.clone();
+        tokio::spawn(async move { gateway_call(&router, "dreamgate_test", 1, false).await })
+    };
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    st.shutdown.advance(Phase::Draining);
+    assert!(st.limits.drained(Duration::from_secs(1)).await);
+    drop(held);
+
+    let response = tokio::time::timeout(Duration::from_secs(5), waiting)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    let body: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(body["error"]["type"], "shutting_down");
+    assert_eq!(
+        mock.peak(),
+        0,
+        "the request reached a connection after the drain"
+    );
+    assert_eq!(row_count(&st.pool).await, 0);
+}
+
+// A single answer still waiting when the grace window has passed is ended as well, answered as the gateway
+// shutting down rather than as a failed connection, and recorded against the connection that was working on
+// it, with the input estimated because no answer came back.
+#[tokio::test]
+async fn a_single_answer_still_waiting_when_the_grace_window_passes_is_ended_and_recorded() {
+    let mock = Mock::new(10_000, 0);
+    let st = test_state(test_limits(8, 8), 4).await;
+    let base_url = mock_upstream(&mock).await;
+    seed(&st, "ada", &base_url, "dreamgate_test", None).await;
+    let router = build_router(st.clone());
+
+    let waiting = {
+        let router = router.clone();
+        tokio::spawn(async move { gateway_call(&router, "dreamgate_test", 5, false).await })
+    };
+    for _ in 0..200 {
+        if mock.peak() == 1 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(mock.peak(), 1, "the request never reached the mock");
+    st.shutdown.advance(Phase::Draining);
+    st.shutdown.advance(Phase::Closing);
+
+    let response = tokio::time::timeout(Duration::from_secs(5), waiting)
+        .await
+        .expect("the request was let wait out its answer")
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert!(st.limits.drained(Duration::from_secs(5)).await);
+    let row = sqlx::query("SELECT status, connection_id, estimated FROM usage")
+        .fetch_one(&st.pool)
+        .await
+        .unwrap();
+    assert_eq!(row.get::<i64, _>("status"), 503);
+    assert!(row.get::<Option<i64>, _>("connection_id").is_some());
+    assert_eq!(row.get::<i64, _>("estimated"), 1);
 }
 
 // Not part of the normal run: it measures, so it is only read when asked for. Run with
