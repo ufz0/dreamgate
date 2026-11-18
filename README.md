@@ -643,7 +643,7 @@ a session or a DreamGate key.
   the key a connection carries and its address are returned to an admin alone, because an address names an
   internal host and port and can carry a credential of its own. A disabled account is refused at every
   gateway endpoint, not only at the completion path.
-- - A key is shown to its owner alone, in the answers of the API and on the page. An admin manages every
+- A key is shown to its owner alone, in the answers of the API and on the page. An admin manages every
   account's keys, and sees another account's key by a hint, the fixed prefix with the first four and the last
   four of its random characters, because a key is a credential that bills the account it belongs to; rotating
   another account's key does not hand the admin the new one either. This keeps keys off an admin's screen, not

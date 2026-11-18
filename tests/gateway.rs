@@ -5942,10 +5942,10 @@ async fn a_key_expires_rotates_and_says_when_it_was_last_used() {
     let others = get_json(&router, "/api/keys/others", &admin).await;
     let listed = &others["keys"][0];
     assert_eq!(listed["key"], Value::Null);
-    let hint = listed["key_hint"].as_str().unwrap();
-    assert!(
-        hint.starts_with("dreamgate_") && hint.ends_with(&bens_new[bens_new.len() - 4..]),
-        "{hint}"
+    // The prefix and the first four random characters, then the last four.
+    assert_eq!(
+        listed["key_hint"],
+        format!("{}…{}", &bens_new[..14], &bens_new[bens_new.len() - 4..])
     );
     assert!(!others.to_string().contains(&bens_new));
 }
