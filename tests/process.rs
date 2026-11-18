@@ -250,12 +250,19 @@ fn start(dir: &std::path::Path) -> (Running, String) {
         .unwrap();
     let stdout = child.stdout.take().unwrap();
     let child = Running(child);
-    let mut lines = BufReader::new(stdout).lines();
+    // The output is read for as long as the process runs, not only up to its address. The process prints more
+    // after that line, and a print to a pipe nobody reads from any more fails, which stops the process with a
+    // panic: the test would then be watching a process that died on its own.
+    let (lines, read) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+            let _ = lines.send(line);
+        }
+    });
     loop {
-        let line = lines
-            .next()
-            .expect("the process printed no address")
-            .unwrap();
+        let line = read
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the process printed no address");
         if let Some(addr) = line.strip_prefix("DreamGate listening on ") {
             return (child, addr.to_string());
         }
