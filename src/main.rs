@@ -3,7 +3,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use dreamgate::shutdown::{self, Phase};
-use dreamgate::{build_router, db, limits, live, metrics, registry, state};
+use dreamgate::{auth, build_router, db, limits, live, metrics, registry, state};
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::filter::LevelFilter;
 
@@ -73,6 +73,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     tokio::spawn(registry::health_checker(st.clone()));
+    auth::prepare_refusals();
 
     // Before the process says it is listening, so a stop sent from then on is met by the drain.
     let signals = shutdown::Signals::listen()

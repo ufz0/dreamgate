@@ -159,7 +159,8 @@ async fn grouped(
 // traffic arrives and a new account is found where its name sorts.
 async fn accounts(st: &State) -> Result<Vec<serde_json::Value>, sqlx::Error> {
     let rows = sqlx::query(
-        "SELECT u.id, u.username, u.enabled, u.pending, u.daily_token_cap, COUNT(r.id) AS requests, \
+        "SELECT u.id, u.username, u.enabled, u.pending, u.daily_token_cap, \
+                u.password_hash IS NOT NULL AS has_password, u.setup_code_expires_at, COUNT(r.id) AS requests, \
                 COALESCE(SUM(r.total_tokens), 0) AS tokens, \
                 COALESCE(SUM(r.prompt_tokens), 0) AS prompt_tokens, \
                 COALESCE(SUM(r.completion_tokens), 0) AS completion_tokens, \
@@ -177,6 +178,10 @@ async fn accounts(st: &State) -> Result<Vec<serde_json::Value>, sqlx::Error> {
                 "enabled": row.get::<i64, _>("enabled") != 0,
                 "pending": row.get::<i64, _>("pending") != 0,
                 "daily_token_cap": row.get::<Option<i64>, _>("daily_token_cap"),
+                // Whether a password is set and until when a setup code works, never the code itself,
+                // which is shown once to the admin who asked for it.
+                "has_password": row.get::<i64, _>("has_password") != 0,
+                "setup_code_expires_at": row.get::<Option<String>, _>("setup_code_expires_at"),
                 "requests": row.get::<i64, _>("requests"),
                 "tokens": row.get::<i64, _>("tokens"),
                 "prompt_tokens": row.get::<i64, _>("prompt_tokens"),

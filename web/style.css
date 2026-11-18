@@ -610,6 +610,11 @@ input:focus-visible, select:focus-visible, textarea:focus-visible, button:focus-
   * { transition: none !important; animation: none !important; }
 }
 
+/* A setup code is read out and typed, so it is set large in the fixed-width face. */
+#setup-code-value { font: 500 17px/1.4 var(--font-mono); letter-spacing: 0.04em; white-space: nowrap; }
+#setup-code .value-line { flex-wrap: wrap; }
+#setup-code-toggle:not([hidden]) { display: block; margin: -6px 0 14px -8px; }
+
 /* The Activity filters sit in one row that wraps, each as narrow as its control allows. */
 .filters { display: flex; flex-wrap: wrap; gap: 12px; align-items: flex-end; margin-bottom: 16px; }
 .filters .field { margin-bottom: 0; flex: 1 1 9rem; max-width: 14rem; }

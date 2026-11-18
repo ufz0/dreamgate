@@ -23,9 +23,11 @@
       <button type="button" id="mode-login" aria-pressed="true">Sign in</button>
     </div>
     <p class="note" id="register-note" hidden>Self-registration is closed, so an admin has to open it before a new account can be made.</p>
-    <p class="note" id="first-password-note" hidden>For an account an admin made, the first password you enter here becomes your own.</p>
+    <p class="note" id="first-password-note" hidden>For an account an admin made, or a password an admin reset, sign in with the setup code they gave you and choose your password.</p>
     <label>Username<input name="username" autocomplete="username" required></label>
-    <label>Password<input name="password" type="password" minlength="8" required></label>
+    <label id="setup-code-field" hidden>Setup code<input name="setup_code" autocomplete="one-time-code" spellcheck="false"></label>
+    <label><span id="password-label">Password</span><input name="password" id="auth-password" type="password" minlength="8" autocomplete="current-password" required></label>
+    <button type="button" class="link" id="setup-code-toggle" aria-expanded="false" hidden>I have a setup code</button>
     <button type="submit" id="auth-submit">Sign in</button>
     <p class="notice" id="auth-error" role="status"></p>
   </form>
@@ -324,6 +326,15 @@
 </div>
 
 <div class="scrim" id="scrim"></div>
+
+<dialog id="setup-code">
+  <h2 id="setup-code-title">Setup code</h2>
+  <p id="setup-code-text"></p>
+  <p class="value-line"><code id="setup-code-value"></code><button type="button" class="link" data-copy-from="setup-code-value">Copy code</button></p>
+  <div class="actions">
+    <button type="button" class="link" id="setup-code-close">Done</button>
+  </div>
+</dialog>
 
 <dialog id="confirm">
   <h2 id="confirm-title">Confirm</h2>
