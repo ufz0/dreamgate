@@ -122,7 +122,7 @@ pub async fn hash_password(password: &str) -> Result<String, String> {
 // A hash nothing matches, checked where a sign-in has nothing to check against: no account by that name, no
 // password yet, no code given out. A wrong password costs one bcrypt check, so every refusal costs one, and the
 // time an answer takes does not say which usernames exist or which accounts are waiting for a code. It is made
-// on the blocking pool the first time it is needed, like any other hash.
+// on the blocking pool at the start, by `prepare_refusals`.
 static NOTHING_TO_CHECK: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
     bcrypt::hash("there is nothing to check this against", BCRYPT_COST).unwrap_or_default()
 });
