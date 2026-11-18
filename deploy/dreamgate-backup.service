@@ -4,7 +4,9 @@
 # It runs as root, because the state directory of a service with a dynamic user is readable by that user
 # alone. That is safe for the database: SQLite gives the -wal and -shm files it makes to the database's
 # owner, so the service can still open them. The copy is written by root and readable by root alone, and
-# the backup refuses a file that is already there. /var/backups/dreamgate has to exist.
+# the backup refuses a file that is already there. The directory is made if it is not there, and copies older
+# than two weeks are removed after each run, because each copy is the whole database and the backups would
+# otherwise fill the disk the database is on.
 
 [Unit]
 Description=DreamGate database backup
@@ -14,4 +16,6 @@ Type=oneshot
 Environment=DREAMGATE_DB=/var/lib/dreamgate/dreamgate.db
 # systemd expands neither $(...) nor a date, so a shell names the file; %% and $$ are how a unit writes a
 # literal % and $.
+ExecStartPre=/usr/bin/install -d -m 0700 /var/backups/dreamgate
 ExecStart=/bin/sh -c 'exec /usr/local/bin/dreamgate backup /var/backups/dreamgate/dreamgate-$$(date +%%F).db'
+ExecStartPost=/usr/bin/find /var/backups/dreamgate -name 'dreamgate-*.db' -mtime +14 -delete

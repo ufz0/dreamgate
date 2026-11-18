@@ -123,23 +123,25 @@ than that only lets a proxy pass on what the gateway then refuses. `proxy_read_t
 time limits above if either is raised.
 
 **Backups.** Copying the database file while the gateway runs is not a backup: with the write-ahead log, the
-latest rows can still be in `dreamgate.db-wal` beside it, and a copy taken during a write is torn.
-`dreamgate backup FILE` writes a consistent copy of the database in `DREAMGATE_DB` with SQLite's `VACUUM INTO`,
-while the gateway runs or not. It does not create or migrate the database it copies. It makes `FILE` itself
-before anything is copied into it and refuses one that is already there, an empty file or a link included, so an
+latest rows can still be in `dreamgate.db-wal` beside it, and a copy taken during a write is torn. `dreamgate
+backup FILE` writes a consistent copy of the database in `DREAMGATE_DB` with SQLite's `VACUUM INTO`, while the
+gateway runs or not. It does not create or migrate the database it copies. It makes `FILE` itself before
+anything is copied into it and refuses one that is already there, an empty file or a link included, so an
 earlier backup, or a file someone else left in a shared directory, is never written into; on Unix the copy is
-readable by its owner alone from the moment it is made, and a copy that fails partway is removed. On Windows it
-keeps the permissions of its directory. Treat a backup as a secret: it holds every DreamGate key and every
-upstream key in the clear. With the systemd unit above, `deploy/dreamgate-backup.service` and
-`deploy/dreamgate-backup.timer` take one a day into `/var/backups/dreamgate`; in Docker,
-`docker exec dreamgate dreamgate backup /data/backup.db`, then `docker cp dreamgate:/data/backup.db .` to take it
-off the volume the database is on, and remove it from there.
+readable by its owner alone from the moment it is made, and a copy that fails partway is removed, unless the
+process is killed in the middle of it. On Windows it keeps the permissions of its directory. Treat a backup as a
+secret: it holds every DreamGate key and every upstream key in the clear. With the systemd unit above,
+`deploy/dreamgate-backup.service` and `deploy/dreamgate-backup.timer` take one a day into
+`/var/backups/dreamgate`, which they make, and remove the copies older than two weeks; in Docker, `docker exec
+dreamgate dreamgate backup /data/backup.db`, then `docker cp dreamgate:/data/backup.db .` to take it off the
+volume the database is on, and remove it from there.
 
 **Restoring.** Stop the gateway first, and make sure no `dreamgate.db-wal` or `dreamgate.db-shm` is left beside
 the database: a database put in place under a write-ahead log that belongs to another one is how SQLite
 databases are corrupted. Put the copy in place as `DREAMGATE_DB`, owned by the user the gateway runs as — with
-the systemd unit, the owner of `/var/lib/dreamgate`; in Docker, uid 10001 — and start the gateway again, which
-migrates the copy if it was taken by an older version.
+the systemd unit, `chown "$(stat -L -c %u:%g /var/lib/dreamgate)" dreamgate.db`, because the user only has a
+name while the service runs; in Docker, uid 10001 — and start the gateway again, which migrates the copy if it
+was taken by an older version.
 
 ## Using it
 

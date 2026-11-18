@@ -364,6 +364,10 @@ async fn the_backup_command_copies_a_database_that_is_in_use() {
 
     let again = run(&target);
     assert!(!again.status.success(), "an earlier backup was overwritten");
+    assert!(
+        String::from_utf8_lossy(&again.stderr).contains("cannot create"),
+        "the error did not say it was about the copy"
+    );
 
     // An empty file someone else made is refused as well, rather than written into, and left as it was.
     let planted = dir.join("planted.db");

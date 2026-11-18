@@ -166,15 +166,20 @@ pub const ACQUIRE_TIMEOUT: Duration = Duration::from_secs(30);
 // SQLite writes into it and gives its journal the same mode. A copy that fails partway is removed with its
 // journal, because a partial copy holds keys too. The path is made absolute, because SQLite reads a name that
 // starts with `file:` as a URI rather than as a file.
-pub async fn backup(url: &str, target: &std::path::Path) -> Result<(), sqlx::Error> {
-    let target = std::path::absolute(target)?;
+// An error about the copy names the file, so it does not read as one about the database being copied.
+pub async fn backup(
+    url: &str,
+    target: &std::path::Path,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let cannot_create = |err: std::io::Error| format!("cannot create {}: {err}", target.display());
+    let target = std::path::absolute(target).map_err(cannot_create)?;
     let options = SqliteConnectOptions::from_str(url)?.busy_timeout(Duration::from_secs(5));
     let mut connection = SqliteConnection::connect_with(&options).await?;
     let mut file = std::fs::OpenOptions::new();
     file.write(true).create_new(true);
     #[cfg(unix)]
     std::os::unix::fs::OpenOptionsExt::mode(&mut file, 0o600);
-    drop(file.open(&target)?);
+    drop(file.open(&target).map_err(cannot_create)?);
     let written = sqlx::query("VACUUM INTO ?")
         .bind(target.to_string_lossy().into_owned())
         .execute(&mut connection)
@@ -184,7 +189,7 @@ pub async fn backup(url: &str, target: &std::path::Path) -> Result<(), sqlx::Err
         let mut journal = target.into_os_string();
         journal.push("-journal");
         let _ = std::fs::remove_file(journal);
-        return Err(err);
+        return Err(err.into());
     }
     connection.close().await?;
     Ok(())
