@@ -1670,6 +1670,17 @@ async fn the_health_check_round_marks_a_connection_that_answers() {
     // The first round runs as soon as the task starts, and the mock answers at once, so the window is
     // far longer than the round needs. A round that stops is only started again after 30 seconds, so a
     // round that cannot read the row is caught here as a row that still reads unknown.
+    // A failure older than the figures' window is removed after the round, and a recent one is kept.
+    for at in ["2020-01-01T00:00:00Z".to_string(), dreamgate::clock::now()] {
+        sqlx::query(
+            "INSERT INTO connection_failures (connection_id, kind, created_at) VALUES (?, 'unreachable', ?)",
+        )
+        .bind(id)
+        .bind(at)
+        .execute(&st.pool)
+        .await
+        .unwrap();
+    }
     let round = tokio::spawn(dreamgate::registry::health_checker(st.clone()));
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
@@ -1678,12 +1689,16 @@ async fn the_health_check_round_marks_a_connection_that_answers() {
             .fetch_one(&st.pool)
             .await
             .unwrap();
-        if health == "ok" {
+        let failures: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM connection_failures")
+            .fetch_one(&st.pool)
+            .await
+            .unwrap();
+        if health == "ok" && failures == 1 {
             break;
         }
         assert!(
             Instant::now() < deadline,
-            "the connection still reads {health} after the first round"
+            "the connection still reads {health}, with {failures} failures, after the first round"
         );
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
@@ -5790,4 +5805,481 @@ async fn the_model_list_passes_on_dates_and_includes_a_connection_marked_down() 
             { "id": "down-model", "object": "model", "owned_by": "down" },
         ])
     );
+}
+
+// A connection that fails a request is written down against it, and when the request goes on to another
+// connection that failure is a failover; the one that answered counts the answer and how long it took. The
+// figures are an admin's alone, and a connection's failures go with it when it is removed.
+#[tokio::test]
+async fn each_connection_counts_its_answers_its_failures_and_the_requests_it_passed_on() {
+    let st = test_state().await;
+    let router = build_router(st.clone());
+    let base_url = mock_upstream().await;
+    let cookie = register(&router, "ada").await;
+    let (_, dead) = post_json(
+        &router,
+        "/api/connections",
+        &cookie,
+        json!({ "name": "dead", "base_url": "http://127.0.0.1:1", "priority": 0 }),
+    )
+    .await;
+    let (_, up) = post_json(
+        &router,
+        "/api/connections",
+        &cookie,
+        json!({ "name": "up", "base_url": base_url, "priority": 1 }),
+    )
+    .await;
+    let (_, created) = post_json(&router, "/api/keys", &cookie, json!({ "name": "k" })).await;
+    let response = gateway_call(
+        &router,
+        created["key"].as_str().unwrap(),
+        json!({ "model": "m", "messages": [{ "role": "user", "content": "hi" }] }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let figures = get_json(&router, "/api/stats/connections", &cookie).await;
+    let of = |connection: &Value| {
+        figures["connections"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|figures| figures["id"] == connection["id"])
+            .cloned()
+            .unwrap()
+    };
+    let (dead_figures, up_figures) = (of(&dead), of(&up));
+    assert_eq!(dead_figures["failures"], 1);
+    assert_eq!(dead_figures["passed_on"], 1);
+    assert_eq!(dead_figures["answered"], 0);
+    assert_eq!(dead_figures["single"]["p50_ms"], Value::Null);
+    assert_eq!(up_figures["answered"], 1);
+    assert_eq!(up_figures["failures"], 0);
+    assert_eq!(up_figures["single"]["count"], 1);
+    assert!(up_figures["single"]["p50_ms"].is_i64());
+    assert_eq!(up_figures["streamed"]["p50_ms"], Value::Null);
+
+    open_registration(&router, &cookie).await;
+    no_approval(&router, &cookie).await;
+    let member = register(&router, "bob").await;
+    let refused = call(
+        &router,
+        Request::get("/api/stats/connections")
+            .header("cookie", &member)
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(refused.status(), StatusCode::FORBIDDEN);
+
+    let removed = call(
+        &router,
+        Request::delete(format!("/api/connections/{}", dead["id"]))
+            .header("cookie", &cookie)
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(removed.status(), StatusCode::OK);
+    let left = sqlx::query("SELECT COUNT(*) AS n FROM connection_failures")
+        .fetch_one(&st.pool)
+        .await
+        .unwrap()
+        .get::<i64, _>("n");
+    assert_eq!(left, 0, "a removed connection's failures were kept");
+}
+
+// A request that every connection fails was passed on from all but the last, which had nothing to pass it to.
+#[tokio::test]
+async fn the_last_connection_to_fail_a_request_did_not_pass_it_on() {
+    let st = test_state().await;
+    let router = build_router(st.clone());
+    let cookie = register(&router, "ada").await;
+    for (name, priority) in [("first", 0), ("second", 1)] {
+        post_json(
+            &router,
+            "/api/connections",
+            &cookie,
+            json!({ "name": name, "base_url": "http://127.0.0.1:1", "priority": priority }),
+        )
+        .await;
+    }
+    let (_, created) = post_json(&router, "/api/keys", &cookie, json!({ "name": "k" })).await;
+    let response = gateway_call(
+        &router,
+        created["key"].as_str().unwrap(),
+        json!({ "model": "m", "messages": [{ "role": "user", "content": "hi" }] }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    let figures = get_json(&router, "/api/stats/connections", &cookie).await;
+    let counted: Vec<(i64, i64)> = figures["connections"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| {
+            (
+                f["failures"].as_i64().unwrap(),
+                f["passed_on"].as_i64().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(counted, [(1, 1), (1, 0)]);
+}
+
+async fn figures_of(router: &Router, cookie: &str, connection: &Value) -> Value {
+    get_json(router, "/api/stats/connections", cookie).await["connections"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|figures| figures["id"] == connection["id"])
+        .cloned()
+        .unwrap()
+}
+
+async fn failures_written(pool: &SqlitePool, at_least: i64) -> Vec<Value> {
+    for _ in 0..200 {
+        let rows = sqlx::query(
+            "SELECT connection_id, kind, passed_on, usage_id FROM connection_failures ORDER BY id",
+        )
+        .fetch_all(pool)
+        .await
+        .unwrap();
+        if rows.len() as i64 >= at_least {
+            return rows
+                .iter()
+                .map(|row| {
+                    json!({
+                        "connection_id": row.get::<i64, _>("connection_id"),
+                        "kind": row.get::<String, _>("kind"),
+                        "passed_on": row.get::<i64, _>("passed_on") != 0,
+                        "usage_id": row.get::<Option<i64>, _>("usage_id"),
+                    })
+                })
+                .collect();
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    panic!("fewer than {at_least} failures were written");
+}
+
+// An upstream that answers every request with a head and then breaks off before the body it promised.
+async fn breaking_upstream() -> String {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        while let Ok((mut socket, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                let mut buf = [0u8; 8192];
+                let _ = socket.read(&mut buf).await;
+                let _ = socket
+                    .write_all(b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 100\r\n\r\n{\"x\":")
+                    .await;
+            });
+        }
+    });
+    format!("http://{addr}")
+}
+
+// An answer that was an error is counted among the connection's errors and left out of its times, and a row or
+// a failure older than the day is left out of the figures altogether.
+#[tokio::test]
+async fn an_error_answer_is_counted_but_not_timed_and_old_rows_are_left_out() {
+    let app = Router::new().route(
+        "/v1/chat/completions",
+        post(|| async {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": { "message": "no" } })),
+            )
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+    let st = test_state().await;
+    let router = build_router(st.clone());
+    let cookie = register(&router, "ada").await;
+    let ada = get_json(&router, "/api/me", &cookie).await["id"]
+        .as_i64()
+        .unwrap();
+    let (_, errs) = post_json(
+        &router,
+        "/api/connections",
+        &cookie,
+        json!({ "name": "errs", "base_url": format!("http://{addr}") }),
+    )
+    .await;
+    let (_, created) = post_json(&router, "/api/keys", &cookie, json!({ "name": "k" })).await;
+    let response = gateway_call(
+        &router,
+        created["key"].as_str().unwrap(),
+        json!({ "model": "m", "messages": [{ "role": "user", "content": "hi" }] }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    sqlx::query(
+        "INSERT INTO usage (user_id, connection_id, model, prompt_tokens, completion_tokens, total_tokens, \
+         latency_ms, status, created_at) VALUES (?, ?, 'm', 1, 1, 2, 5, 200, '2020-01-01T00:00:00Z')",
+    )
+    .bind(ada)
+    .bind(errs["id"].as_i64().unwrap())
+    .execute(&st.pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO connection_failures (connection_id, kind, created_at) VALUES (?, 'unreachable', '2020-01-01T00:00:00Z')",
+    )
+    .bind(errs["id"].as_i64().unwrap())
+    .execute(&st.pool)
+    .await
+    .unwrap();
+
+    let figures = figures_of(&router, &cookie, &errs).await;
+    assert_eq!(figures["answered"], 1);
+    assert_eq!(figures["errors"], 1);
+    assert_eq!(figures["failures"], 0);
+    assert_eq!(figures["single"]["count"], 0);
+    assert_eq!(figures["single"]["p50_ms"], Value::Null);
+}
+
+// A single answer that breaks off is a failure, passed on to the next connection; a stream that breaks off after
+// its head was sent has a row, but its failure names that row, so it is counted as a failure rather than as an
+// answer, and its time is not an answer's.
+#[tokio::test]
+async fn a_broken_answer_is_passed_on_and_a_broken_stream_is_not_an_answer() {
+    let st = test_state().await;
+    let router = build_router(st.clone());
+    let base_url = mock_upstream().await;
+    let cookie = register(&router, "ada").await;
+    let (_, broken) = post_json(
+        &router,
+        "/api/connections",
+        &cookie,
+        json!({ "name": "broken", "base_url": breaking_upstream().await, "priority": 0 }),
+    )
+    .await;
+    post_json(
+        &router,
+        "/api/connections",
+        &cookie,
+        json!({ "name": "up", "base_url": base_url, "priority": 1 }),
+    )
+    .await;
+    let (_, created) = post_json(&router, "/api/keys", &cookie, json!({ "name": "k" })).await;
+    let key = created["key"].as_str().unwrap().to_string();
+
+    let response = gateway_call(
+        &router,
+        &key,
+        json!({ "model": "m", "messages": [{ "role": "user", "content": "hi" }] }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let response = gateway_call(
+        &router,
+        &key,
+        json!({ "model": "m", "stream": true, "messages": [{ "role": "user", "content": "hi" }] }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let _ = response.into_body().collect().await;
+
+    let failures = failures_written(&st.pool, 2).await;
+    let stream_row = sqlx::query("SELECT id FROM usage WHERE streamed = 1")
+        .fetch_one(&st.pool)
+        .await
+        .unwrap()
+        .get::<i64, _>("id");
+    assert_eq!(failures[0]["kind"], "broken");
+    assert_eq!(failures[0]["passed_on"], true);
+    assert_eq!(failures[0]["usage_id"], Value::Null);
+    assert_eq!(failures[1]["kind"], "broken");
+    assert_eq!(failures[1]["passed_on"], false);
+    assert_eq!(failures[1]["usage_id"], stream_row);
+
+    let figures = figures_of(&router, &cookie, &broken).await;
+    assert_eq!(figures["failures"], 2);
+    assert_eq!(figures["passed_on"], 1);
+    assert_eq!(
+        figures["answered"], 0,
+        "a stream that broke off is not an answer"
+    );
+    assert_eq!(figures["streamed"]["count"], 0);
+}
+
+// A failure followed by a connection that was full is still passed on when the request reaches a third; a model
+// list that fails has nothing to pass on to; and a failure that cannot be written does not touch the request.
+#[tokio::test]
+async fn a_failure_before_a_full_connection_is_passed_on_and_a_lost_write_changes_nothing() {
+    let st = test_state().await;
+    let router = build_router(st.clone());
+    let base_url = mock_upstream().await;
+    let cookie = register(&router, "ada").await;
+    let (_, dead) = post_json(
+        &router,
+        "/api/connections",
+        &cookie,
+        json!({ "name": "dead", "base_url": "http://127.0.0.1:1", "priority": 0 }),
+    )
+    .await;
+    let (_, full) = post_json(
+        &router,
+        "/api/connections",
+        &cookie,
+        json!({ "name": "full", "base_url": base_url, "priority": 1, "max_concurrent": 1 }),
+    )
+    .await;
+    post_json(
+        &router,
+        "/api/connections",
+        &cookie,
+        json!({ "name": "up", "base_url": base_url, "priority": 2 }),
+    )
+    .await;
+    let _held = st
+        .limits
+        .for_connection(full["id"].as_i64().unwrap(), Some(1))
+        .try_acquire_owned()
+        .unwrap();
+    let (_, created) = post_json(&router, "/api/keys", &cookie, json!({ "name": "k" })).await;
+    let key = created["key"].as_str().unwrap().to_string();
+    let response = gateway_call(
+        &router,
+        &key,
+        json!({ "model": "m", "messages": [{ "role": "user", "content": "hi" }] }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let failures = failures_written(&st.pool, 1).await;
+    assert_eq!(failures[0]["connection_id"], dead["id"]);
+    assert_eq!(failures[0]["passed_on"], true);
+
+    // No list has been read, so the model list asks the first connection, which fails with nothing after it.
+    let response = models_call(&router, &key).await;
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    let failures = failures_written(&st.pool, 2).await;
+    assert_eq!(failures[1]["connection_id"], dead["id"]);
+    assert_eq!(failures[1]["passed_on"], false);
+
+    sqlx::query("DROP TABLE connection_failures")
+        .execute(&st.pool)
+        .await
+        .unwrap();
+    let response = gateway_call(
+        &router,
+        &key,
+        json!({ "model": "m", "messages": [{ "role": "user", "content": "hi" }] }),
+    )
+    .await;
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "a lost failure is not the request's"
+    );
+}
+
+// A database written before the figures gains their table and its indexes on start.
+#[tokio::test]
+async fn the_failures_table_is_added_to_a_database_written_before_it() {
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
+        .unwrap();
+    for statement in db::SCHEMA
+        .iter()
+        .filter(|statement| !statement.contains("connection_failures"))
+    {
+        sqlx::query(*statement).execute(&pool).await.unwrap();
+    }
+    for statement in db::SCHEMA {
+        sqlx::query(*statement).execute(&pool).await.unwrap();
+    }
+    db::migrate(&pool).await.unwrap();
+    let names: Vec<String> = sqlx::query(
+        "SELECT name FROM sqlite_master WHERE tbl_name = 'connection_failures' ORDER BY name",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap()
+    .iter()
+    .map(|row| row.get("name"))
+    .collect();
+    assert_eq!(
+        names,
+        [
+            "connection_failures",
+            "idx_failures_connection",
+            "idx_failures_created"
+        ]
+    );
+}
+
+// A request whose client leaves while a later connection is still working on it still has the failures it met
+// written, from where they were dropped; and a failure of a connection removed while the request ran is left out
+// without losing the others.
+#[tokio::test]
+async fn failures_are_written_when_the_client_leaves_and_a_removed_connection_loses_no_others() {
+    let app = Router::new().route(
+        "/v1/chat/completions",
+        post(|| async {
+            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+            Json(json!({}))
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+    let st = test_state().await;
+    let router = build_router(st.clone());
+    let cookie = register(&router, "ada").await;
+    let mut dead = Vec::new();
+    for (name, priority) in [("dead-1", 0), ("dead-2", 1)] {
+        let (_, created) = post_json(
+            &router,
+            "/api/connections",
+            &cookie,
+            json!({ "name": name, "base_url": "http://127.0.0.1:1", "priority": priority }),
+        )
+        .await;
+        dead.push(created);
+    }
+    post_json(
+        &router,
+        "/api/connections",
+        &cookie,
+        json!({ "name": "slow", "base_url": format!("http://{addr}"), "priority": 2 }),
+    )
+    .await;
+    let (_, created) = post_json(&router, "/api/keys", &cookie, json!({ "name": "k" })).await;
+    let key = created["key"].as_str().unwrap().to_string();
+
+    let mut request = Box::pin(gateway_call(
+        &router,
+        &key,
+        json!({ "model": "m", "messages": [{ "role": "user", "content": "hi" }] }),
+    ));
+    // The client stays until both dead connections have failed and the slow one has the request, then the first
+    // is removed and the client leaves.
+    let _ = tokio::time::timeout(std::time::Duration::from_millis(500), &mut request).await;
+    let removed = call(
+        &router,
+        Request::delete(format!("/api/connections/{}", dead[0]["id"]))
+            .header("cookie", &cookie)
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(removed.status(), StatusCode::OK);
+    drop(request);
+
+    let failures = failures_written(&st.pool, 1).await;
+    assert_eq!(failures.len(), 1, "{failures:?}");
+    assert_eq!(failures[0]["connection_id"], dead[1]["id"]);
+    assert_eq!(failures[0]["passed_on"], true);
 }

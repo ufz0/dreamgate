@@ -105,8 +105,14 @@ fn unreadable(err: sqlx::Error) -> Response {
 // What a client is told about a failed upstream is its connection's name and the first line of the
 // error, without the address. The log is where an admin looks for why, so it gets the whole chain of
 // causes — refused, a name that did not resolve, a certificate, a timeout — which the first line
-// leaves out.
-fn upstream_failed(st: &State, conn: &Connection, err: &(dyn std::error::Error + 'static)) {
+// leaves out. The failure is also kept with the request's others, for the connection's figures.
+fn upstream_failed(
+    st: &State,
+    conn: &Connection,
+    err: &(dyn std::error::Error + Send + Sync + 'static),
+    failures: &mut registry::Failures,
+    kind: &'static str,
+) {
     st.metrics.upstream_failure(&conn.name);
     let mut causes = err.to_string();
     let mut source = err.source();
@@ -116,6 +122,7 @@ fn upstream_failed(st: &State, conn: &Connection, err: &(dyn std::error::Error +
         source = cause.source();
     }
     tracing::warn!(connection = %conn.name, "upstream failed: {causes}");
+    failures.push(conn.id, kind);
 }
 
 // A disabled account cannot use a key at all. Every gateway endpoint reads the account the same
@@ -587,6 +594,7 @@ async fn record(
     st: &State,
     row: UsageRow,
     mut reservation: Reservation,
+    mut failures: registry::Failures,
     slots: impl Send + 'static,
 ) {
     let st = st.clone();
@@ -596,6 +604,7 @@ async fn record(
             st.metrics.usage_write_failure();
             tracing::error!("usage record failed: {err}");
         }
+        failures.write().await;
         drop(reservation);
         drop(slots);
     });
@@ -612,6 +621,7 @@ struct StreamContext {
     present: Active,
     admission: Admission,
     reservation: Reservation,
+    failures: registry::Failures,
 }
 
 fn stream_body(
@@ -677,6 +687,7 @@ fn stream_body(
                 Ok(None) => break,
                 Err(_) => {
                     ctx.st.metrics.stream_stall();
+                    ctx.failures.push(ctx.conn.id, "stalled");
                     tracing::warn!(
                         "upstream went quiet for {stall:?} and the stream was closed: {}",
                         ctx.model
@@ -723,7 +734,7 @@ fn stream_body(
                 }
                 Err(err) => {
                     let err = err.without_url();
-                    upstream_failed(&ctx.st, &ctx.conn, &err);
+                    upstream_failed(&ctx.st, &ctx.conn, &err, &mut ctx.failures, "broken");
                     let _ = ended.set(err.to_string());
                     break;
                 }
@@ -761,7 +772,13 @@ fn stream_body(
         // row's event, so a page goes from one to the other without a moment showing neither. The row is
         // counted for `/metrics` here as well, because it does not go through `record`.
         ctx.st.metrics.recorded(&row);
-        let event = match usage::write(&ctx.st, &row, |id| ctx.reservation.settle(id)).await {
+        let mut row_id = None;
+        let written = usage::write(&ctx.st, &row, |id| {
+            row_id = Some(id);
+            ctx.reservation.settle(id);
+        })
+        .await;
+        let event = match written {
             Ok(event) => Some(event),
             Err(err) => {
                 ctx.st.metrics.usage_write_failure();
@@ -769,7 +786,17 @@ fn stream_body(
                 None
             }
         };
+        // A stream that broke off or went quiet is named by its row, so its figures count it as a failure. The
+        // stream is settled first, so its row's event and the client's end of the stream do not wait for this
+        // write; the slots, which a stop waits for, are still held until it is done.
+        if let Some(id) = row_id {
+            ctx.failures.cut_short(id);
+        }
         inflight.settle(event);
+        // The sender goes with the stream: the client reads the end of it once the sender is gone, and the task
+        // would otherwise keep it until the write below is done.
+        drop(tx);
+        ctx.failures.write().await;
         // Released here rather than when the handler returned, so a stream is still counted
         // while it is running. The connection slot is given back at the same point, because the request
         // is still in flight for as long as the stream is being read.
@@ -945,6 +972,9 @@ async fn forward(st: State, headers: HeaderMap, body: Value, endpoint: Endpoint)
     // upstream that was never asked.
     let mut full: Vec<String> = Vec::new();
     let mut attempted = false;
+    // The failures of connections this request was sent to, marked passed on when it is sent to another one,
+    // which is what makes them failovers.
+    let mut failures = registry::Failures::new(&st);
     // The connection a request was waiting on when the gateway ended it because it was stopping, and the model
     // it was sent there with.
     let mut cut: Option<(i64, String)> = None;
@@ -967,6 +997,7 @@ async fn forward(st: State, headers: HeaderMap, body: Value, endpoint: Endpoint)
         // The upstream's answer says which model it used, but that is not read here.
         let model = model.unwrap_or_else(|| String::from("unknown"));
         attempted = true;
+        failures.passed_on();
         // From here the upstream is asked, so the request keeps its place in the minute even if its client
         // leaves before a row is written.
         reservation.sent();
@@ -1015,7 +1046,7 @@ async fn forward(st: State, headers: HeaderMap, body: Value, endpoint: Endpoint)
         let upstream = match sent {
             Ok(upstream) => upstream,
             Err(err) => {
-                upstream_failed(&st, conn, &*err);
+                upstream_failed(&st, conn, &*err, &mut failures, "unreachable");
                 last_error = format!("{}: {err}", conn.name);
                 continue;
             }
@@ -1048,6 +1079,7 @@ async fn forward(st: State, headers: HeaderMap, body: Value, endpoint: Endpoint)
                     connection: slot,
                 },
                 reservation,
+                failures,
             };
             *out.body_mut() = Body::from_stream(stream_body(ctx, upstream, started, prompt_tokens));
             return out;
@@ -1065,7 +1097,7 @@ async fn forward(st: State, headers: HeaderMap, body: Value, endpoint: Endpoint)
             Ok(bytes) => bytes,
             Err(err) => {
                 let err = err.without_url();
-                upstream_failed(&st, conn, &err);
+                upstream_failed(&st, conn, &err, &mut failures, "broken");
                 last_error = format!("{}: {err}", conn.name);
                 continue;
             }
@@ -1110,6 +1142,7 @@ async fn forward(st: State, headers: HeaderMap, body: Value, endpoint: Endpoint)
                 stream: None,
             },
             reservation,
+            failures,
             (global, slot),
         )
         .await;
@@ -1173,6 +1206,7 @@ async fn forward(st: State, headers: HeaderMap, body: Value, endpoint: Endpoint)
             stream: None,
         },
         reservation,
+        failures,
         global,
     )
     .await;
@@ -1278,7 +1312,10 @@ pub async fn list_models(AxumState(st): AxumState<State>, headers: HeaderMap) ->
                 Ok(bytes) => bytes,
                 Err(err) => {
                     let err = err.without_url();
-                    upstream_failed(&st, &conn, &err);
+                    // Left to be written as it drops, on a task of its own, so a client that leaves cannot cut
+                    // the write short.
+                    let mut failures = registry::Failures::new(&st);
+                    upstream_failed(&st, &conn, &err, &mut failures, "broken");
                     return error(
                         StatusCode::BAD_GATEWAY,
                         "upstream_unavailable",
@@ -1298,7 +1335,8 @@ pub async fn list_models(AxumState(st): AxumState<State>, headers: HeaderMap) ->
         // As on the completion path, the connection is named and its address is not.
         Err(err) => {
             let err = err.without_url();
-            upstream_failed(&st, &conn, &err);
+            let mut failures = registry::Failures::new(&st);
+            upstream_failed(&st, &conn, &err, &mut failures, "unreachable");
             error(
                 StatusCode::BAD_GATEWAY,
                 "upstream_unavailable",
