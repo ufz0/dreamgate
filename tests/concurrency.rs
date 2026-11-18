@@ -1509,6 +1509,67 @@ async fn a_disabled_account_is_answered_as_disabled_before_its_keys_limit() {
     assert_eq!(refused[0].1["error"]["type"], "account_disabled");
 }
 
+// A request whose row lands while another request's check is reading the rows is in that reading or it is not,
+// and the check knows which by the highest row id the reading saw, so it is never counted twice. Thirty
+// requests a millisecond apart on a key limited to thirty a minute are all within the limit, and a pool of one
+// connection, which widens the time a reading takes, is where counting by time refused some of them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn requests_within_the_per_minute_limit_are_not_refused_while_others_are_recorded() {
+    for _ in 0..20 {
+        let mock = Mock::new(3, 0);
+        let st = test_state(test_limits(64, 64), 1).await;
+        let base_url = mock_upstream(&mock).await;
+        seed(&st, "ada", &base_url, "dreamgate_test", None).await;
+        set_key_limits(&st, "dreamgate_test", Some(30), None).await;
+        let router = build_router(st.clone());
+
+        let mut sending = Vec::new();
+        for n in 0..30 {
+            let router = router.clone();
+            sending.push(tokio::spawn(async move {
+                gateway_call(&router, "dreamgate_test", n, false)
+                    .await
+                    .status()
+            }));
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        for sent in sending {
+            assert_eq!(sent.await.unwrap(), StatusCode::OK);
+        }
+    }
+}
+
+// A row that cannot be written is not in the rows, but the request reached a connection, so it keeps its place
+// in the minute as one that has no row.
+#[tokio::test]
+async fn a_request_whose_row_could_not_be_written_keeps_its_place_in_the_minute() {
+    let mock = Mock::new(0, 0);
+    let st = test_state(test_limits(64, 64), 4).await;
+    let base_url = mock_upstream(&mock).await;
+    seed(&st, "ada", &base_url, "dreamgate_test", None).await;
+    set_key_limits(&st, "dreamgate_test", Some(1), None).await;
+    sqlx::query(
+        "CREATE TRIGGER no_rows BEFORE INSERT ON usage BEGIN SELECT RAISE(ABORT, 'full'); END",
+    )
+    .execute(&st.pool)
+    .await
+    .unwrap();
+    let router = build_router(st.clone());
+
+    assert_eq!(
+        gateway_call(&router, "dreamgate_test", 1, false)
+            .await
+            .status(),
+        StatusCode::OK
+    );
+    let next = answers(vec![
+        gateway_call(&router, "dreamgate_test", 2, false).await,
+    ])
+    .await;
+    assert_eq!(next[0].0, StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(next[0].1["error"]["type"], "rate_limit");
+}
+
 // Not part of the normal run: it measures, so it is only read when asked for. Run with
 // `cargo test --release -- --ignored --nocapture`. The runtime is the multi-thread one, because a
 // single-threaded runtime would measure one worker's throughput rather than the gateway's. The limits are

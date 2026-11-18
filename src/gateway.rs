@@ -14,7 +14,7 @@ use crate::api::{error, logged};
 use crate::limits::Admission;
 use crate::presence::{self, Active};
 use crate::registry::{self, Connection};
-use crate::reservations::{Ask, Refusal, Reservation};
+use crate::reservations::{Ask, Reading, Refusal, Reservation};
 use crate::shutdown::Phase;
 use crate::state::State;
 use crate::tokens;
@@ -205,62 +205,78 @@ async fn enforce_limits(
             }
         })
     };
+    // Each limit is read together with the highest row id at that moment, in one statement and so in one
+    // snapshot, which is how the holds know which requests that reading already counted.
     let read_at = Instant::now();
+    let reading = |limit: i64, row: sqlx::sqlite::SqliteRow| Reading {
+        limit,
+        used: row.get::<i64, _>("used"),
+        seen: row.get::<i64, _>("seen"),
+    };
     let rpm = match key.rpm_limit {
         Some(limit) => match sqlx::query(
-            "SELECT COUNT(*) AS n FROM usage WHERE api_key_id = ? \
+            "SELECT COUNT(*) AS used, (SELECT COALESCE(MAX(id), 0) FROM usage) AS seen \
+             FROM usage WHERE api_key_id = ? \
              AND strftime('%Y-%m-%d %H:%M:%S', created_at) >= datetime('now', '-1 minute')",
         )
         .bind(key.id)
         .fetch_one(&st.pool)
         .await
         {
-            Ok(row) => Some((limit, row.get::<i64, _>("n"))),
+            Ok(row) => Some(reading(limit, row)),
             Err(err) => return Err(Box::new(unreadable(err))),
         },
         None => None,
     };
-    if let Some((limit, recorded)) = rpm
-        && recorded >= limit
+    if let Some(rpm) = rpm
+        && rpm.used >= rpm.limit
     {
-        return Err(refuse(Refusal::RateLimit { limit }));
+        return Err(refuse(Refusal::RateLimit { limit: rpm.limit }));
     }
     let key_cap = match key.token_cap {
         Some(cap) => match sqlx::query(
-            "SELECT COALESCE(SUM(total_tokens), 0) AS used FROM usage WHERE api_key_id = ?",
+            "SELECT COALESCE(SUM(total_tokens), 0) AS used, \
+             (SELECT COALESCE(MAX(id), 0) FROM usage) AS seen FROM usage WHERE api_key_id = ?",
         )
         .bind(key.id)
         .fetch_one(&st.pool)
         .await
         {
-            Ok(row) => Some((cap, row.get::<i64, _>("used"))),
+            Ok(row) => Some(reading(cap, row)),
             Err(err) => return Err(Box::new(unreadable(err))),
         },
         None => None,
     };
-    if let Some((cap, used)) = key_cap
-        && used >= cap
+    if let Some(cap) = key_cap
+        && cap.used >= cap.limit
     {
-        return Err(refuse(Refusal::KeyCap { cap, in_flight: 0 }));
+        return Err(refuse(Refusal::KeyCap {
+            cap: cap.limit,
+            in_flight: 0,
+        }));
     }
     let day_cap = match account.get::<Option<i64>, _>("daily_token_cap") {
         Some(cap) => match sqlx::query(
-            "SELECT COALESCE(SUM(total_tokens), 0) AS used FROM usage \
+            "SELECT COALESCE(SUM(total_tokens), 0) AS used, \
+             (SELECT COALESCE(MAX(id), 0) FROM usage) AS seen FROM usage \
              WHERE user_id = ? AND strftime('%Y-%m-%d', created_at) = date('now')",
         )
         .bind(key.user_id)
         .fetch_one(&st.pool)
         .await
         {
-            Ok(row) => Some((cap, row.get::<i64, _>("used"))),
+            Ok(row) => Some(reading(cap, row)),
             Err(err) => return Err(Box::new(unreadable(err))),
         },
         None => None,
     };
-    if let Some((cap, used)) = day_cap
-        && used >= cap
+    if let Some(cap) = day_cap
+        && cap.used >= cap.limit
     {
-        return Err(refuse(Refusal::DayCap { cap, in_flight: 0 }));
+        return Err(refuse(Refusal::DayCap {
+            cap: cap.limit,
+            in_flight: 0,
+        }));
     }
     let ask = Ask {
         key_id: key.id,
@@ -463,15 +479,28 @@ fn drain_buffer(buffer: &mut Vec<u8>, generated: &mut String, report: &mut Repor
     }
 }
 
-// A row that could not be written settles the request's hold all the same: the rows are what the limits
-// count, and a lost row is counted as one (`/metrics`) rather than held against a limit for ever.
-async fn record(st: &State, row: &UsageRow, reservation: &mut Reservation) {
-    st.metrics.recorded(row);
-    if let Err(err) = usage::record(st, row, || reservation.settle()).await {
-        st.metrics.usage_write_failure();
-        tracing::error!("usage record failed: {err}");
-    }
-    reservation.settle();
+// The row is written on a task of its own, which holds the request's hold and its slots until the row is in. A
+// client that leaves drops the handler and whatever the handler was waiting on: dropped in the middle of the
+// write, the row could land without its hold learning of it, which would count the request twice for a minute,
+// and the slots would come back before the row, which is what a stop waits for. A row that could not be written
+// leaves the hold unsettled, so a request that reached a connection keeps its place in the minute.
+async fn record(
+    st: &State,
+    row: UsageRow,
+    mut reservation: Reservation,
+    slots: impl Send + 'static,
+) {
+    let st = st.clone();
+    let write = tokio::spawn(async move {
+        st.metrics.recorded(&row);
+        if let Err(err) = usage::record(&st, &row, |id| reservation.settle(id)).await {
+            st.metrics.usage_write_failure();
+            tracing::error!("usage record failed: {err}");
+        }
+        drop(reservation);
+        drop(slots);
+    });
+    let _ = write.await;
 }
 
 // What the stream task still needs after the handler has returned, passed as one value rather
@@ -633,7 +662,7 @@ fn stream_body(
         // row's event, so a page goes from one to the other without a moment showing neither. The row is
         // counted for `/metrics` here as well, because it does not go through `record`.
         ctx.st.metrics.recorded(&row);
-        let event = match usage::write(&ctx.st, &row, || ctx.reservation.settle()).await {
+        let event = match usage::write(&ctx.st, &row, |id| ctx.reservation.settle(id)).await {
             Ok(event) => Some(event),
             Err(err) => {
                 ctx.st.metrics.usage_write_failure();
@@ -641,7 +670,6 @@ fn stream_body(
                 None
             }
         };
-        ctx.reservation.settle();
         inflight.settle(event);
         // Released here rather than when the handler returned, so a stream is still counted
         // while it is running. The connection slot is given back at the same point, because the request
@@ -896,7 +924,7 @@ pub async fn chat_completions(
         };
         record(
             &st,
-            &UsageRow {
+            UsageRow {
                 api_key_id: key.id,
                 user_id: key.user_id,
                 connection_id: Some(conn.id),
@@ -914,7 +942,8 @@ pub async fn chat_completions(
                 created_at: crate::clock::now(),
                 stream: None,
             },
-            &mut reservation,
+            reservation,
+            (global, slot),
         )
         .await;
 
@@ -947,7 +976,7 @@ pub async fn chat_completions(
 
     record(
         &st,
-        &UsageRow {
+        UsageRow {
             api_key_id: key.id,
             user_id: key.user_id,
             // The connection that was working on the request when the gateway ended it, with the model it was
@@ -971,7 +1000,8 @@ pub async fn chat_completions(
             created_at: crate::clock::now(),
             stream: None,
         },
-        &mut reservation,
+        reservation,
+        global,
     )
     .await;
     // Ended by the gateway because it was stopping, not by a connection that failed.

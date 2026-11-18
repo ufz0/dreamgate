@@ -163,22 +163,25 @@ was taken by an older version.
 
    The limits hold when requests arrive together. The rows are written when a request ends, so on their own
    they cannot see a request that is still running; a request is therefore checked and held in one step, in
-   the process, against what the rows said plus what they could not show yet. The per-minute limit counts the
-   rows of the last minute, as it always did, plus the requests still running, so twenty requests at once on
-   a key limited to two a minute are two admitted and eighteen answered 429 `rate_limit`, and a request
-   counts from the moment it is admitted until a minute after its row. A restart empties what is held in the
-   process, and the rows still count. A cap counts what the rows have recorded plus the input of the requests
-   still running, as the gateway estimated it, because their output is not known until it has been generated;
-   a refusal that counted such an estimate says how much of what it counted it was ("…, counting an estimated
-   N input tokens of requests still in flight"). A limit the rows alone have reached is refused at once, with
-   the reads after it skipped. A request turned away before it reaches a connection, at a full connection or
-   a full gateway, is never recorded, so it gives back its hold; a single answer whose client leaves after it
-   reached a connection is not recorded either, but the upstream was asked, so it keeps its place in the
-   minute, not in the caps. A limit set while requests are running counts them once their rows are written.
-   If the rows took longer than ten seconds to read, which only a database under heavy load does, the request
-   is answered 503 `unavailable` rather than checked against holds that may have been let go of in the
-   meantime. A disabled account is checked before any of these, so its keys are answered 403 even when they
-   are also at a limit.
+   the process, against what the rows said plus what they could not show yet. Each limit is read together
+   with the highest row id at that moment, so the gateway knows exactly which of the requests it holds that
+   reading already counted, and none is counted twice. The per-minute limit counts the rows of the last
+   minute, as it always did, plus the requests still running, so twenty requests at once on a key limited to
+   two a minute are two admitted and eighteen answered 429 `rate_limit`, and a request counts from the moment
+   it is admitted until a minute after its row. A restart empties what is held in the process, and the rows
+   still count. A cap counts what the rows have recorded plus the input of the requests still running, as the
+   gateway estimated it, because their output is not known until it has been generated; a refusal that
+   counted such an estimate says how much of what it counted it was ("…, counting an estimated N input tokens
+   of requests still in flight"). A limit the rows alone have reached is refused at once, with the reads
+   after it skipped. A request turned away before it reaches a connection, at a full connection or a full
+   gateway, is never recorded, so it gives back its hold. A request that reached a connection and has no row
+   — a single answer whose client left while it waited, or one whose row could not be written — keeps its
+   place in the minute, not in the caps, which are sums of the rows; a row is written on a task of its own,
+   so a client that leaves while it is written does not cut it short. A limit set while requests are running
+   counts them once their rows are written. If the rows took longer than ten seconds to read, which only a
+   database under heavy load does, the request is answered 503 `unavailable` rather than checked against
+   holds that may have been let go of in the meantime. A disabled account is checked before any of these, so
+   its keys are answered 403 even when they are also at a limit.
 3. Point a client at the gateway, for example OpenWebUI:
    - API base: `http://127.0.0.1:8787/v1`
    - API key: the DreamGate key
@@ -684,8 +687,10 @@ to two a minute admit two and refuse eighteen, and after a restart a row from th
 one; a key cap and an account's daily limit of one token admit one of ten sent together because the first one's
 input is held while it runs; a request turned away at a full connection gives back its place in the minute, so
 the key can still send the one it has left, while one whose client left after it reached a connection keeps
-it; and a disabled account at a limit is answered as disabled. Unit tests beside `src/reservations.rs` check the
-holds directly: a recorded request counted only by checks that read the rows before it, rows read too long ago
+it, as does one whose row could not be written; thirty requests a millisecond apart on a key limited to thirty
+a minute are all admitted while the earlier ones are being recorded; and a disabled account at a limit is
+answered as disabled. Unit tests beside `src/reservations.rs` check the
+holds directly: a recorded request counted only by readings that did not reach its row, rows read too long ago
 not decided on, and a key with no limit holding nothing.
 The time bounds are tested the same way: a stream that runs past the request deadline without ever going quiet
 has to arrive whole, including its usage chunk, so the row is not an estimate; a single answer is still given its
