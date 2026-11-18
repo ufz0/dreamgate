@@ -300,9 +300,10 @@ async fn add_connection_limit(pool: &SqlitePool) -> Result<(), sqlx::Error> {
     Ok(())
 }
 
-// The models a connection listed at its last check, as a JSON array of their ids, so a request can be sent to
-// a connection that serves its model. Null means no list has been read, which says nothing about what the
-// connection serves, so a row written before the change keeps its meaning: not known.
+// The models a connection listed at its last check, as a JSON array of objects with each one's id and, when the
+// upstream gave it, the time it was made, so a request can be sent to a connection that serves its model. Null
+// means no list has been read, which says nothing about what the connection serves, so a row written before the
+// change keeps its meaning: not known.
 async fn add_connection_models(pool: &SqlitePool) -> Result<(), sqlx::Error> {
     if has_column(pool, "connections", "models").await? {
         return Ok(());

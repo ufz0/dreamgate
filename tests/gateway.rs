@@ -5580,16 +5580,33 @@ async fn routing_by_model_keeps_the_keys_connection_and_moves_nothing_on_no_know
     );
     mark_health(&st.pool, &connections[1], "ok").await;
 
-    // A connection's default is the model it is sent, so it is the one matched: the second is sent its own
-    // default, which it lists, and the first the model asked for, which it does not.
-    sqlx::query("UPDATE connections SET default_model = 'qwen2.5' WHERE id = ?")
+    // A connection's default is the model it is sent, so it is the one matched: the first is sent the file it
+    // lists, so it keeps its place although it does not list the model the client asked for.
+    sqlx::query("UPDATE connections SET default_model = '/models/qwen.gguf' WHERE id = ?")
+        .bind(ids[0])
+        .execute(&st.pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        routed_to(&router, &st.pool, &plain, "qwen2.5").await,
+        ids[0]
+    );
+
+    // And a default only keeps its own connection in place: the second listing the default it is sent says
+    // nothing about a model no list names, so the first is not moved behind it.
+    sqlx::query("UPDATE connections SET default_model = NULL WHERE id = ?")
+        .bind(ids[0])
+        .execute(&st.pool)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE connections SET default_model = 'llama3' WHERE id = ?")
         .bind(ids[1])
         .execute(&st.pool)
         .await
         .unwrap();
     assert_eq!(
-        routed_to(&router, &st.pool, &plain, "anything").await,
-        ids[1]
+        routed_to(&router, &st.pool, &plain, "nothing-lists-this").await,
+        ids[0]
     );
 }
 
@@ -5637,11 +5654,16 @@ async fn an_embedding_is_routed_by_the_model_its_client_names() {
     );
 }
 
-// A list whose entries all have ids is kept, an empty one too, because that is what the upstream said; one with
-// an entry it cannot read an id from is no list at all, rather than the part it could read.
+// A list whose entries all have ids is kept with the dates it gave, which the model list passes on, and an empty
+// one too, because that is what the upstream said; one with an entry it cannot read an id from is no list at all,
+// rather than the part it could read.
 #[tokio::test]
 async fn a_list_with_an_entry_without_an_id_is_not_read_in_part() {
     let app = Router::new()
+        .route(
+            "/c/v1/models",
+            get(|| async { Json(json!({ "data": [{ "id": "dated", "created": 1700000000 }] })) }),
+        )
         .route(
             "/a/v1/models",
             get(|| async { Json(json!({ "data": [{ "id": "ok", "created": 7 }, { "id": 5 }] })) }),
@@ -5657,7 +5679,7 @@ async fn a_list_with_an_entry_without_an_id_is_not_read_in_part() {
     let st = test_state().await;
     let router = build_router(st.clone());
     let cookie = register(&router, "ada").await;
-    for name in ["a", "b"] {
+    for name in ["a", "b", "c"] {
         let (_, created) = post_json(
             &router,
             "/api/connections",
@@ -5680,6 +5702,55 @@ async fn a_list_with_an_entry_without_an_id_is_not_read_in_part() {
     assert_eq!(
         connection_named(&router, &cookie, "b").await["models"],
         json!([])
+    );
+    let (_, created) = post_json(&router, "/api/keys", &cookie, json!({ "name": "k" })).await;
+    let body = json_body(models_call(&router, created["key"].as_str().unwrap()).await).await;
+    assert_eq!(
+        body["data"],
+        json!([{ "id": "dated", "object": "model", "owned_by": "c", "created": 1700000000 }])
+    );
+}
+
+// A check whose answer breaks off before its body ends leaves the list the connection gave last, because what it
+// serves has not changed for a body that could not be read.
+#[tokio::test]
+async fn a_list_that_breaks_off_keeps_the_last_one() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        while let Ok((mut socket, _)) = listener.accept().await {
+            let mut buf = [0u8; 4096];
+            let _ = socket.read(&mut buf).await;
+            let _ = socket
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 100\r\n\r\n{\"data\":[",
+                )
+                .await;
+        }
+    });
+
+    let st = test_state().await;
+    let router = build_router(st.clone());
+    let cookie = register(&router, "ada").await;
+    let (_, created) = post_json(
+        &router,
+        "/api/connections",
+        &cookie,
+        json!({ "name": "broken", "base_url": format!("http://{addr}") }),
+    )
+    .await;
+    set_models(&st.pool, &created, Some(json!(["kept"]))).await;
+    post_json(
+        &router,
+        &format!("/api/connections/{}/check", created["id"]),
+        &cookie,
+        json!({}),
+    )
+    .await;
+    assert_eq!(
+        connection_named(&router, &cookie, "broken").await["models"],
+        json!(["kept"])
     );
 }
 

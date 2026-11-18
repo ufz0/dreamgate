@@ -252,20 +252,21 @@ twice for one request. A check is only every 30 seconds, so a connection marked 
 a request still reaches one when every connection is marked down.
 
 Each check also keeps the model list the connection answered with, and requests are routed by it. An upstream's
-answer is passed on as it is, a 404 for a model it does not have included, so when some connection's list names
-the model the request would send it — for a generation the key's own model, the connection's default, or the one
-the client asked for, in that order, and for an embedding the one the client asked for first — a connection
-whose list does not name the model it would be sent is tried after the others. It is moved back rather than left
+answer is passed on as it is, a 404 for a model it does not have included, so a connection whose last list does
+not name the model it would be sent — for a generation the key's own model, the connection's default, or the one
+the client asked for, in that order, and for an embedding the one the client asked for first — is tried after
+the others when another connection that would be sent the same model lists it. It is moved back rather than left
 out, because a list is only read every 30 seconds and some servers answer to any name, and nothing is moved when
-no list names the model, because then no connection is known to serve it better and moving one back would only
-hand the request to another's 404. The key's own connection is never moved: binding a key is how a client is
-sent to the connection that serves it. A connection whose list has not been read keeps its place, because
-nothing is known against it, and otherwise the order is the one above, with one difference: a connection marked
-down whose list names the model goes ahead of one that is up and does not, because it is the only one that may
-serve it. A model Ollama lists as `name:latest` is found by `name` as well, and the other way round. A list is
-read whole or not at all: one in another shape, or with an entry that has no id, is kept as no list rather than
-as the part that could be read. A connection that fails its check, or whose list could not be read to its end,
-keeps the list it gave last.
+no connection that would be sent the model lists it, because then none is known to serve it better and moving
+one back would only hand the request to another's 404. A connection whose default its list names keeps its own
+place by it, and moves no other connection for a model it is not sent. The key's own connection is never moved:
+binding a key is how a client is sent to the connection that serves it. A connection whose list has not been
+read keeps its place, because nothing is known against it, and otherwise the order is the one above, with one
+difference: a connection marked down whose list names the model goes ahead of one that is up and does not,
+because it is the only one that may serve it. A model Ollama lists as `name:latest` is found by `name` as well,
+and the other way round. A list is read whole or not at all: one in another shape, or with an entry that has no
+id, is kept as no list rather than as the part that could be read. A connection that fails its check, or whose
+list could not be read to its end, keeps the list it gave last.
 
 The model list, `GET /v1/models`, is those lists merged: each model once, in the order of the key's connections,
 and named (`owned_by`) after the first connection that lists it, with the time it was made (`created`) when that
@@ -503,7 +504,7 @@ URL hash (`#/overview`, `#/activity`, `#/keys`, `#/connections`, `#/connect`, `#
   and that rule is on the routes as well as on the page. The key a connection carries is returned to an admin
   alone, and so is its address; every signed-in account still sees the connection itself — its name, health,
   priority, default model and the ids its last list named — because the gate readout and the model list need
-  it; a key holder reads the same ids from `/v1/models`.
+  it; a key holder reads the ids of the connections that are turned on from `/v1/models` as well.
 - **Connect a client** — the base URL, a key picker, a copyable curl request.
 - **Sandbox** — chat with any model a connection serves, through the same gateway the clients
   use, so the request is recorded like any other. Pick a key and a model from the gateway's
@@ -681,8 +682,10 @@ list in another shape as none and keeping the last list of a connection that doe
 first to a connection whose list names its model while one never read keeps its place and a key's own model is
 the one matched, a key's own connection never moved, nothing moved when no list names the model, a connection
 marked down that lists it going ahead of one that is up and does not, a connection's default and an embedding's
-model being the ones matched, `:latest` matched both ways, a list with an entry without an id read as none and an
-empty one kept, the model list merging the lists in the order a key reaches them with the dates they gave and a
+model being the ones matched, a connection's default moving no other connection for a model no list names,
+`:latest` matched both ways, a list with an entry without an id read as none and an empty one kept, a list that
+breaks off leaving the last one, the model list merging the lists in the order a key reaches them with the dates
+a check read and a
 connection marked down included,
 the model recorded for a streamed request when nothing is pinned to a key or a connection,
 per-key limits and their validation, the per-key, per-account and per-model figures carrying the input and the

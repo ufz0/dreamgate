@@ -59,7 +59,7 @@ impl Connection {
 
 // Ollama lists a model under its tag and answers to its name without one, which it reads as `:latest`, so the
 // two are the same model here.
-fn same_model(listed: &str, asked: &str) -> bool {
+pub fn same_model(listed: &str, asked: &str) -> bool {
     listed == asked
         || listed.strip_suffix(":latest") == Some(asked)
         || asked.strip_suffix(":latest") == Some(listed)

@@ -884,23 +884,36 @@ async fn forward(st: State, headers: HeaderMap, body: Value, endpoint: Endpoint)
     // An upstream's answer is passed on as it is, a 404 for a model it does not have included, so the order is
     // what decides whether a request for a model reaches one that serves it. A connection whose last list does
     // not name the model it would be sent is tried after the others rather than left out, because a list is
-    // only read every 30 seconds and some servers answer to any name. That is only done when some connection's
-    // list does name it: with nothing known for the model, moving one back would only hand the request to a
-    // connection known no better, whose 404 would then end it. The key's own connection is never moved, because
-    // binding a key is how a client is sent to the connection that serves it. The sort is stable, so the order
-    // within each part is the one `registry::candidates` gave, a connection marked down after the others; one
-    // marked down whose list names the model goes ahead of one that is up and does not.
-    let sent_to =
-        |conn: &Connection| resolve_model(endpoint, key.model.as_deref(), conn, requested);
-    if candidates
+    // only read every 30 seconds and some servers answer to any name. That is only done when another connection
+    // would be sent the same model and its list names it: with nothing known for the model, moving one back would
+    // only hand the request to a connection known no better, whose 404 would then end it, and a connection whose
+    // own default it lists says nothing about a model it is not sent. The key's own connection is never moved,
+    // because binding a key is how a client is sent to the connection that serves it. The sort is stable, so the
+    // order within each part is the one `registry::candidates` gave, a connection marked down after the others;
+    // one marked down whose list names the model goes ahead of one that is up and does not.
+    let sent: Vec<Option<String>> = candidates
         .iter()
-        .any(|conn| sent_to(conn).is_some_and(|model| conn.lists(&model)))
-    {
-        candidates.sort_by_cached_key(|conn| {
+        .map(|conn| resolve_model(endpoint, key.model.as_deref(), conn, requested))
+        .collect();
+    let served = |model: &str| {
+        candidates.iter().zip(&sent).any(|(conn, sent)| {
+            sent.as_deref()
+                .is_some_and(|sent| registry::same_model(sent, model))
+                && conn.lists(model)
+        })
+    };
+    let moved: std::collections::HashSet<i64> = candidates
+        .iter()
+        .zip(&sent)
+        .filter(|(conn, sent)| {
             Some(conn.id) != key.connection_id
-                && sent_to(conn).is_some_and(|model| conn.lists_without(&model))
-        });
-    }
+                && sent
+                    .as_deref()
+                    .is_some_and(|model| conn.lists_without(model) && served(model))
+        })
+        .map(|(conn, _)| conn.id)
+        .collect();
+    candidates.sort_by_key(|conn| moved.contains(&conn.id));
     // The request is admitted as a whole, before anything is asked of a connection, and the slots are held for
     // as long as it runs. Nothing is queued here: a connection that is full is skipped, so one slow
     // connection cannot hold unrelated requests behind it. Admitting once, at the start, is also what keeps a
