@@ -1,5 +1,5 @@
 use axum::extract::{Path, State as AxumState};
-use axum::http::StatusCode;
+use axum::http::{HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Json, Response};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -31,6 +31,65 @@ pub struct Connection {
     // The models the connection listed at its last check that could read its list. None means no list has been
     // read, which is not the same as a list with nothing in it.
     pub models: Option<Vec<Listed>>,
+    pub kind: Kind,
+}
+
+// What kind of upstream a connection is. Every kind speaks the OpenAI API; a kind other than the plain one also
+// needs something more on each request, which `authorized` adds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Kind {
+    OpenAi,
+    OpencodeGo,
+}
+
+impl Kind {
+    pub fn parse(text: &str) -> Option<Kind> {
+        match text {
+            "openai" => Some(Kind::OpenAi),
+            "opencode-go" => Some(Kind::OpencodeGo),
+            _ => None,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Kind::OpenAi => "openai",
+            Kind::OpencodeGo => "opencode-go",
+        }
+    }
+}
+
+// OpenCode Go asks every client to name itself with a user agent of its own rather than an HTTP library's, and to
+// send a session that stays the same for each conversation, which it routes and caches prompts by and without
+// which it refuses the request. It also asks a client that forwards requests to pass on the session it was sent,
+// so a session a client sends is the one that goes on; a client that sends none, and the gateway's own checks and
+// model lists, are sent the gateway's.
+pub const OPENCODE_USER_AGENT: &str = "DreamGate/1.0";
+pub const OPENCODE_SESSION_HEADER: &str = "x-opencode-session";
+pub const OPENCODE_SESSION: &str = "ses_dreamgate_abc123";
+
+// A request to a connection, with its key and whatever else its kind asks for. Every request the gateway sends a
+// connection goes through here, so a kind's headers cannot be on one of them and missing from another.
+pub fn authorized(
+    request: reqwest::RequestBuilder,
+    connection: &Connection,
+    session: Option<&HeaderValue>,
+) -> reqwest::RequestBuilder {
+    let request = request.header(
+        header::AUTHORIZATION,
+        format!("Bearer {}", connection.api_key.clone().unwrap_or_default()),
+    );
+    match connection.kind {
+        Kind::OpenAi => request,
+        Kind::OpencodeGo => request
+            .header(header::USER_AGENT, OPENCODE_USER_AGENT)
+            .header(
+                OPENCODE_SESSION_HEADER,
+                session
+                    .cloned()
+                    .unwrap_or(HeaderValue::from_static(OPENCODE_SESSION)),
+            ),
+    }
 }
 
 // A model as a connection listed it: its id, and the time it was made when the upstream gave one, which the
@@ -97,6 +156,9 @@ fn row_to_connection(row: &sqlx::sqlite::SqliteRow) -> Connection {
         models: row
             .get::<Option<String>, _>("models")
             .and_then(|text| serde_json::from_str(&text).ok()),
+        // Only the kinds this version knows are written, so another is one a newer version wrote; it is sent the
+        // plain OpenAI API, which every kind speaks, rather than refused.
+        kind: Kind::parse(&row.get::<String, _>("kind")).unwrap_or(Kind::OpenAi),
     }
 }
 
@@ -240,7 +302,7 @@ async fn prune_failures(st: &State) {
 pub async fn candidates(st: &State, preferred: Option<i64>) -> Vec<Connection> {
     let rows = sqlx::query(
         "SELECT id, name, base_url, api_key, default_model, enabled, priority, health, last_checked_at, \
-         max_concurrent, models FROM connections WHERE enabled = 1 ORDER BY priority ASC, id ASC",
+         max_concurrent, models, kind FROM connections WHERE enabled = 1 ORDER BY priority ASC, id ASC",
     )
     .fetch_all(&st.pool)
     .await
@@ -266,13 +328,7 @@ pub async fn candidates(st: &State, preferred: Option<i64>) -> Vec<Connection> {
 
 pub async fn check(st: &State, connection: &Connection) -> StatusCode {
     let url = endpoint(&connection.base_url, "models");
-    let result = st
-        .http
-        .get(&url)
-        .header(
-            "Authorization",
-            format!("Bearer {}", connection.api_key.clone().unwrap_or_default()),
-        )
+    let result = authorized(st.http.get(&url), connection, None)
         .timeout(Duration::from_secs(10))
         .send()
         .await;
@@ -332,12 +388,14 @@ pub struct CreateConnection {
     pub priority: Option<i64>,
     // What the connection can take at once. Left out means it never said, and the default limit applies.
     pub max_concurrent: Option<i64>,
+    // `openai` or `opencode-go`; left out, the plain OpenAI API.
+    pub kind: Option<String>,
 }
 
 pub async fn list(AxumState(st): AxumState<State>, caller: Caller) -> Response {
     let rows = sqlx::query(
         "SELECT id, name, base_url, api_key, default_model, enabled, priority, health, last_checked_at, \
-         max_concurrent, models FROM connections ORDER BY priority ASC, id ASC",
+         max_concurrent, models, kind FROM connections ORDER BY priority ASC, id ASC",
     )
     .fetch_all(&st.pool)
     .await
@@ -368,6 +426,7 @@ pub async fn list(AxumState(st): AxumState<State>, caller: Caller) -> Response {
                 "health": c.health,
                 "last_checked_at": c.last_checked_at,
                 "max_concurrent": c.max_concurrent,
+                "kind": c.kind.label(),
                 // The ids alone: the page shows how many and which, and the dates are for the model list.
                 "models": c.models.as_ref().map(|models| {
                     models.iter().map(|listed| listed.id.clone()).collect::<Vec<_>>()
@@ -415,9 +474,22 @@ pub async fn create(
             "max_concurrent must be positive",
         );
     }
+    let kind = match body.kind.as_deref().map(str::trim) {
+        None | Some("") => Kind::OpenAi,
+        Some(text) => match Kind::parse(text) {
+            Some(kind) => kind,
+            None => {
+                return error(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_request",
+                    "kind must be openai or opencode-go",
+                );
+            }
+        },
+    };
     let row = sqlx::query(
         "INSERT INTO connections (name, base_url, api_key, default_model, priority, max_concurrent, \
-         created_at) VALUES (?, ?, ?, ?, ?, ?, ?) RETURNING id",
+         kind, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?) RETURNING id",
     )
     .bind(&name)
     .bind(&base_url)
@@ -425,6 +497,7 @@ pub async fn create(
     .bind(&body.default_model)
     .bind(body.priority.unwrap_or(0))
     .bind(body.max_concurrent)
+    .bind(kind.label())
     .bind(crate::clock::now())
     .fetch_one(&st.pool)
     .await;
@@ -478,7 +551,7 @@ pub async fn health_check(
     }
     let row = sqlx::query(
         "SELECT id, name, base_url, api_key, default_model, enabled, priority, health, last_checked_at, \
-         max_concurrent, models FROM connections WHERE id = ?",
+         max_concurrent, models, kind FROM connections WHERE id = ?",
     )
     .bind(id)
     .fetch_optional(&st.pool)
@@ -518,7 +591,7 @@ async fn rounds(st: State) {
     loop {
         let rows = sqlx::query(
             "SELECT id, name, base_url, api_key, default_model, enabled, priority, health, last_checked_at, \
-             max_concurrent, models FROM connections WHERE enabled = 1",
+             max_concurrent, models, kind FROM connections WHERE enabled = 1",
         )
         .fetch_all(&st.pool)
         .await

@@ -27,11 +27,13 @@ empty for the rows written before it, the setup code columns (`setup_code_hash`,
 `setup_code_expires_at`) are added to accounts and left empty, an `expires_at` column is added to
 keys and left empty, so a key written before it does not expire, the `daily_token_cap` and
 `monthly_token_cap` columns are added to keys and left empty, so a key written before them has
-neither limit, and existing accounts keep their limits and are enabled by default. A connection row
-with no `max_concurrent` keeps its meaning: it never stated a capability, so the default applies to
-it, which is not the same as a capability of one. An account with no setup code keeps its meaning
-too where it has a password, which it signs in with as before; one made by an admin before setup
-codes that never got a password can no longer be claimed by whoever signs in first, and waits for an
+neither limit, a `kind` column is added to connections with `openai` as its value, so a
+connection made before it is sent what it was sent before, and existing accounts keep their
+limits and are enabled by default. A connection row with no `max_concurrent` keeps its meaning:
+it never stated a capability, so the default applies to it, which is not the same as a
+capability of one. An account with no setup code keeps its meaning too where it has a password,
+which it signs in with as before; one made by an admin before setup codes that never got a
+password can no longer be claimed by whoever signs in first, and waits for an
 admin to give it a code. A table that has to be rebuilt for this is rebuilt in one transaction, so a
 start that stops partway, on a full disk or in a crash,
 leaves that table as it was, and the next start migrates whatever is still in an older shape; each step
@@ -159,6 +161,17 @@ was taken by an older version.
    through `POST /api/connections`; the page has no field for it and does not show it, so a limit set here is
    only visible in the API response. Left out, the default is used; a stated value has to be positive,
    because a capability of zero would admit nothing, which is not what leaving it out means.
+
+   A connection has a type, `kind`, set when it is made: `openai`, the default, for any OpenAI-compatible
+   endpoint, or `opencode-go` for OpenCode Go, whose address is `https://opencode.ai/inference/go` and whose
+   upstream key is a Go API key. OpenCode Go asks every client to name itself with a user agent of its own
+   and to send a session that stays the same for each conversation, which it routes and caches prompts by,
+   and it refuses a request without one. Every request the gateway sends such a connection — a request, a
+   health check, the model list it asks for itself — therefore carries `User-Agent: DreamGate/1.0` and
+   `x-opencode-session`: the session the client sent, passed on as OpenCode Go asks a client that forwards
+   requests to do, or `ses_dreamgate_abc123` when the client sent none, as a check or the gateway's own
+   model list never does. A connection of the plain type is sent neither header, even when the client sent a
+   session. A type the gateway does not know is refused.
 2. Create a key. A DreamGate key is what clients use — the upstream key stays server-side.
    Optionally bind a key to one connection, pin a model, give it an expiry, or set a requests-per-minute limit,
    a token cap over its life, and token limits for a day and for a month.
@@ -596,6 +609,8 @@ URL hash (`#/overview`, `#/activity`, `#/keys`, `#/connections`, `#/connect`, `#
   every signed-in account still sees the connection itself — its name, health, priority, default model and the
   ids its last list named — because the gate readout and the model list need it; a key holder reads the ids of
   the connections that are turned on from `/v1/models` as well.
+  The table names a connection's type when it is OpenCode Go, and picking that type in the form fills in its
+  address when the field is empty.
 - **Connect a client** — the base URL, a key picker, a copyable curl request.
 - **Sandbox** — chat with any model a connection serves, through the same gateway the clients
   use, so the request is recorded like any other. Pick a key and a model from the gateway's
@@ -797,7 +812,10 @@ it, no output and nothing about streaming added, legacy completions forwarded si
 generated text estimated when nothing is reported, a single completion estimated from its prompt, its suffix and
 the text it generated, an embedding sent with the model the client names whatever the key's or the connection's
 model, an unknown path or method under `/v1`, and `/v1` itself, answered as JSON,
-that a client's reasoning level reaches the upstream unchanged, that a request naming no model
+an OpenCode Go connection sent the gateway's user agent and the client's session, or the gateway's own when the
+client sent none, on a request, a health check and the model list, a plain connection sent neither, a type the
+gateway does not know refused, a connection written before types reading as a plain one, that a client's
+reasoning level reaches the upstream unchanged, that a request naming no model
 reaches the upstream without one and is recorded as `unknown`, upstream failover,
 a connection marked down being tried after the ones that are not rather than skipped, including when every
 connection is marked down, and a connection that is full passing the request on to one marked down,

@@ -36,6 +36,7 @@ pub const SCHEMA: &[&str] = &[
         last_checked_at TEXT,
         max_concurrent INTEGER,
         models TEXT,
+        kind TEXT NOT NULL DEFAULT 'openai',
         created_at TEXT NOT NULL
     )",
     "CREATE TABLE IF NOT EXISTS api_keys (
@@ -294,6 +295,7 @@ pub async fn migrate(pool: &SqlitePool) -> Result<(), sqlx::Error> {
     add_key_expiry(pool).await?;
     add_setup_codes(pool).await?;
     add_key_windows(pool).await?;
+    add_connection_kind(pool).await?;
     relax_key_reference(pool).await?;
     for statement in INDEXES {
         sqlx::query(*statement).execute(pool).await?;
@@ -355,6 +357,18 @@ async fn add_key_expiry(pool: &SqlitePool) -> Result<(), sqlx::Error> {
         return Ok(());
     }
     sqlx::query("ALTER TABLE api_keys ADD COLUMN expires_at TEXT")
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+// What kind of upstream a connection is. Every connection made before there were kinds speaks the plain OpenAI API,
+// so the column is added with that as its value, and those connections are sent what they were sent before.
+async fn add_connection_kind(pool: &SqlitePool) -> Result<(), sqlx::Error> {
+    if has_column(pool, "connections", "kind").await? {
+        return Ok(());
+    }
+    sqlx::query("ALTER TABLE connections ADD COLUMN kind TEXT NOT NULL DEFAULT 'openai'")
         .execute(pool)
         .await?;
     Ok(())
