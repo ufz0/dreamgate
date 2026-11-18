@@ -32,6 +32,7 @@ pub struct KeyInfo {
     pub enabled: bool,
     pub rpm_limit: Option<i64>,
     pub token_cap: Option<i64>,
+    pub expires_at: Option<String>,
 }
 
 fn virtual_key(headers: &HeaderMap) -> Option<String> {
@@ -50,7 +51,7 @@ fn virtual_key(headers: &HeaderMap) -> Option<String> {
 
 async fn lookup_key(st: &State, raw: &str) -> Result<Option<KeyInfo>, sqlx::Error> {
     let row = sqlx::query(
-        "SELECT id, user_id, name, connection_id, model, enabled, rpm_limit, token_cap \
+        "SELECT id, user_id, name, connection_id, model, enabled, rpm_limit, token_cap, expires_at \
          FROM api_keys WHERE key = ?",
     )
     .bind(raw)
@@ -65,7 +66,30 @@ async fn lookup_key(st: &State, raw: &str) -> Result<Option<KeyInfo>, sqlx::Erro
         enabled: row.get::<i64, _>("enabled") != 0,
         rpm_limit: row.get::<Option<i64>, _>("rpm_limit"),
         token_cap: row.get::<Option<i64>, _>("token_cap"),
+        expires_at: row.get::<Option<String>, _>("expires_at"),
     }))
+}
+
+// A key that is turned off, or whose time has passed, is refused before anything else is read about it. The
+// expiry is written the way `clock` writes a moment, so the two compare as text.
+fn key_refused(key: &KeyInfo) -> Option<Response> {
+    if !key.enabled {
+        return Some(error(
+            StatusCode::FORBIDDEN,
+            "key_disabled",
+            "this key is disabled",
+        ));
+    }
+    if let Some(at) = &key.expires_at
+        && at.as_str() <= crate::clock::now().as_str()
+    {
+        return Some(error(
+            StatusCode::FORBIDDEN,
+            "key_expired",
+            format!("this key expired at {at}"),
+        ));
+    }
+    None
 }
 
 // A request that arrives while the process is stopping is turned away rather than started, because it
@@ -881,12 +905,8 @@ async fn forward(st: State, headers: HeaderMap, body: Value, endpoint: Endpoint)
         Ok(None) => return unknown_key(),
         Err(err) => return unreadable(err),
     };
-    if !key.enabled {
-        return error(
-            StatusCode::FORBIDDEN,
-            "key_disabled",
-            "this key is disabled",
-        );
+    if let Some(refused) = key_refused(&key) {
+        return refused;
     }
     // Counted from here, so a request that is refused by a limit still marks the account as
     // active; the guard is released when the request finishes, including for a stream.
@@ -1264,12 +1284,8 @@ pub async fn list_models(AxumState(st): AxumState<State>, headers: HeaderMap) ->
         Ok(None) => return unknown_key(),
         Err(err) => return unreadable(err),
     };
-    if !key.enabled {
-        return error(
-            StatusCode::FORBIDDEN,
-            "key_disabled",
-            "this key is disabled",
-        );
+    if let Some(refused) = key_refused(&key) {
+        return refused;
     }
     match account_row(&st, key.user_id).await {
         Ok(Some(account)) => {

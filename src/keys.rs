@@ -1,7 +1,8 @@
 use axum::extract::{Path, State as AxumState};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Json, Response};
-use serde::Deserialize;
+use chrono::{DateTime, Datelike, NaiveDate, SecondsFormat, Utc};
+use serde::{Deserialize, Deserializer};
 use serde_json::json;
 use sqlx::Row;
 use uuid::Uuid;
@@ -17,6 +18,7 @@ pub struct CreateKey {
     pub model: Option<String>,
     pub rpm_limit: Option<i64>,
     pub token_cap: Option<i64>,
+    pub expires_at: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -27,14 +29,74 @@ pub struct UpdateKey {
     pub enabled: Option<bool>,
     pub rpm_limit: Option<i64>,
     pub token_cap: Option<i64>,
+    // Left out, the expiry stays as it is; null clears it, so the key no longer expires.
+    #[serde(default, deserialize_with = "given")]
+    pub expires_at: Option<Option<String>>,
+}
+
+// A field that was sent, null included, as against one that was left out.
+fn given<'de, D: Deserializer<'de>, T: Deserialize<'de>>(d: D) -> Result<Option<T>, D::Error> {
+    T::deserialize(d).map(Some)
+}
+
+// When a key stops working, written the way `clock` writes a moment so the gateway compares the two as text. A
+// date alone means the key works through that day in UTC, which is how a date picker means it. A moment that has
+// passed is refused rather than stored: a key is stopped now by turning it off.
+fn expiry(given: &str) -> Result<String, Box<Response>> {
+    let refuse =
+        |message: &str| Box::new(error(StatusCode::BAD_REQUEST, "invalid_request", message));
+    let given = given.trim();
+    let at = if let Ok(day) = NaiveDate::parse_from_str(given, "%Y-%m-%d") {
+        match day.succ_opt().and_then(|next| next.and_hms_opt(0, 0, 0)) {
+            Some(start) => start.and_utc(),
+            None => return Err(refuse("the expiry is not a date that can be read")),
+        }
+    } else {
+        match DateTime::parse_from_rfc3339(given) {
+            Ok(at) => at.with_timezone(&Utc),
+            Err(_) => {
+                return Err(refuse(
+                    "the expiry must be a date written YYYY-MM-DD or an RFC 3339 time",
+                ));
+            }
+        }
+    };
+    if at <= Utc::now() {
+        return Err(refuse(
+            "the expiry has already passed; turn the key off to stop it now",
+        ));
+    }
+    // A year past 9999 is written with a sign, which sorts before every year of four digits, so it would compare
+    // as long passed. A key that is meant never to expire is given no expiry.
+    if at.year() > 9999 {
+        return Err(refuse(
+            "the expiry must be before the year 10000; leave it out for a key that does not expire",
+        ));
+    }
+    Ok(at.to_rfc3339_opts(SecondsFormat::Secs, true))
+}
+
+// What an admin is shown of another account's key: the fixed `dreamgate_` prefix and the first and last four of
+// its random characters, enough to tell it from the others and to match it against a key someone reports, while
+// the ninety random bits of a version 4 UUID between them stay hidden.
+fn key_hint(key: &str) -> String {
+    let chars: Vec<char> = key.chars().collect();
+    if chars.len() <= 18 {
+        return "…".to_string();
+    }
+    let start: String = chars[..14].iter().collect();
+    let end: String = chars[chars.len() - 4..].iter().collect();
+    format!("{start}…{end}")
 }
 
 // One row shape for both lists. The Keys page shows the caller's own keys; an admin can ask for
 // the other accounts separately, so a table never mixes two owners. The input and the output are
 // reported apart because the page shows them apart; the total stays, because the list is ordered by it
-// and a client that read it before still can.
+// and a client that read it before still can. When a key was last used is the time of its last recorded
+// request, read from the rows rather than written on every request; a request refused before it was recorded,
+// and a model list, do not count.
 const KEY_SQL: &str = "SELECT k.id, k.name, k.key, k.model, k.connection_id, k.enabled, k.rpm_limit, k.token_cap, \
-        k.created_at, c.name AS connection, u.username AS owner, \
+        k.created_at, k.expires_at, MAX(r.created_at) AS last_used_at, c.name AS connection, u.username AS owner, \
         COUNT(r.id) AS requests, COALESCE(SUM(r.total_tokens), 0) AS tokens, \
         COALESCE(SUM(r.prompt_tokens), 0) AS prompt_tokens, \
         COALESCE(SUM(r.completion_tokens), 0) AS completion_tokens \
@@ -42,10 +104,13 @@ const KEY_SQL: &str = "SELECT k.id, k.name, k.key, k.model, k.connection_id, k.e
  LEFT JOIN connections c ON c.id = k.connection_id \
  JOIN users u ON u.id = k.user_id {scope} GROUP BY k.id ORDER BY tokens DESC";
 
+// The key itself is in a row only for its owner. An admin reads every account's keys to manage them, and a
+// key is a credential that bills its account, so another account's key is shown by its hint alone.
 async fn key_rows(
     st: &State,
     scope: &str,
     user_id: i64,
+    reveal: bool,
 ) -> Result<Vec<serde_json::Value>, sqlx::Error> {
     let sql = KEY_SQL.replace("{scope}", scope);
     let rows = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
@@ -55,10 +120,12 @@ async fn key_rows(
     Ok(rows
         .iter()
         .map(|row| {
+            let key = row.get::<String, _>("key");
             json!({
                 "id": row.get::<i64, _>("id"),
                 "name": row.get::<String, _>("name"),
-                "key": row.get::<String, _>("key"),
+                "key_hint": key_hint(&key),
+                "key": reveal.then_some(key),
                 "model": row.get::<Option<String>, _>("model"),
                 "connection_id": row.get::<Option<i64>, _>("connection_id"),
                 "connection": row.get::<Option<String>, _>("connection"),
@@ -71,13 +138,15 @@ async fn key_rows(
                 "prompt_tokens": row.get::<i64, _>("prompt_tokens"),
                 "completion_tokens": row.get::<i64, _>("completion_tokens"),
                 "created_at": row.get::<String, _>("created_at"),
+                "expires_at": row.get::<Option<String>, _>("expires_at"),
+                "last_used_at": row.get::<Option<String>, _>("last_used_at"),
             })
         })
         .collect())
 }
 
 pub async fn list(AxumState(st): AxumState<State>, caller: Caller) -> Response {
-    match key_rows(&st, "WHERE k.user_id = ?", caller.id).await {
+    match key_rows(&st, "WHERE k.user_id = ?", caller.id, true).await {
         Ok(keys) => Json(json!({ "keys": keys })).into_response(),
         Err(err) => server_error(err),
     }
@@ -92,10 +161,14 @@ pub async fn other_accounts(AxumState(st): AxumState<State>, caller: Caller) -> 
             "only an admin can see keys from other accounts",
         );
     }
-    match key_rows(&st, "WHERE k.user_id != ?", caller.id).await {
+    match key_rows(&st, "WHERE k.user_id != ?", caller.id, false).await {
         Ok(keys) => Json(json!({ "keys": keys })).into_response(),
         Err(err) => server_error(err),
     }
+}
+
+fn new_key() -> String {
+    format!("dreamgate_{}", Uuid::new_v4().simple())
 }
 
 pub async fn create(
@@ -121,10 +194,21 @@ pub async fn create(
             "limits must be a positive number, or left unset",
         );
     }
-    let key = format!("dreamgate_{}", Uuid::new_v4().simple());
+    let expires_at = match body
+        .expires_at
+        .as_deref()
+        .filter(|at| !at.trim().is_empty())
+    {
+        Some(at) => match expiry(at) {
+            Ok(at) => Some(at),
+            Err(refused) => return *refused,
+        },
+        None => None,
+    };
+    let key = new_key();
     let result = sqlx::query(
-        "INSERT INTO api_keys (user_id, name, key, connection_id, model, rpm_limit, token_cap, created_at) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?) RETURNING id",
+        "INSERT INTO api_keys (user_id, name, key, connection_id, model, rpm_limit, token_cap, created_at, \
+         expires_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id",
     )
     .bind(caller.id)
     .bind(&name)
@@ -134,10 +218,14 @@ pub async fn create(
     .bind(body.rpm_limit)
     .bind(body.token_cap)
     .bind(crate::clock::now())
+    .bind(&expires_at)
     .fetch_one(&st.pool)
     .await;
     match result {
-        Ok(row) => Json(json!({ "id": row.get::<i64, _>("id"), "key": key })).into_response(),
+        Ok(row) => {
+            Json(json!({ "id": row.get::<i64, _>("id"), "key": key, "expires_at": expires_at }))
+                .into_response()
+        }
         Err(err) => write_failed(&st, body.connection_id, err).await,
     }
 }
@@ -189,12 +277,27 @@ pub async fn update(
             None => return error(StatusCode::NOT_FOUND, "not_found", "key not found"),
         }
     }
+    // Read before anything is written, so an expiry that cannot be read changes nothing else either.
+    let expires_at = match &body.expires_at {
+        None => None,
+        Some(None) => Some(None),
+        Some(Some(at)) if at.trim().is_empty() => Some(None),
+        Some(Some(at)) => match expiry(at) {
+            Ok(at) => Some(Some(at)),
+            Err(refused) => return *refused,
+        },
+    };
+    // The expiry is written in the same statement as the rest, so a change refused for another field, a binding
+    // to a connection that is gone, changes the expiry no more than it changes the name.
     let result = sqlx::query(
-        "UPDATE api_keys SET name = COALESCE(?, name), connection_id = COALESCE(?, connection_id), \
+        "UPDATE api_keys SET expires_at = CASE WHEN ? THEN ? ELSE expires_at END, \
+                name = COALESCE(?, name), connection_id = COALESCE(?, connection_id), \
                 model = COALESCE(?, model), enabled = COALESCE(?, enabled), \
                 rpm_limit = COALESCE(?, rpm_limit), token_cap = COALESCE(?, token_cap) \
          WHERE id = ?",
     )
+    .bind(expires_at.is_some())
+    .bind(expires_at.flatten())
     .bind(body.name)
     .bind(body.connection_id)
     .bind(body.model)
@@ -208,6 +311,52 @@ pub async fn update(
         Ok(_) => Json(json!({ "ok": true })).into_response(),
         Err(err) => write_failed(&st, body.connection_id, err).await,
     }
+}
+
+// A new secret for a key that keeps everything else: its id, its name, its limits, its binding and the usage
+// recorded for it. The old secret stops working at once, which is the point of rotating a key that may have
+// leaked. The new one is given back to its owner; an admin rotating another account's key is not given it,
+// for the same reason the list does not show it, and the owner reads it from their own list.
+// The body is an empty JSON object rather than nothing: a form on another page of the same site can post with the
+// session cookie but cannot send JSON, so it cannot rotate someone's key out from under their clients.
+pub async fn rotate(
+    AxumState(st): AxumState<State>,
+    Path(id): Path<i64>,
+    caller: Caller,
+    Json(_): Json<serde_json::Value>,
+) -> Response {
+    let owner = match sqlx::query("SELECT user_id FROM api_keys WHERE id = ?")
+        .bind(id)
+        .fetch_optional(&st.pool)
+        .await
+    {
+        Ok(Some(row)) => row.get::<i64, _>("user_id"),
+        Ok(None) => return error(StatusCode::NOT_FOUND, "not_found", "key not found"),
+        Err(err) => return server_error(err),
+    };
+    if owner != caller.id && caller.role != "admin" {
+        return error(
+            StatusCode::FORBIDDEN,
+            "forbidden",
+            "you can only rotate your own key",
+        );
+    }
+    let key = new_key();
+    // Only the key that was checked: an id freed by a delete in the meantime can be given to another account's new
+    // key, which this must not rotate.
+    match sqlx::query("UPDATE api_keys SET key = ? WHERE id = ? AND user_id = ?")
+        .bind(&key)
+        .bind(id)
+        .bind(owner)
+        .execute(&st.pool)
+        .await
+    {
+        Ok(done) if done.rows_affected() == 1 => {}
+        Ok(_) => return error(StatusCode::NOT_FOUND, "not_found", "key not found"),
+        Err(err) => return server_error(err),
+    }
+    let shown = (owner == caller.id).then_some(key);
+    Json(json!({ "id": id, "key": shown, "rotated": true })).into_response()
 }
 
 pub async fn delete(
