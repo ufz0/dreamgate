@@ -169,12 +169,12 @@ was taken by an older version.
    single or streamed, a health check, and the list `/v1/models` asks the first connection for when no list
    has been read — therefore carries `User-Agent: DreamGate/1.0` and `x-opencode-session`: the session the
    client sent, passed on as OpenCode Go asks a client that forwards requests to do, or
-   `ses_dreamgate_abc123` when the client sent none or sent it empty, which a health check always is. That
-   one session is shared by every client that sends none, so OpenCode Go reads all of them as one
-   conversation; a client that keeps a session for each conversation, as OpenCode's own clients do, keeps
-   its routing and its cache. The headers follow the connection a request is sent to, so a request that
-   fails over from one type to the other is sent what the connection it reaches asks for. A connection of
-   the plain type is sent neither header, even when the client sent a session, and nothing else from a
+   `ses_dreamgate_abc123` when the client sent none or sent it empty, which is always the case for a health
+   check. That one session is shared by every client that sends none, so OpenCode Go reads all of them as
+   one conversation; a client that keeps a session for each conversation, as OpenCode's own clients do,
+   keeps its routing and its cache. The headers follow the connection a request is sent to, so a request
+   that fails over from one type to the other is sent what the connection it reaches asks for. A connection
+   of the plain type is sent neither header, even when the client sent a session, and nothing else from a
    client's headers is passed on. A type the gateway does not know is refused when a connection is made; one
    a newer version wrote is sent the plain API, which every type speaks, and listed as it was stored.
 2. Create a key. A DreamGate key is what clients use — the upstream key stays server-side.

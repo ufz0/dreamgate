@@ -7934,20 +7934,22 @@ async fn a_request_that_fails_over_is_sent_the_headers_of_the_connection_it_reac
         let admin = register(&router, "ada").await;
         let (url, sent) = recording_upstream().await;
         // Nothing listens on port 1, so the first connection refuses the request and it goes on to the second.
-        post_json(
+        let (status, dead) = post_json(
             &router,
             "/api/connections",
             &admin,
             json!({ "name": "gone", "base_url": "http://127.0.0.1:1", "kind": gone }),
         )
         .await;
-        post_json(
+        assert_eq!(status, StatusCode::OK);
+        let (status, _) = post_json(
             &router,
             "/api/connections",
             &admin,
             json!({ "name": "reached", "base_url": url, "api_key": "k", "priority": 1, "kind": reached }),
         )
         .await;
+        assert_eq!(status, StatusCode::OK);
         let (_, key) = post_json(&router, "/api/keys", &admin, json!({ "name": "k" })).await;
         let response = call(
             &router,
@@ -7963,6 +7965,10 @@ async fn a_request_that_fails_over_is_sent_the_headers_of_the_connection_it_reac
         )
         .await;
         assert_eq!(response.status(), StatusCode::OK, "{gone} to {reached}");
+        // The dead connection was tried first and its failure passed the request on.
+        let failures = failures_written(&st.pool, 1).await;
+        assert_eq!(failures[0]["connection_id"], dead["id"]);
+        assert_eq!(failures[0]["passed_on"], true);
         let (path, agent, session, _) = sent.lock().unwrap().last().cloned().unwrap();
         assert_eq!(path, "/v1/chat/completions");
         if reached == "opencode-go" {
