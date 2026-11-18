@@ -604,7 +604,8 @@ fn csv_line(event: &serde_json::Value) -> String {
 // spreadsheet reads as a formula is written with an apostrophe before it, because key and model names are chosen
 // by whoever made them and the file is opened by an admin. A spreadsheet whose locale separates a list with `;`,
 // as German and Austrian ones do, splits the cell there and pays no attention to the quotes, so each part after
-// a `;` is guarded as the start of a cell as well.
+// a `;` is guarded as the start of a cell as well, and so is each line, which such a spreadsheet reads as a new
+// row, and a quote at the start of a part, which it reads as the start of a quoted cell.
 fn csv_text(text: &str) -> String {
     const FORMULA: [char; 6] = ['=', '+', '-', '@', '\t', '\r'];
     let mut guarded = String::with_capacity(text.len() + 1);
@@ -614,7 +615,7 @@ fn csv_text(text: &str) -> String {
             guarded.push('\'');
         }
         guarded.push(c);
-        starts_cell = c == ';';
+        starts_cell = matches!(c, ';' | '\n' | '\r') || (starts_cell && c == '"');
     }
     let text = guarded;
     if text.contains([',', '"', '\n', '\r']) {
@@ -776,6 +777,8 @@ mod tests {
         assert_eq!(csv_text("-1,2"), "\"'-1,2\"");
         assert_eq!(csv_text("x;=1+1;"), "x;'=1+1;");
         assert_eq!(csv_text("a;b"), "a;b");
+        assert_eq!(csv_text("x\n=1+1;"), "\"x\n'=1+1;\"");
+        assert_eq!(csv_text("x;\"=1+1"), "\"x;\"\"'=1+1\"");
     }
 
     #[test]

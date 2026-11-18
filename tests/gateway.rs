@@ -6544,6 +6544,8 @@ async fn the_activity_filters_read_a_connection_a_deleted_key_and_the_end_of_a_d
     .await;
     let (_, gone) = post_json(&router, "/api/keys", &admin, json!({ "name": "gone" })).await;
     let gone_id = gone["id"].as_i64().unwrap();
+    let (_, kept) = post_json(&router, "/api/keys", &admin, json!({ "name": "kept" })).await;
+    let kept_id = kept["id"].as_i64().unwrap();
 
     insert_usage(
         &st.pool,
@@ -6556,6 +6558,15 @@ async fn the_activity_filters_read_a_connection_a_deleted_key_and_the_end_of_a_d
     .await;
     insert_usage(&st.pool, ada, None, "m2", 200, "2026-03-03T00:00:00Z").await;
     insert_usage(&st.pool, ben, None, "m3", 200, "2026-03-03T01:00:00Z").await;
+    insert_usage(
+        &st.pool,
+        ada,
+        Some(kept_id),
+        "m0",
+        200,
+        "2026-02-28T00:00:00Z",
+    )
+    .await;
     sqlx::query("UPDATE usage SET connection_id = ? WHERE model = 'm2'")
         .bind(connection["id"].as_i64().unwrap())
         .execute(&st.pool)
@@ -6590,11 +6601,11 @@ async fn the_activity_filters_read_a_connection_a_deleted_key_and_the_end_of_a_d
     let (_, body) = get_status_json(&router, "/api/stats/activity?until=2026-03-02", &admin).await;
     assert_eq!(
         models(&body),
-        ["m1"],
+        ["m0", "m1"],
         "the first second of the next day is not in it"
     );
     assert_eq!(
-        body["events"][0]["key"],
+        body["events"][1]["key"],
         Value::Null,
         "the key was deleted, the row kept"
     );
@@ -6603,7 +6614,7 @@ async fn the_activity_filters_read_a_connection_a_deleted_key_and_the_end_of_a_d
     let (_, body) = get_status_json(&router, "/api/stats/activity?limit=&before=", &admin).await;
     assert_eq!(
         models(&body),
-        ["m3", "m2", "m1"],
+        ["m0", "m3", "m2", "m1"],
         "a value left empty is left out"
     );
     for query in ["limit=0", "limit=-3", "limit=abc"] {
@@ -6627,9 +6638,16 @@ async fn the_activity_filters_read_a_connection_a_deleted_key_and_the_end_of_a_d
     assert_eq!(status, StatusCode::FORBIDDEN);
     let (_, body) = get_status_json(
         &router,
-        &format!("/api/stats/activity?key={gone_id}"),
+        &format!("/api/stats/activity?key={kept_id}"),
+        &admin,
+    )
+    .await;
+    assert_eq!(models(&body), ["m0"], "the key has a row");
+    let (_, body) = get_status_json(
+        &router,
+        &format!("/api/stats/activity?key={kept_id}"),
         &member,
     )
     .await;
-    assert_eq!(body["events"], json!([]));
+    assert_eq!(body["events"], json!([]), "but not one the member can read");
 }

@@ -51,6 +51,11 @@ function healthChip(health) {
   return `<span class="chip ${kind}">${glyph ? `<span class="icon">${icon(glyph)}</span>` : ''}<span>${esc(label)}</span></span>`;
 }
 
+// How many rows the Activity view keeps while new ones arrive. A page left open on a busy gateway would otherwise
+// hold every row since it was opened and rebuild the whole table for each one; the rows let go are still there
+// with "Load older", which goes on from the last row kept.
+const ACTIVITY_KEPT = 500;
+
 const state = {
   me: null,
   summary: { self: {}, global: {}, hourly: [], daily: [], models: [], users: [] },
@@ -63,7 +68,7 @@ const state = {
   connectionFiguresError: null,
   // The Activity view's rows, read a page at a time with the filters that were applied, and the id to read the
   // page after them from.
-  activity: { filters: {}, rows: [], next: null, loaded: false, loading: false, arrived: [] },
+  activity: freshActivity(),
   keyOwner: '',
   connections: [],
   events: [],
@@ -266,7 +271,11 @@ function route() {
   // on every page load.
   if (state.view === 'sandbox' && !state.models.length && state.keys.length) loadModels().then(() => renderSandbox());
   if (state.view === 'connections') loadConnectionFigures().then(() => state.view === 'connections' && renderConnections());
-  if (state.view === 'activity' && !state.activity.loaded) loadActivity(false).then(() => renderActivity()).catch(report);
+  if (state.view === 'activity' && !state.activity.loaded && !state.activity.loading) {
+    loadActivity(false)
+      .then((landed) => landed && renderActivity())
+      .catch(report);
+  }
 }
 
 function render(arrived) {
@@ -771,15 +780,16 @@ function renderFeed(arrived) {
 
 // Activity
 
-// How many rows the Activity view keeps while new ones arrive. A page left open on a busy gateway would otherwise
-// hold every row since it was opened and rebuild the whole table for each one; the rows let go are still there
-// with "Load older", which goes on from the last row kept.
-const ACTIVITY_KEPT = 500;
+// What the view starts from: no rows, no filters, and the number of rows it keeps as rows arrive, which grows to
+// what "Load older" has read so a page the reader asked for is not let go under them.
+function freshActivity() {
+  return { filters: {}, rows: [], next: null, loaded: false, loading: false, reading: false, arrived: [], kept: ACTIVITY_KEPT, ticket: 0 };
+}
 
 // The rows are the signed-in account's own, or every account's for an admin, so none of them, nor the filters
 // they were read with, outlive the session they were read in.
 function resetActivity() {
-  state.activity = { filters: {}, rows: [], next: null, loaded: false, loading: false, arrived: [] };
+  state.activity = freshActivity();
   $('activity-filters').reset();
   for (const id of ['activity-key', 'activity-user', 'activity-connection']) $(id).innerHTML = '';
 }
@@ -794,9 +804,10 @@ function arriveInActivity(event) {
   }
   if (!activity.loaded) return;
   activity.rows.unshift(event);
-  if (activity.rows.length > ACTIVITY_KEPT) {
-    activity.rows.length = ACTIVITY_KEPT;
-    activity.next = activity.rows[ACTIVITY_KEPT - 1].id;
+  // Nothing is let go while an older page is being read, because that page goes on from the last row kept.
+  if (!activity.reading && activity.rows.length > activity.kept) {
+    activity.rows.length = activity.kept;
+    activity.next = activity.rows[activity.kept - 1].id;
   }
 }
 
@@ -817,28 +828,51 @@ function activityQuery(extra = {}) {
 }
 
 // The first page with the filters as they are, or the page after the rows already shown.
+// Only the latest read lands, so a read answered late cannot replace what a later one showed, and none lands
+// in the state of a session that has since ended. It says whether it landed.
 async function loadActivity(older) {
   const activity = state.activity;
-  if (!older) {
+  const ticket = ++activity.ticket;
+  if (older) {
+    activity.reading = true;
+  } else {
     activity.loading = true;
     activity.arrived = [];
   }
   try {
     const page = await api(`/api/stats/activity?${activityQuery(older ? { before: activity.next } : {})}`);
+    if (ticket !== activity.ticket || activity !== state.activity) return false;
     if (older) {
       activity.rows = activity.rows.concat(page.events);
+      activity.kept = Math.max(ACTIVITY_KEPT, activity.rows.length);
     } else {
       const newest = page.events[0]?.id ?? 0;
       const arrived = activityFiltered() ? [] : activity.arrived.filter((event) => event.id > newest);
       activity.rows = arrived.sort((a, b) => b.id - a.id).concat(page.events);
+      activity.kept = ACTIVITY_KEPT;
     }
     activity.next = page.next;
     activity.loaded = true;
+    return true;
   } finally {
-    if (!older) {
+    if (ticket === activity.ticket) {
       activity.loading = false;
+      activity.reading = false;
       activity.arrived = [];
     }
+  }
+}
+
+// Filters are applied by reading their first page. A read that is refused leaves the filters that were applied
+// before it, so arriving rows and "Load older" go on as they did rather than repeating the refusal.
+async function applyActivityFilters(filters) {
+  const previous = state.activity.filters;
+  state.activity.filters = filters;
+  try {
+    return await loadActivity(false);
+  } catch (err) {
+    if (state.activity.filters === filters) state.activity.filters = previous;
+    throw err;
   }
 }
 
@@ -864,6 +898,7 @@ function renderActivityFilters() {
 // The rows and the models are an admin's for every account and anyone else's for their own, the same scope the
 // live stream keeps, so the lede says which.
 function renderActivity() {
+  if (!state.me) return;
   const admin = state.me.role === 'admin';
   $('activity-lede').textContent = `${
     admin ? 'The requests that crossed the gate from every account' : 'The requests this account sent through the gate'
@@ -1544,10 +1579,8 @@ window.addEventListener('hashchange', () => {
 
 $('activity-filters').addEventListener('submit', async (event) => {
   event.preventDefault();
-  state.activity.filters = formFilters();
   try {
-    await loadActivity(false);
-    renderActivity();
+    if (await applyActivityFilters(formFilters())) renderActivity();
   } catch (err) {
     report(err);
   }
@@ -1557,10 +1590,8 @@ $('activity-filters').addEventListener('submit', async (event) => {
 // as the applied one.
 $('activity-clear').addEventListener('click', async () => {
   for (const field of $('activity-filters').elements) if (field.name) field.value = '';
-  state.activity.filters = {};
   try {
-    await loadActivity(false);
-    renderActivity();
+    if (await applyActivityFilters({})) renderActivity();
   } catch (err) {
     report(err);
   }
@@ -1568,8 +1599,7 @@ $('activity-clear').addEventListener('click', async () => {
 
 $('activity-older').addEventListener('click', async () => {
   try {
-    await loadActivity(true);
-    renderActivity();
+    if (await loadActivity(true)) renderActivity();
   } catch (err) {
     report(err);
   }
@@ -1580,9 +1610,8 @@ $('activity-older').addEventListener('click', async () => {
 // says nothing on the page, so a filter the server refuses, or a session that has ended, is reported here
 // instead.
 $('activity-export').addEventListener('click', async () => {
-  state.activity.filters = formFilters();
   try {
-    await loadActivity(false);
+    if (!(await applyActivityFilters(formFilters()))) return;
     renderActivity();
   } catch (err) {
     report(err);
