@@ -5791,3 +5791,205 @@ async fn the_model_list_passes_on_dates_and_includes_a_connection_marked_down() 
         ])
     );
 }
+
+// A key's expiry, its last use and its rotation. An expiry is a date or a time still to come; a key past it is
+// refused at the gateway and the model list with an error of its own, and clearing the expiry lets it in again.
+// The list says when a key was last used. Rotating gives a key a new secret and keeps its id and its usage, and
+// the old secret is refused at once; an admin rotating another account's key is not given the new one, and a
+// member cannot rotate someone else's. An admin's list of other accounts' keys has hints, not keys.
+#[tokio::test]
+async fn a_key_expires_rotates_and_says_when_it_was_last_used() {
+    let st = test_state().await;
+    let router = build_router(st.clone());
+    let base_url = mock_upstream().await;
+    let admin = register(&router, "ada").await;
+    post_json(
+        &router,
+        "/api/connections",
+        &admin,
+        json!({ "name": "test", "base_url": base_url, "default_model": "reports-usage" }),
+    )
+    .await;
+    let body = json!({ "messages": [{ "role": "user", "content": "hi" }] });
+
+    let (status, _) = post_json(
+        &router,
+        "/api/keys",
+        &admin,
+        json!({ "name": "late", "expires_at": "2020-01-01" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let (status, created) = post_json(
+        &router,
+        "/api/keys",
+        &admin,
+        json!({ "name": "k", "expires_at": "2099-12-31" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        created["expires_at"], "2100-01-01T00:00:00Z",
+        "the key works through the day"
+    );
+    let id = created["id"].as_i64().unwrap();
+    let old = created["key"].as_str().unwrap().to_string();
+    let own = |router: Router, cookie: String| async move {
+        get_json(&router, "/api/keys", &cookie).await["keys"][0].clone()
+    };
+    assert_eq!(
+        own(router.clone(), admin.clone()).await["last_used_at"],
+        Value::Null
+    );
+
+    assert_eq!(
+        gateway_call(&router, &old, body.clone()).await.status(),
+        StatusCode::OK
+    );
+    assert!(own(router.clone(), admin.clone()).await["last_used_at"].is_string());
+
+    sqlx::query("UPDATE api_keys SET expires_at = '2020-01-01T00:00:00Z' WHERE id = ?")
+        .bind(id)
+        .execute(&st.pool)
+        .await
+        .unwrap();
+    for response in [
+        gateway_call(&router, &old, body.clone()).await,
+        models_call(&router, &old).await,
+    ] {
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_eq!(json_body(response).await["error"]["type"], "key_expired");
+    }
+    // An expiry that cannot be read changes nothing, the name sent with it included.
+    let (status, _) = send_json(
+        &router,
+        http::Method::PATCH,
+        &format!("/api/keys/{id}"),
+        &admin,
+        json!({ "name": "renamed", "expires_at": "soon" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(own(router.clone(), admin.clone()).await["name"], "k");
+    send_json(
+        &router,
+        http::Method::PATCH,
+        &format!("/api/keys/{id}"),
+        &admin,
+        json!({ "expires_at": null }),
+    )
+    .await;
+    assert_eq!(
+        gateway_call(&router, &old, body.clone()).await.status(),
+        StatusCode::OK
+    );
+
+    let (status, rotated) = post_json(
+        &router,
+        &format!("/api/keys/{id}/rotate"),
+        &admin,
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let new = rotated["key"].as_str().unwrap().to_string();
+    assert_ne!(new, old);
+    assert_eq!(
+        gateway_call(&router, &old, body.clone()).await.status(),
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        gateway_call(&router, &new, body.clone()).await.status(),
+        StatusCode::OK
+    );
+    let listed = own(router.clone(), admin.clone()).await;
+    assert_eq!(listed["id"], id);
+    assert_eq!(listed["key"], new);
+    assert_eq!(listed["requests"], 3, "the usage stays with the key");
+
+    open_registration(&router, &admin).await;
+    no_approval(&router, &admin).await;
+    let member = register(&router, "ben").await;
+    let (_, bens) = post_json(&router, "/api/keys", &member, json!({ "name": "b" })).await;
+    let bens_id = bens["id"].as_i64().unwrap();
+    let (status, _) = post_json(
+        &router,
+        &format!("/api/keys/{id}/rotate"),
+        &member,
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let (status, rotated) = post_json(
+        &router,
+        &format!("/api/keys/{bens_id}/rotate"),
+        &admin,
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        rotated["key"],
+        Value::Null,
+        "an admin is not given another account's key"
+    );
+    let bens_new = own(router.clone(), member.clone()).await["key"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_ne!(bens_new, bens["key"].as_str().unwrap());
+
+    let others = get_json(&router, "/api/keys/others", &admin).await;
+    let listed = &others["keys"][0];
+    assert_eq!(listed["key"], Value::Null);
+    let hint = listed["key_hint"].as_str().unwrap();
+    assert!(
+        hint.starts_with("dreamgate_") && hint.ends_with(&bens_new[bens_new.len() - 4..]),
+        "{hint}"
+    );
+    assert!(!others.to_string().contains(&bens_new));
+}
+
+// A key written before keys could expire gains the column on start and reads as a key that does not expire.
+#[tokio::test]
+async fn a_key_written_before_expiry_does_not_expire() {
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
+        .unwrap();
+    for statement in db::SCHEMA {
+        let before = statement.replace(",\n        expires_at TEXT", "");
+        sqlx::query(sqlx::AssertSqlSafe(before.as_str()))
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+    sqlx::query(
+        "INSERT INTO users (id, username, role, created_at) VALUES (1, 'ada', 'admin', '2026-01-01T00:00:00Z')",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO api_keys (user_id, name, key, created_at) VALUES (1, 'k', 'dreamgate_old', '2026-01-01T00:00:00Z')",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    let before = sqlx::query(
+        "SELECT COUNT(*) AS n FROM pragma_table_info('api_keys') WHERE name = 'expires_at'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap()
+    .get::<i64, _>("n");
+    assert_eq!(before, 0, "the table was written without the column");
+    db::migrate(&pool).await.unwrap();
+    let expires_at = sqlx::query("SELECT expires_at FROM api_keys")
+        .fetch_one(&pool)
+        .await
+        .unwrap()
+        .get::<Option<String>, _>("expires_at");
+    assert_eq!(expires_at, None);
+}

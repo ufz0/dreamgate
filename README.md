@@ -15,15 +15,16 @@ cargo run
 Then open <http://127.0.0.1:8787/>. The server binds every interface by default, so clients on the
 network can reach the same port. Accounts sign in with a username and a password; there are
 no email addresses. The first account to register is the admin; everyone after that is a normal
-user. An admin is the only one who can change an account, and sees every key and every account;
-users see their own. An admin can also make an account directly, with a username and a daily
-limit, while self-registration is closed — that person chooses their own password when they sign
-in for the first time.
+user. An admin is the only one who can change an account, and sees every key, by its hint rather
+than the key itself, and every account; users see their own. An admin can also make an account
+directly, with a username and a daily limit, while self-registration is closed — that person chooses
+their own password when they sign in for the first time.
 
 A database written before this change is migrated on start: the stored display name becomes the
 username, the email column is dropped, a password column that was required is rebuilt so it can be
 left empty, the approval flag is added, the `max_concurrent` column is added to connections and left
-empty for the rows written before it, and existing accounts keep their limits and are enabled by
+empty for the rows written before it, an `expires_at` column is added to keys and left empty, so a key
+written before it does not expire, and existing accounts keep their limits and are enabled by
 default. A connection row with no `max_concurrent` keeps its meaning: it never stated a capability, so
 the default applies to it, which is not the same as a capability of one. A table that has to be rebuilt
 for this is rebuilt in one transaction, so a start that stops partway, on a full disk or in a crash,
@@ -153,7 +154,8 @@ was taken by an older version.
    only visible in the API response. Left out, the default is used; a stated value has to be positive,
    because a capability of zero would admit nothing, which is not what leaving it out means.
 2. Create a key. A DreamGate key is what clients use — the upstream key stays server-side.
-   Optionally bind a key to one connection, pin a model, or set a requests-per-minute limit and a token cap.
+   Optionally bind a key to one connection, pin a model, give it an expiry, or set a requests-per-minute limit
+   and a token cap.
    A pinned model is the one chat and completions are sent with; an embedding keeps the model its client
    names, so a pin does not limit which embedding model a key can ask for. An admin can set a token limit for
    any account from the Accounts view; that limit counts the tokens used in the current day — the input and
@@ -492,11 +494,21 @@ URL hash (`#/overview`, `#/activity`, `#/keys`, `#/connections`, `#/connect`, `#
 - **Activity** — the last 50 recorded requests, newest first, with each one's input and output tokens,
   plus usage by model for the eight models with the most tokens, input and output together, each split
   into the two: every account's for an admin, and otherwise this account's own. The page says which.
-- **Keys** — create, copy, disable and delete keys, with per-key usage split into input and output
-  tokens (a key's token cap counts the two together), and a note when a key's binding points at a
-  connection that is turned off. A key that is turned off stays listed and reads dimmer than the keys
-  that work. The table is this account's own keys for anyone; under it an admin can pick another
-  account, or all of them, and see those keys with the account each one belongs to.
+- **Keys** — create, copy, rotate, disable and delete keys, with per-key usage split into input and output
+  tokens (a key's token cap counts the two together), and a note when a key's binding points at a connection
+  that is turned off. A key that is turned off stays listed and reads dimmer than the keys that work. The
+  table is this account's own keys for anyone; under it an admin can pick another account, or all of them,
+  and see those keys with the account each one belongs to. Each key says when it was last used — the time of
+  its last recorded request, read from the usage rows, so a request refused before it was recorded and a
+  model list do not count — and when it expires, if it does. A key can be given an expiry when it is made
+  (`expires_at`, a date written `YYYY-MM-DD`, which it works through in UTC, or an RFC 3339 time), and
+  `PATCH /api/keys/{id}` sets or, with null, clears it; a time that has passed is refused, because a key is
+  stopped now by turning it off. A key past its expiry is refused at the gateway with 403 `key_expired`.
+  Rotating a key (`POST /api/keys/{id}/rotate`) gives it a new secret and keeps everything else — its id,
+  name, limits, binding and recorded usage — and the old secret is refused at once. The key itself is shown
+  to its owner alone: another account's key reaches an admin as a hint, its first ten and last four
+  characters, enough to tell it apart and to match one someone reports, and an admin who rotates another
+  account's key is not given the new one, which the owner reads from their own list.
 - **Connections** — add and health-check upstreams. A connection that no check has reached yet reads "not
   checked yet" rather than down, here and in the gate readout on the Overview, because the gateway only puts
   one whose check failed behind the others. Beside its health is how many models its last list named, with the
@@ -624,6 +636,10 @@ a session or a DreamGate key.
   the key a connection carries and its address are returned to an admin alone, because an address names an
   internal host and port and can carry a credential of its own. A disabled account is refused at every
   gateway endpoint, not only at the completion path.
+- A key is shown to its owner alone. An admin manages every account's keys, and sees another account's key
+  by a hint of its first ten and last four characters, because a key is a credential that bills the account it
+  belongs to; rotating another account's key does not hand the admin the new one either. The keys are still
+  stored as they are, so the database itself is as sensitive as before.
 - A key, its account and its limits are read from the database on every request, and a read that fails — a
   write holding the database past the busy timeout, a disk that fails — answers 503 `unavailable` with a short
   reference and is logged under it, rather than letting the request through unchecked: a limit that could not
@@ -688,8 +704,12 @@ breaks off leaving the last one, the model list merging the lists in the order a
 a check read and a
 connection marked down included,
 the model recorded for a streamed request when nothing is pinned to a key or a connection,
-per-key limits and their validation, the per-key, per-account and per-model figures carrying the input and the
-output apart, including for a key or an account with no usage and after a key is deleted, the keys list being the
+per-key limits and their validation, a key's expiry refused when it has passed, refusing the key at the gateway
+and the model list once it has, cleared with null and left empty on a key written before it, a key's last use,
+rotation keeping the id and the usage and refusing the old secret, an admin not given another account's new key
+or its key in the list, and a member unable to rotate another's, the per-key, per-account and per-model figures
+carrying the input and the output apart, including for a key or an account with no usage and after a key is
+deleted, the keys list being the
 caller's own with the other
 accounts read by an admin alone, per-account daily token limits including the day
 boundary and the admin-only rule for setting one, the admin/user scoping of the stats

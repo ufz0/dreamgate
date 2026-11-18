@@ -46,7 +46,8 @@ pub const SCHEMA: &[&str] = &[
         enabled INTEGER NOT NULL DEFAULT 1,
         rpm_limit INTEGER,
         token_cap INTEGER,
-        created_at TEXT NOT NULL
+        created_at TEXT NOT NULL,
+        expires_at TEXT
     )",
     "CREATE TABLE IF NOT EXISTS usage (
         id INTEGER PRIMARY KEY,
@@ -263,6 +264,7 @@ pub async fn migrate(pool: &SqlitePool) -> Result<(), sqlx::Error> {
     add_usage_columns(pool).await?;
     add_connection_limit(pool).await?;
     add_connection_models(pool).await?;
+    add_key_expiry(pool).await?;
     relax_key_reference(pool).await?;
     for statement in INDEXES {
         sqlx::query(*statement).execute(pool).await?;
@@ -295,6 +297,18 @@ async fn add_connection_limit(pool: &SqlitePool) -> Result<(), sqlx::Error> {
         return Ok(());
     }
     sqlx::query("ALTER TABLE connections ADD COLUMN max_concurrent INTEGER")
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+// A key can be given a time it stops working. The column is nullable, so a key written before it keeps its
+// meaning: it does not expire.
+async fn add_key_expiry(pool: &SqlitePool) -> Result<(), sqlx::Error> {
+    if has_column(pool, "api_keys", "expires_at").await? {
+        return Ok(());
+    }
+    sqlx::query("ALTER TABLE api_keys ADD COLUMN expires_at TEXT")
         .execute(pool)
         .await?;
     Ok(())

@@ -795,6 +795,17 @@ function keyModel(key, bound) {
     : 'the model the client asks for';
 }
 
+// When a key was last used, from its last recorded request, and when it stops working, in UTC like every
+// time on the page.
+function keyTimes(key) {
+  const used = key.last_used_at ? `last used ${key.last_used_at.slice(0, 16).replace('T', ' ')} UTC` : 'never used';
+  if (!key.expires_at) return esc(used);
+  const at = `${key.expires_at.slice(0, 16).replace('T', ' ')} UTC`;
+  return new Date(key.expires_at) > new Date()
+    ? `${esc(used)} · expires ${esc(at)}`
+    : `${esc(used)} · <span class="danger">expired ${esc(at)}</span>`;
+}
+
 function keyRow(key, showOwner) {
   // A binding to a disabled connection does not hold: the key uses another one.
   const bound = key.connection_id ? state.connections.find((c) => c.id === key.connection_id) : null;
@@ -803,7 +814,12 @@ function keyRow(key, showOwner) {
   // Enable button in it says plainly which state it is in.
   return `<tr class="${key.enabled ? '' : 'off'}">
     ${showOwner ? `<td>${esc(key.owner)}</td>` : ''}
-    <td><span class="clamp" title="${esc(key.key)}">${esc(key.name)}</span></td>
+    <td>
+      <span class="stack">
+        <span class="clamp" title="${esc(key.key_hint)}">${esc(key.name)}</span>
+        <span class="muted">${keyTimes(key)}</span>
+      </span>
+    </td>
     <td>${binding}</td>
     <td>${esc(keyModel(key, bound))}</td>
     <td>${key.rpm_limit ? `${key.rpm_limit}/min` : 'no rate limit'}<br>${key.token_cap ? `${nf.format(key.token_cap)} input + output tokens` : 'no token cap'}</td>
@@ -811,7 +827,8 @@ function keyRow(key, showOwner) {
     <td class="num">${nf.format(key.prompt_tokens)}</td>
     <td class="num">${nf.format(key.completion_tokens)}</td>
     <td class="num">
-      <button class="link" data-copy="${esc(key.key)}">Copy key</button>
+      ${key.key ? `<button class="link" data-copy="${esc(key.key)}">Copy key</button>` : ''}
+      <button class="link" data-rotate="${key.id}">Rotate</button>
       <button class="link" data-toggle="${key.id}" data-enabled="${key.enabled}">${key.enabled ? 'Disable' : 'Enable'}</button>
       <button class="link danger" data-delete="${key.id}">Delete</button>
     </td>
@@ -1404,6 +1421,7 @@ $('key-form').addEventListener('submit', async (event) => {
     model: data.model || null,
     rpm_limit: data.rpm_limit ? Number(data.rpm_limit) : null,
     token_cap: data.token_cap ? Number(data.token_cap) : null,
+    expires_at: data.expires_at || null,
   };
   try {
     const created = await postJson('/api/keys', body);
@@ -1589,6 +1607,26 @@ document.addEventListener('click', async (event) => {
     } catch (err) {
       report(err);
     }
+    return;
+  }
+  if (button.dataset.rotate) {
+    const id = Number(button.dataset.rotate);
+    const own = state.keys.find((k) => k.id === id);
+    const key = own || state.otherKeys.find((k) => k.id === id);
+    const who = own ? '' : ` (${key.owner})`;
+    // Another account's new key is not shown to an admin, so the confirm says where it can be read.
+    const after = own ? 'The new key is in this list.' : `${key.owner} reads the new key from their own list.`;
+    confirmAction(
+      'Rotate key',
+      `Give "${key.name}"${who} a new key? The old key stops working at once, so every client that uses it needs the new one. The key keeps its limits, its binding and its usage. ${after}`,
+      'Rotate',
+      async () => {
+        const rotated = await api(`/api/keys/${key.id}/rotate`, { method: 'POST' });
+        if (own && key.key === state.connectKey) state.connectKey = rotated.key;
+        await refresh('keys');
+        notice(`Rotated "${key.name}". The old key no longer works.`);
+      },
+    );
     return;
   }
   if (button.dataset.delete) {

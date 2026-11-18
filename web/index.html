@@ -147,7 +147,7 @@
         <form id="key-form">
           <label class="field">Key name<input name="name" required></label>
           <button type="button" class="expand" id="key-advanced" aria-expanded="false">
-            <span class="icon" data-icon="chevron"></span><span>Connection, model and limits</span>
+            <span class="icon" data-icon="chevron"></span><span>Connection, model, limits and expiry</span>
           </button>
           <div id="key-advanced-fields" hidden>
             <div class="field">
@@ -165,6 +165,11 @@
               <label for="key-token-cap">Token cap</label>
               <p class="help" id="key-token-cap-help">Counted against the input and output tokens this key has already used, together, so it does not reset. An account's daily limit, which an admin sets, counts one day and applies on top of it.</p>
               <input id="key-token-cap" name="token_cap" type="number" min="1" aria-describedby="key-token-cap-help">
+            </div>
+            <div class="field">
+              <label for="key-expires">Expires</label>
+              <p class="help" id="key-expires-help">The key works through this day in UTC and is refused after it. Leave it empty for a key that does not expire.</p>
+              <input id="key-expires" name="expires_at" type="date" aria-describedby="key-expires-help">
             </div>
           </div>
           <button type="submit">Create key</button>
