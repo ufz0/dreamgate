@@ -15,19 +15,23 @@ cargo run
 Then open <http://127.0.0.1:8787/>. The server binds every interface by default, so clients on the
 network can reach the same port. Accounts sign in with a username and a password; there are
 no email addresses. The first account to register is the admin; everyone after that is a normal
-user. An admin is the only one who can change an account, and sees every key, by its hint rather
-than the key itself, and every account; users see their own. An admin can also make an account
-directly, with a username and a daily limit, while self-registration is closed — that person chooses
-their own password when they sign in for the first time.
+user. An admin is the only one who can change an account, and sees every key, by its hint rather than
+the key itself, and every account; users see their own. An admin can also make an account directly,
+with a username and a daily limit, while self-registration is closed — the admin is given a one-time
+setup code for it, and the person chooses their own password when they sign in with that code.
 
 A database written before this change is migrated on start: the stored display name becomes the
 username, the email column is dropped, a password column that was required is rebuilt so it can be
 left empty, the approval flag is added, the `max_concurrent` column is added to connections and left
-empty for the rows written before it, an `expires_at` column is added to keys and left empty, so a key
-written before it does not expire, and existing accounts keep their limits and are enabled by
-default. A connection row with no `max_concurrent` keeps its meaning: it never stated a capability, so
-the default applies to it, which is not the same as a capability of one. A table that has to be rebuilt
-for this is rebuilt in one transaction, so a start that stops partway, on a full disk or in a crash,
+empty for the rows written before it, the setup code columns (`setup_code_hash`,
+`setup_code_expires_at`) are added to accounts and left empty, an `expires_at` column is added to
+keys and left empty, so a key written before it does not expire, and existing accounts keep their
+limits and are enabled by default. A connection row with no `max_concurrent` keeps its meaning: it
+never stated a capability, so the default applies to it, which is not the same as a capability of
+one. An account with no setup code keeps its meaning too where it has a password, which it signs in
+with as before; one made by an admin before setup codes that never got a password can no longer be
+claimed by whoever signs in first, and waits for an admin to give it a code. A table that has to be
+rebuilt for this is rebuilt in one transaction, so a start that stops partway, on a full disk or in a crash,
 leaves that table as it was, and the next start migrates whatever is still in an older shape; each step
 reads the shape before it acts, so one that already finished is not run again. A new table that an older start left
 beside the old one when it stopped is dropped and made again from the old one, which still holds every
@@ -386,7 +390,10 @@ and started again after the same 30 seconds, so health checking does not end wit
 ### Stopping
 
 A request that crossed the gate has been served, and billed by the upstream, so stopping the process must not
-lose its row. On Ctrl-C, or the SIGTERM a service manager or a container runtime sends, the gateway:
+lose its row. The gateway listens for the signals from before it prints that it is listening, so a stop sent
+once that line is printed is met by the steps below rather than by the signal's default, which ends a process at
+once; a stop sent before then, while the database is opened and migrated, still ends it at once, with nothing
+taken yet to lose. On Ctrl-C, or the SIGTERM a service manager or a container runtime sends, the gateway:
 
 1. stops taking work: a request to the gateway that arrives is answered 503 `shutting_down` and not recorded,
    `/health` answers 503 `draining` so a load balancer stops sending requests here, and a dashboard's live stream
@@ -491,9 +498,33 @@ URL hash (`#/overview`, `#/activity`, `#/keys`, `#/connections`, `#/connect`, `#
   request, and the speed is measured over the rows whose counts an upstream reported rather than over
   estimated ones; when nothing reported timings those rows are not shown. Totals across accounts are in
   the Accounts view.
-- **Activity** — the last 50 recorded requests, newest first, with each one's input and output tokens,
-  plus usage by model for the eight models with the most tokens, input and output together, each split
-  into the two: every account's for an admin, and otherwise this account's own. The page says which.
+- **Activity** — the recorded requests, newest first, with each one's date and time in UTC, its input and
+  output tokens, latency and status, fifty to a page with older pages loaded on request, plus usage by model
+  for the eight models with the most tokens, input and output together, each split into the two: every
+  account's for an admin, and otherwise this account's own. The page says which. The requests can be narrowed
+  by key, account (for an admin), connection, model, outcome — answered, or an error status — and whole days
+  in UTC, both included; while a filter is set, a row that arrives is not put at the top, because it may not
+  match. While none is set, rows that arrive go on top and the view keeps the newest 500, or, once "Load
+  older" has been used, what it shows then and 500 more, so a page left open does not grow without end and a
+  page the reader asked for stays until that many rows have arrived on top of it; the ones it lets go are
+  still there with "Load older", and none are let go while an older page is being read. When filters are
+  applied twice in a row, only the later read lands, and filters the server refuses are not kept in place of
+  the ones before them. Signing out drops the rows and the filters, so whoever signs in next starts from their
+  own. **Export CSV** downloads every request the filters on the form match, not only the pages shown,
+  applying them first so a filter the server refuses, or a session that has ended, is reported on the page
+  rather than as a failed download. The file has the account, key, connection, model, status, whether it
+  streamed, whether the counts are the gateway's estimate, the tokens, the cache hit and the times; a figure
+  nothing reported is an empty cell rather than a zero, and a name that starts like a spreadsheet formula is
+  written with an apostrophe before it so it opens as text — at its start, after every `;`, at the start of
+  every line in it, and after a quote that opens one of those parts, because a spreadsheet in a locale that
+  separates lists with `;` splits the cell at a `;` and starts a new row at a line break, whatever the quotes
+  say. The file is UTF-8 without a byte-order mark, which some spreadsheets need to be told when they open it.
+  The history is `/api/stats/activity`, with `key`, `user`, `connection`, `model`, `outcome` (`ok` or
+  `error`), `since` and `until` (`YYYY-MM-DD`), `limit` (a whole number from 1, fifty when left out and read
+  as 500 above that) and `before` (the `next` the previous page gave); the file is `/api/stats/activity.csv`
+  with the same filters. A member's history is its own account's, and asking for another account's is refused;
+  a value left empty is left out, a value that cannot be read is answered 400 rather than ignored, and a
+  parameter the history does not take is ignored.
 - **Keys** — create, copy, rotate, disable and delete keys, with per-key usage split into input and output
   tokens (a key's token cap counts the two together), and a note when a key's binding points at a connection
   that is turned off. A key that is turned off stays listed and reads dimmer than the keys that work. The
@@ -519,11 +550,33 @@ URL hash (`#/overview`, `#/activity`, `#/keys`, `#/connections`, `#/connect`, `#
 - **Connections** — add and health-check upstreams. A connection that no check has reached yet reads "not
   checked yet" rather than down, here and in the gate readout on the Overview, because the gateway only puts
   one whose check failed behind the others. Beside its health is how many models its last list named, with the
-  names on hover, or "models unknown" when no list has been read. Admin-only, like the per-account figures,
-  and that rule is on the routes as well as on the page. The key a connection carries is returned to an admin
-  alone, and so is its address; every signed-in account still sees the connection itself — its name, health,
-  priority, default model and the ids its last list named — because the gate readout and the model list need
-  it; a key holder reads the ids of the connections that are turned on from `/v1/models` as well.
+  names on hover, or "models unknown" when no list has been read. A column shows each connection's last 24
+  hours, from `/api/stats/connections`, read when the view is opened rather than with every page, because it
+  reads a day of rows; a read that fails says so in the column and leaves the rest of the page as it is. The
+  column shows the requests the connection answered and how many of those answers were errors; how often it
+  failed a request it was sent — it could not be reached or gave no answer, its answer broke off, or its
+  stream went quiet for the stall window — and how many of those requests were passed on to another
+  connection, which is a failover; and the median and 95th percentile of how long its answers took, single
+  answers and streams apart, because a stream's time is its whole length. An answer that was an error is left
+  out of the times, so a refusal that comes back at once cannot make a connection look fast, and a time
+  nothing measured is left out rather than shown as zero. A stream that broke off or went quiet after its head
+  was sent is counted as a failure and not as an answer, and its time is left out too, because a stall would
+  put the whole stall window into it; a stream its client left, or one the gateway cut short while stopping,
+  keeps its row and its time. The failures are kept with the request while it runs and written together when
+  it ends, so going on to the next connection never waits for a write, and a failure that cannot be written is
+  logged and changes nothing for the request; a failure of a connection removed while the request ran is left
+  out, and the request's others are kept. They go to a table of their own, because a usage row only says which
+  connection answered; they go with a connection when it is removed, and the health round removes those older
+  than the day, because nothing reads them after it. A few things are counted as they are: a failure of the
+  model list counts against its connection and is never passed on, while a model list that was answered is not
+  counted as an answer; a single answer the gateway cut short while stopping is recorded as a 503 against the
+  connection that was working on it, so it shows among that connection's errors although the connection did
+  not fail; and a failure just before the gateway cut a request while stopping counts as passed on, because
+  the request had already gone on. Admin-only, like the per-account figures, and that rule is on the routes as
+  well as on the page. The key a connection carries is returned to an admin alone, and so is its address;
+  every signed-in account still sees the connection itself — its name, health, priority, default model and the
+  ids its last list named — because the gate readout and the model list need it; a key holder reads the ids of
+  the connections that are turned on from `/v1/models` as well.
 - **Connect a client** — the base URL, a key picker, a copyable curl request.
 - **Sandbox** — chat with any model a connection serves, through the same gateway the clients
   use, so the request is recorded like any other. Pick a key and a model from the gateway's
@@ -531,9 +584,11 @@ URL hash (`#/overview`, `#/activity`, `#/keys`, `#/connections`, `#/connect`, `#
   model that sends reasoning gets it as a separate section above the answer.
 - **Accounts** — per-account totals split into input and output tokens, beside what the account used
   today, which is the two together because that is what the daily limit counts, and everything an admin
-  can do to an account: the daily token limit, a new username, a new password, disable, delete, approve
-  an account that is waiting. Admin-only. This is also where an admin opens or closes self-registration,
-  turns approval on or off, and makes an account without opening registration.
+  can do to an account: the daily token limit, a new username, a new password, a new setup code, disable,
+  delete, approve an account that is waiting. Each account says whether it has a password yet and until when
+  a setup code given to it works. Admin-only. This is also where an admin opens or closes self-registration,
+  turns approval on or off, and makes an account without opening registration; the setup code for it, and for
+  every new one, is shown once in a dialog with a copy button.
 
 Every token figure on the page says which side of a request it counts: input tokens, what was sent in;
 output tokens, what the model generated; or the two together, where a figure is measured against a limit or
@@ -596,9 +651,24 @@ is nothing there to sign in to; Register is offered only while registration is o
 closed `POST /api/register` answers 403, so an admin either opens registration or makes the account
 themselves from the Accounts view.
 
-An account an admin makes has no password. The person who signs in with it for the first time
-chooses the password, and that is what is stored from then on; `POST /api/login` accepts whatever
-is entered while the account has no password hash.
+An account an admin makes has no password. Making it answers with a one-time setup code, shown to the
+admin once, in groups of four (`1a2b-3c4d-…`), which works for seven days: the person signs in with the
+username, the code and the password they choose — `POST /api/login` with `setup_code` beside `username`
+and `password` — and from then on that password is checked. Without the code nobody can set the
+password, so a username that is guessed cannot be claimed; a sign-in without one is answered as a wrong
+password, so the answer does not say which accounts are waiting for a code. A code is typed in any case,
+with or without its dashes. It is used once: two sign-ins with the same code at the same moment let one
+in, and the other is answered as the used code it has become. An admin gives any account a new code from
+the Accounts view (`POST /api/users/{id}/setup-code`), which replaces the one before it. For an account
+that has a password it is a reset that the person carries out, so the admin never learns the new
+password: the old one keeps working until the code is used, and using it signs out every session the
+account had. A password an admin sets directly cancels a code given before it. A wrong code, an expired
+one, and a code for a username nobody has get one answer; a password under eight characters given with a
+code is refused before the account is read. Only the code's bcrypt hash and the time it stops working
+are stored, so a copy of the database does not hand out the accounts waiting for one, and the Accounts
+view shows until when a code works, never the code. An account made before setup codes existed that
+never got a password has no code either, so nobody can sign in with it until an admin gives it one; the
+Accounts view marks it.
 
 New accounts are held for approval, on by default: `POST /api/register` answers 200 with
 `pending: true` and no session, and signing in answers 403 until an admin approves the account in
@@ -607,12 +677,17 @@ there; the first account is never held, because there is no one to approve it, a
 admin made is not held either, because that admin approved it by making it.
 
 An account is identified by its username, and the only fields are the username, the password,
-the role, the daily limit, whether it is enabled, and whether it is waiting for approval.
+the role, the daily limit, whether it is enabled, whether it is waiting for approval, and a setup
+code given to it, stored as its hash with the time it stops working. A code belongs to the account
+rather than to its name, so after a rename it is used with the new name.
 Disabling an account signs it out, refuses its keys at the gateway with 403, and stops a new
 sign-in; deleting it takes the account, its keys, its sessions and everything recorded for it,
 because those reference it with `ON DELETE CASCADE`. An admin cannot delete the account they are
 signed in with. Changing one field changes only that field, so setting a password does not clear a
-limit.
+limit. A password an admin sets cancels a setup code given before it and signs the account out, as a
+reset with a code does, because a password is set for someone most often when the old one is lost or
+known to someone else; an admin who sets their own password is signed out everywhere but the session
+they set it from, so that page stays signed in.
 
 It follows the system theme with a manual light/dark toggle next to Sign out, the sidebar collapses
 to an icon rail and becomes a drawer under 768px, and deleting a key, an account or a connection
@@ -633,8 +708,13 @@ a session or a DreamGate key.
   a session token travel in the clear, which is what the `0.0.0.0` default means on a shared network.
 - A session row is refused after the window the cookie lasts (30 days), so a token taken from a shared
   browser and replayed does not work forever.
-- Sign-in attempts are bounded to 10 per account per minute, and an unknown username answers exactly as
-  a wrong password does, so an attempt cannot be used to list the accounts. Registering does say when a
+- Sign-in attempts are bounded to 10 per account per minute, a code given with a sign-in counting like a
+  password, and an unknown username answers exactly as a wrong password does, so an attempt cannot be
+  used to list the accounts. It takes as long as one too: every refusal costs one bcrypt check, against
+  a hash nothing matches where there is nothing else to check — no account, no password yet, no code
+  given — so the time an answer takes does not say which usernames exist or which accounts are waiting
+  for a code. An account that is waiting for approval or disabled is told so before its password is
+  checked, which does say that it exists. Registering does say when a
   username is taken, because the person has to pick another, so while self-registration is open a name
   can be tried there; a name that is free becomes an account, held for approval by default. While
   registration is closed the answer is 403 before the name is checked against the accounts. A state-changing request
@@ -648,8 +728,8 @@ a session or a DreamGate key.
   four of its random characters, because a key is a credential that bills the account it belongs to; rotating
   another account's key does not hand the admin the new one either. This keeps keys off an admin's screen, not
   out of an admin's reach: an admin can set another account's password and sign in as it, and the owner would
-  notice only by their password no longer working. The keys are still stored as they are, so the database
-  itself is as sensitive as before.
+  notice only by being signed out and their password no longer working. The keys are still stored as they are,
+  so the database itself is as sensitive as before.
 - A key, its account and its limits are read from the database on every request, and a read that fails — a
   write holding the database past the busy timeout, a disk that fails — answers 503 `unavailable` with a short
   reference and is logged under it, rather than letting the request through unchecked: a limit that could not
@@ -669,15 +749,14 @@ a session or a DreamGate key.
   so an internal host and port, or a credential in a connection's address, does not reach a key holder; the
   whole error, with its causes, is logged as a warning under the connection's name.
 
-Two things are left as they are, and a public release should decide on them first. An account an admin
-makes has no password until its first sign-in, so whoever signs in with that username first is the one
-who sets it — the intended feature, but a guessed username can be claimed by anyone who reaches the
-instance. And bcrypt only reads the first 72 bytes of a password.
+One thing is left as it is, and a public release should decide on it first: bcrypt only reads the first 72
+bytes of a password.
 
-The moments around a first account are settled. Two first sign-ins at the same moment do not both get in:
-the password is written only where there is still none, and only while the account is still enabled and not
-held, so the one that lands second, or one that lands after an admin turned the account off, is answered
-exactly as a wrong password is, and the password that stays is the one whose sign-in was let in. Whether
+The moments around a first account are settled. Two sign-ins with the same setup code at the same moment do
+not both get in: the password is written only where the code is still the one that was checked, and only while
+the account is still enabled and not held, so the one that lands second, or one that lands after an admin
+turned the account off, is answered as a code that does not work, and the password that stays is the one whose
+sign-in was let in. Whether
 registration is open, the role, and whether a new account waits for approval are decided by the statement
 that inserts the account rather than by counting the accounts first, so registrations at the same moment on
 an empty instance make one admin, and the others are answered as registration being closed.
@@ -711,29 +790,49 @@ marked down that lists it going ahead of one that is up and does not, a connecti
 model being the ones matched, a connection's default moving no other connection for a model no list names,
 `:latest` matched both ways, a list with an entry without an id read as none and an empty one kept, a list that
 breaks off leaving the last one, the model list merging the lists in the order a key reaches them with the dates
-a check read and a
-connection marked down included,
-the model recorded for a streamed request when nothing is pinned to a key or a connection,
-per-key limits and their validation, a key's expiry refused when it has passed or is past the year 9999, refusing
-the key at the gateway and the model list once it has, set with an offset and kept in UTC, left as it is when a
-change leaves it out or is refused for another field, cleared with null or an empty string and left empty on a key
-written before it, a key's last use, not moved by a model list or a refused request, rotation keeping the id and
-the usage and refusing the old secret, refused without a JSON body and not found for a key that does not exist,
-an admin not given another account's new key or its key in the list, a member rotating their own key and given
-it, and a member unable to rotate another's, the per-key, per-account and per-model figures
-carrying the input and the output apart, including for a key or an account with no usage and after a key is
-deleted, the keys list being the
-caller's own with the other
+a check read and a connection marked down included, the activity history paged by row with each page
+naming the next, narrowed by key, account, model, outcome and whole UTC days, a member's history being
+its own and another account's refused, a filter that cannot be read refused, the CSV export carrying
+every matching row across the pages it is read in with empty cells for what nothing reported, quoting
+and a formula written as text at a cell's start, after a `;`, after a line break and after a quote that
+opens a part, a page larger than the most read as the most, a limit that cannot be read refused, a value
+left empty left out, a connection filter, a key deleted through the API reading as none with its row
+kept, a day ending before the first second of the next, a member's export its own rows and another
+account's key id giving it none, each connection's figures for the last day — a failure it
+passed on and one it could not, a failure before a full connection still passed on, a model list's failure
+never passed on, a single answer that broke off passed on and a stream that broke off counted as a failure and
+not as an answer, an error answer counted and left out of the times, rows older than the day left out, the
+answer and its time on the connection that gave it, a failure that cannot be written leaving the request as it
+was, the failures written when the client leaves, a connection removed while the request ran left out without
+losing the others, the health round removing failures older than the day, an admin's alone, gone with the
+connection when it is removed, and the table and its indexes added to a database written before them — the
+model recorded for a streamed request when nothing is pinned to a key or a connection, per-key limits and their
+validation, a key's expiry refused when it has passed or is past the year 9999, refusing the key at the gateway
+and the model list once it has, set with an offset and kept in UTC, left as it is when a change leaves it out or
+is refused for another field, cleared with null or an empty string and left empty on a key written before it, a
+key's last use, not moved by a model list or a refused request, rotation keeping the id and the usage and
+refusing the old secret, refused without a JSON body and not found for a key that does not exist, an admin not
+given another account's new key or its key in the list, a member rotating their own key and given it, and a
+member unable to rotate another's, the per-key, per-account and per-model figures carrying the input and the
+output apart, including for a key or an account with no usage and after a key is deleted, the keys list being
+the caller's own with the other
 accounts read by an admin alone, per-account daily token limits including the day
 boundary and the admin-only rule for setting one, the admin/user scoping of the stats
 queries and the split between a caller's own figures and the platform total, every account listed for an admin
 however many there are, including one past the twentieth by name that is waiting for approval, a taken username named when registering, including one held for approval, with any other failure
 answered as a server error, the registration setting being read before sign in and closed by default after the
 first account, approval being on by default and blocking a sign-in until an admin grants it, an
-account made by an admin with no password until its first sign-in, the account races, run against several
-database connections at once: many registrations at the same moment on an empty instance making one admin
-that is not held for approval, and two first sign-ins at the same moment on an account an admin made letting
-one in, with the other answered as a wrong password and the stored password the one that was let in, the account actions (disable,
+account made by an admin signed into only with its setup code, the code used once, typed in any case and without
+its dashes, and refused with one answer when it is wrong, expired, or given for a username nobody has, a new
+code resetting a password that keeps working until it is used, then signing out the account's sessions, a
+password the admin sets cancelling a code and signing the account out, the admin's own sessions included but the
+one it was set from, a code waiting for a disabled or pending account and working once it is let in, a blank
+code read as none, a code with no time refused, code sign-ins counting toward the attempt limit, a code working
+for seven days, an account from before codes with no password claimed by nobody until it is given one, the
+account races, run against several database connections at once: many registrations at the same moment on an
+empty instance making one admin that is not held for approval, and two sign-ins at the same moment with one
+setup code letting one in, with the other refused and the stored password the one that was let in, the account
+actions (disable,
 rename, new password, approve, delete) and what they do to a sign-in, a key and the recorded usage,
 that deleting a key leaves the rows recorded for it and the
 counters standing, the presence counts while a request is in flight, a stream's progress reaching the live
@@ -768,8 +867,9 @@ buckets that are cumulative, a usage row that could not be written by a single a
 in flight on the gateway and on its connection, and which connections are up — and, in a test binary of its own
 so its subscriber is the global one, the access log writing one line per request, a failure as much as a
 success, with neither its headers nor its query. The stall test in `tests/concurrency.rs` checks the stall count
-as well. A health check whose database does not answer within the second is not tested, because a database that
-hangs cannot be held still in a test.
+as well, and that the stall is written down against its connection, naming the stream's row. A health check whose
+database does not answer within the second is not tested, because a database that hangs cannot be held still in
+a test.
 
 The concurrency tests (`tests/concurrency.rs`) run the gateway against a mock upstream that counts how many
 requests it is working on at once, and check that requests are answered at the same time rather than one after
@@ -815,8 +915,13 @@ sends the process SIGTERM in the middle of the stream, and checks that the strea
 connection meanwhile is answered 503 `draining` at `/health` and 503 `shutting_down` at the gateway rather than
 refused, that the process stops on its own with a success even though the client keeps its connection open, and
 that the row is in the database file afterwards with no write-ahead log left beside it. Another sends the
-process three signals with nothing in flight and a request whose head is only half sent holding it open, and
-checks that the second does not stop it and the third does, with exit status 1. The stopping phases are also
+process three signals with nothing in flight and a request holding it open whose handler is waiting for a body
+that never comes, sent only once the server has answered it 100 Continue, and checks that the second does not
+stop it and the third does, with exit status 1. A unit test in `src/shutdown.rs` sends the process itself a
+SIGTERM, a SIGINT and another SIGTERM, each after the one before was taken in, and checks that none is lost.
+That the listeners are made before the listening line is printed is not tested, because a signal cannot be made
+to arrive in the moment between the two without holding the process there, which only a hook in it could do. The
+stopping phases are also
 tested in `tests/concurrency.rs`: a request that arrives while stopping is turned away with 503 and not
 recorded, and so is one that passed the first check and waited on the database while the drain ended; the model
 list and the health check say so; a stream in flight is let finish with the drain ending only once its row is

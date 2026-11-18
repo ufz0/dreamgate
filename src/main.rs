@@ -3,7 +3,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use dreamgate::shutdown::{self, Phase};
-use dreamgate::{build_router, db, limits, live, metrics, registry, state};
+use dreamgate::{auth, build_router, db, limits, live, metrics, registry, state};
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::filter::LevelFilter;
 
@@ -73,7 +73,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     tokio::spawn(registry::health_checker(st.clone()));
+    auth::prepare_refusals();
 
+    // Before the process says it is listening, so a stop sent from then on is met by the drain.
+    let signals = shutdown::Signals::listen()
+        .map_err(|err| format!("cannot listen for stop signals: {err}"))?;
     let addr = std::env::var("DREAMGATE_ADDR").unwrap_or_else(|_| "0.0.0.0:8787".to_string());
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     let bound = listener.local_addr()?;
@@ -87,7 +91,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "DREAMGATE_SHUTDOWN_GRACE_SECS",
         shutdown::DEFAULT_GRACE_SECS as usize,
     ) as u64);
-    tokio::spawn(shutdown::on_signal(st.clone(), grace));
+    tokio::spawn(shutdown::on_signal(st.clone(), grace, signals));
 
     // The server keeps taking connections while the requests in flight drain, so a request that arrives
     // then is answered 503 rather than refused, and stops once the drain is over, returning when the

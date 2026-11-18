@@ -39,6 +39,9 @@ pub fn build_router(st: State) -> Router {
         .route("/presence", routing::get(presence::summary))
         .route("/stats/summary", routing::get(stats::summary))
         .route("/stats/recent", routing::get(stats::recent))
+        .route("/stats/connections", routing::get(stats::connections))
+        .route("/stats/activity", routing::get(stats::activity))
+        .route("/stats/activity.csv", routing::get(stats::activity_export))
         .route("/live", routing::get(live::stream_events))
         .route("/keys", routing::get(keys::list).post(keys::create))
         .route("/keys/{id}/rotate", routing::post(keys::rotate))
@@ -48,6 +51,7 @@ pub fn build_router(st: State) -> Router {
             routing::patch(keys::update).delete(keys::delete),
         )
         .route("/users", routing::post(users::create))
+        .route("/users/{id}/setup-code", routing::post(users::setup_code))
         .route(
             "/users/{id}",
             routing::patch(users::update).delete(users::remove),

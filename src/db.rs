@@ -15,7 +15,9 @@ pub const SCHEMA: &[&str] = &[
         daily_token_cap INTEGER,
         enabled INTEGER NOT NULL DEFAULT 1,
         pending INTEGER NOT NULL DEFAULT 0,
-        created_at TEXT NOT NULL
+        created_at TEXT NOT NULL,
+        setup_code_hash TEXT,
+        setup_code_expires_at TEXT
     )",
     "CREATE TABLE IF NOT EXISTS sessions (
         token TEXT PRIMARY KEY,
@@ -67,6 +69,23 @@ pub const SCHEMA: &[&str] = &[
         estimated INTEGER NOT NULL DEFAULT 0,
         created_at TEXT NOT NULL
     )",
+    // Each time a connection failed a request: it could not be reached or gave no answer (`unreachable`), its
+    // answer broke off (`broken`), or its stream went quiet for the stall window (`stalled`), and whether the
+    // request was then passed on to another connection. A usage row says which connection answered; this is
+    // what the rows cannot say, the connections that were asked first and did not. A stream cut short after its
+    // head was sent has a usage row as well, which `usage_id` names, so its figures count it as a failure rather
+    // than as an answer that took that long; it is not a reference, because a failure says nothing more once
+    // the row is gone. A table of its own, made on start like every other, so a database written before it gains
+    // it empty; a connection's failures go with it when it is removed, because they only mean something beside
+    // the connection, and rows older than the figures' window are removed by the health round.
+    "CREATE TABLE IF NOT EXISTS connection_failures (
+        id INTEGER PRIMARY KEY,
+        connection_id INTEGER NOT NULL REFERENCES connections(id) ON DELETE CASCADE,
+        kind TEXT NOT NULL,
+        passed_on INTEGER NOT NULL DEFAULT 0,
+        usage_id INTEGER,
+        created_at TEXT NOT NULL
+    )",
     "CREATE TABLE IF NOT EXISTS settings (
         key TEXT PRIMARY KEY,
         value TEXT NOT NULL
@@ -81,6 +100,9 @@ const INDEXES: &[&str] = &[
     "CREATE INDEX IF NOT EXISTS idx_usage_created ON usage (created_at)",
     "CREATE INDEX IF NOT EXISTS idx_usage_key ON usage (api_key_id)",
     "CREATE INDEX IF NOT EXISTS idx_usage_user ON usage (user_id)",
+    "CREATE INDEX IF NOT EXISTS idx_failures_created ON connection_failures (created_at)",
+    // Removing a connection removes its failures, which would otherwise read the whole table to find them.
+    "CREATE INDEX IF NOT EXISTS idx_failures_connection ON connection_failures (connection_id)",
 ];
 
 async fn has_column<'e, E>(db: E, table: &str, column: &str) -> Result<bool, sqlx::Error>
@@ -265,6 +287,7 @@ pub async fn migrate(pool: &SqlitePool) -> Result<(), sqlx::Error> {
     add_connection_limit(pool).await?;
     add_connection_models(pool).await?;
     add_key_expiry(pool).await?;
+    add_setup_codes(pool).await?;
     relax_key_reference(pool).await?;
     for statement in INDEXES {
         sqlx::query(*statement).execute(pool).await?;
@@ -283,6 +306,23 @@ async fn add_usage_columns(pool: &SqlitePool) -> Result<(), sqlx::Error> {
             continue;
         }
         let statement = format!("ALTER TABLE usage ADD COLUMN {column} INTEGER");
+        sqlx::query(sqlx::AssertSqlSafe(statement.as_str()))
+            .execute(pool)
+            .await?;
+    }
+    Ok(())
+}
+
+// A setup code is how the person an admin made an account for, or gave a new code to, sets its password. Both
+// columns are nullable, so an account written before the change reads as having no code: one with a password
+// signs in with it as before, and one without waits for an admin to give it a code, because no code means
+// nothing can set its password.
+async fn add_setup_codes(pool: &SqlitePool) -> Result<(), sqlx::Error> {
+    for column in ["setup_code_hash", "setup_code_expires_at"] {
+        if has_column(pool, "users", column).await? {
+            continue;
+        }
+        let statement = format!("ALTER TABLE users ADD COLUMN {column} TEXT");
         sqlx::query(sqlx::AssertSqlSafe(statement.as_str()))
             .execute(pool)
             .await?;

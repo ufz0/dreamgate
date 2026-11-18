@@ -23,9 +23,11 @@
       <button type="button" id="mode-login" aria-pressed="true">Sign in</button>
     </div>
     <p class="note" id="register-note" hidden>Self-registration is closed, so an admin has to open it before a new account can be made.</p>
-    <p class="note" id="first-password-note" hidden>For an account an admin made, the first password you enter here becomes your own.</p>
+    <p class="note" id="first-password-note" hidden>For an account an admin made, or a password an admin reset, sign in with the setup code they gave you and choose your password.</p>
     <label>Username<input name="username" autocomplete="username" required></label>
-    <label>Password<input name="password" type="password" minlength="8" required></label>
+    <label id="setup-code-field" hidden>Setup code<input name="setup_code" autocomplete="one-time-code" spellcheck="false"></label>
+    <label><span id="password-label">Password</span><input name="password" id="auth-password" type="password" minlength="8" autocomplete="current-password" required></label>
+    <button type="button" class="link" id="setup-code-toggle" aria-expanded="false" hidden>I have a setup code</button>
     <button type="submit" id="auth-submit">Sign in</button>
     <p class="notice" id="auth-error" role="status"></p>
   </form>
@@ -126,12 +128,27 @@
       <section class="view" data-view="activity" hidden>
         <h1>Activity</h1>
         <p class="lede" id="activity-lede"></p>
+        <form id="activity-filters" class="filters">
+          <label class="field">Key<select name="key" id="activity-key"></select></label>
+          <label class="field" id="activity-user-field">Account<select name="user" id="activity-user"></select></label>
+          <label class="field">Connection<select name="connection" id="activity-connection"></select></label>
+          <label class="field">Model<input name="model" list="activity-models" autocomplete="off"><datalist id="activity-models"></datalist></label>
+          <label class="field">Outcome<select name="outcome"><option value="">Any</option><option value="ok">Answered</option><option value="error">Errors</option></select></label>
+          <label class="field">From<input name="since" type="date"></label>
+          <label class="field">To<input name="until" type="date"></label>
+          <div class="filter-actions">
+            <button type="submit">Show</button>
+            <button type="button" class="secondary" id="activity-clear">Clear</button>
+            <button type="button" class="secondary" id="activity-export">Export CSV</button>
+          </div>
+        </form>
         <div class="table">
           <table id="activity">
             <thead id="activity-head"></thead>
             <tbody id="activity-body"></tbody>
           </table>
         </div>
+        <p class="value-line"><button type="button" class="link" id="activity-older" hidden>Load older requests</button></p>
         <h2>Usage by model, the eight with the most tokens, input and output together</h2>
         <div class="table">
           <table id="models">
@@ -225,7 +242,7 @@
         <div class="table">
           <table id="connections">
             <thead>
-              <tr><th>Connection</th><th>Base URL</th><th>Default model</th><th>Priority</th><th>Health</th><th><span class="visually-hidden">Actions</span></th></tr>
+              <tr><th>Connection</th><th>Base URL</th><th>Default model</th><th>Priority</th><th>Health</th><th>Last 24 hours</th><th><span class="visually-hidden">Actions</span></th></tr>
             </thead>
             <tbody id="connections-body"></tbody>
           </table>
@@ -314,6 +331,15 @@
 </div>
 
 <div class="scrim" id="scrim"></div>
+
+<dialog id="setup-code">
+  <h2 id="setup-code-title">Setup code</h2>
+  <p id="setup-code-text"></p>
+  <p class="value-line"><code id="setup-code-value"></code><button type="button" class="link" data-copy-from="setup-code-value">Copy code</button></p>
+  <div class="actions">
+    <button type="button" class="link" id="setup-code-close">Done</button>
+  </div>
+</dialog>
 
 <dialog id="confirm">
   <h2 id="confirm-title">Confirm</h2>
