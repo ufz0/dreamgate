@@ -14,16 +14,14 @@ usage: dreamgate              serve the gateway and the dashboard, configured th
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    match args
-        .iter()
-        .map(String::as_str)
-        .collect::<Vec<_>>()
-        .as_slice()
-    {
-        [] => {}
-        ["backup", target] => std::process::exit(backup(target).await),
-        ["help" | "-h" | "--help"] => {
+    // Read without assuming the arguments are text, so one that is not is answered with the usage rather
+    // than with a panic.
+    let args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
+    let args: Option<Vec<&str>> = args.iter().map(|arg| arg.to_str()).collect();
+    match args.as_deref() {
+        Some([]) => {}
+        Some(["backup", target]) => std::process::exit(backup(target).await),
+        Some(["help" | "-h" | "--help"]) => {
             println!("{USAGE}");
             return Ok(());
         }

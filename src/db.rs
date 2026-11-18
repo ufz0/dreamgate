@@ -157,22 +157,36 @@ pub const ACQUIRE_TIMEOUT: Duration = Duration::from_secs(30);
 // A copy of the database that can be taken while the gateway runs. Copying the file is not one: with WAL,
 // committed rows can still be in the -wal file beside it, and a copy taken during a write is torn.
 // `VACUUM INTO` writes a consistent snapshot to a new file instead. The database is opened as it is, not
-// created and not migrated, because a backup must not change what it copies; SQLite refuses a target that
-// already exists, so an earlier backup is never overwritten. The copy holds every key the gateway stores,
-// upstream keys included, so on Unix it is made readable by its owner alone.
+// created and not migrated, because a backup must not change what it copies.
+//
+// The copy holds every key the gateway stores, upstream keys included. SQLite would make the file with the
+// process's umask, readable by anyone on the machine while it is written, and would write into an empty file
+// or through a link someone else left in a shared directory. So the file is made here first, by this process
+// alone, refusing anything already at that path and, on Unix, readable by its owner alone from the start;
+// SQLite writes into it and gives its journal the same mode. A copy that fails partway is removed with its
+// journal, because a partial copy holds keys too. The path is made absolute, because SQLite reads a name that
+// starts with `file:` as a URI rather than as a file.
 pub async fn backup(url: &str, target: &std::path::Path) -> Result<(), sqlx::Error> {
+    let target = std::path::absolute(target)?;
     let options = SqliteConnectOptions::from_str(url)?.busy_timeout(Duration::from_secs(5));
     let mut connection = SqliteConnection::connect_with(&options).await?;
-    sqlx::query("VACUUM INTO ?")
+    let mut file = std::fs::OpenOptions::new();
+    file.write(true).create_new(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut file, 0o600);
+    drop(file.open(&target)?);
+    let written = sqlx::query("VACUUM INTO ?")
         .bind(target.to_string_lossy().into_owned())
         .execute(&mut connection)
-        .await?;
-    connection.close().await?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(target, std::fs::Permissions::from_mode(0o600))?;
+        .await;
+    if let Err(err) = written {
+        let _ = std::fs::remove_file(&target);
+        let mut journal = target.into_os_string();
+        journal.push("-journal");
+        let _ = std::fs::remove_file(journal);
+        return Err(err);
     }
+    connection.close().await?;
     Ok(())
 }
 

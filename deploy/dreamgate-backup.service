@@ -1,0 +1,17 @@
+# A daily backup for the unit in dreamgate.service, as /etc/systemd/system/dreamgate-backup.service, started by
+# dreamgate-backup.timer beside it.
+#
+# It runs as root, because the state directory of a service with a dynamic user is readable by that user
+# alone. That is safe for the database: SQLite gives the -wal and -shm files it makes to the database's
+# owner, so the service can still open them. The copy is written by root and readable by root alone, and
+# the backup refuses a file that is already there. /var/backups/dreamgate has to exist.
+
+[Unit]
+Description=DreamGate database backup
+
+[Service]
+Type=oneshot
+Environment=DREAMGATE_DB=/var/lib/dreamgate/dreamgate.db
+# systemd expands neither $(...) nor a date, so a shell names the file; %% and $$ are how a unit writes a
+# literal % and $.
+ExecStart=/bin/sh -c 'exec /usr/local/bin/dreamgate backup /var/backups/dreamgate/dreamgate-$$(date +%%F).db'

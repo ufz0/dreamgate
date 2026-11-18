@@ -17,6 +17,7 @@ pub mod tokens;
 pub mod usage;
 pub mod users;
 
+use axum::extract::DefaultBodyLimit;
 use axum::{Router, middleware, routing};
 use tower_http::services::ServeDir;
 
@@ -80,5 +81,10 @@ pub fn build_router(st: State) -> Router {
         .nest("/api", public.merge(private))
         .fallback_service(ServeDir::new("web"))
         .with_state(st)
+        // The largest request body taken, which is axum's default, stated so that the README and the
+        // proxy recipe in it do not change with an upgrade of axum.
+        .layer(DefaultBodyLimit::max(BODY_LIMIT))
         .layer(middleware::from_fn(metrics::access_log))
 }
+
+pub const BODY_LIMIT: usize = 2 * 1024 * 1024;

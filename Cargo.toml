@@ -2,8 +2,10 @@
 name = "dreamgate"
 version = "0.1.0"
 edition = "2024"
-# Packages in the lockfile need at least this; CI and rust-toolchain.toml pin the one the code is formatted with.
-rust-version = "1.88"
+# sqlx 0.9 needs at least this, the highest of the packages in the lockfile. Edition 2024 resolves dependencies
+# to versions this Rust can build, so a lower number here would steer an update to older packages. CI and
+# rust-toolchain.toml pin the toolchain the code is formatted with.
+rust-version = "1.94"
 
 [dependencies]
 axum = "0.8"
