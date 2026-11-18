@@ -141,15 +141,15 @@ fn disabled_account(row: &SqliteRow) -> Option<Response> {
 }
 
 // What the rows say a key and its account have used, read here and then checked together with the requests
-// still in flight in one step (`reservations`), so requests sent at the same moment cannot all pass on the
-// same reading. What comes back is the request's hold, settled once its row is written; a refusal is the
-// answer the request is given, boxed because an answer is large and is only built when one is refused.
+// the rows cannot show yet in one step (`reservations`), so requests sent at the same moment cannot all pass on
+// the same reading. A limit the rows alone have reached refuses at once, without the reads after it. What comes
+// back is the request's hold, settled once its row is written; a refusal is the answer the request is given,
+// boxed because an answer is large and is only built when one is refused.
 async fn enforce_limits(
     st: &State,
     key: &KeyInfo,
     prompt_tokens: i64,
 ) -> Result<Reservation, Box<Response>> {
-    let read_at = Instant::now();
     // The account is checked before its limits, because a disabled account cannot use a key at
     // all. The account limit counts the current day only and resets at 00:00 UTC, matching the
     // UTC text the usage rows are stored as. It is checked after the key cap, so a key cannot
@@ -162,57 +162,7 @@ async fn enforce_limits(
     if let Some(blocked) = disabled_account(&account) {
         return Err(Box::new(blocked));
     }
-    let rpm = match key.rpm_limit {
-        Some(limit) => match sqlx::query(
-            "SELECT COUNT(*) AS n FROM usage WHERE api_key_id = ? \
-             AND strftime('%Y-%m-%d %H:%M:%S', created_at) >= datetime('now', '-1 minute')",
-        )
-        .bind(key.id)
-        .fetch_one(&st.pool)
-        .await
-        {
-            Ok(row) => Some((limit, row.get::<i64, _>("n"))),
-            Err(err) => return Err(Box::new(unreadable(err))),
-        },
-        None => None,
-    };
-    let key_cap = match key.token_cap {
-        Some(cap) => match sqlx::query(
-            "SELECT COALESCE(SUM(total_tokens), 0) AS used FROM usage WHERE api_key_id = ?",
-        )
-        .bind(key.id)
-        .fetch_one(&st.pool)
-        .await
-        {
-            Ok(row) => Some((cap, row.get::<i64, _>("used"))),
-            Err(err) => return Err(Box::new(unreadable(err))),
-        },
-        None => None,
-    };
-    let day_cap = match account.get::<Option<i64>, _>("daily_token_cap") {
-        Some(cap) => match sqlx::query(
-            "SELECT COALESCE(SUM(total_tokens), 0) AS used FROM usage \
-             WHERE user_id = ? AND strftime('%Y-%m-%d', created_at) = date('now')",
-        )
-        .bind(key.user_id)
-        .fetch_one(&st.pool)
-        .await
-        {
-            Ok(row) => Some((cap, row.get::<i64, _>("used"))),
-            Err(err) => return Err(Box::new(unreadable(err))),
-        },
-        None => None,
-    };
-    let ask = Ask {
-        key_id: key.id,
-        user_id: key.user_id,
-        prompt_tokens,
-        read_at,
-        rpm,
-        key_cap,
-        day_cap,
-    };
-    st.reservations.reserve(ask).map_err(|refusal| {
+    let refuse = |refusal: Refusal| -> Box<Response> {
         Box::new(match refusal {
             Refusal::RateLimit { limit } => error(
                 StatusCode::TOO_MANY_REQUESTS,
@@ -240,8 +190,88 @@ async fn enforce_limits(
                     in_flight_note(in_flight)
                 ),
             ),
+            // As with a limit that could not be read: a limit not known to be unreached is not one that was
+            // not reached.
+            Refusal::Stale => {
+                tracing::warn!(
+                    "the limits of key '{}' took too long to read to be checked against the requests in flight",
+                    key.name
+                );
+                error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "unavailable",
+                    "this key's limits could not be read in time; try again",
+                )
+            }
         })
-    })
+    };
+    let read_at = Instant::now();
+    let rpm = match key.rpm_limit {
+        Some(limit) => match sqlx::query(
+            "SELECT COUNT(*) AS n FROM usage WHERE api_key_id = ? \
+             AND strftime('%Y-%m-%d %H:%M:%S', created_at) >= datetime('now', '-1 minute')",
+        )
+        .bind(key.id)
+        .fetch_one(&st.pool)
+        .await
+        {
+            Ok(row) => Some((limit, row.get::<i64, _>("n"))),
+            Err(err) => return Err(Box::new(unreadable(err))),
+        },
+        None => None,
+    };
+    if let Some((limit, recorded)) = rpm
+        && recorded >= limit
+    {
+        return Err(refuse(Refusal::RateLimit { limit }));
+    }
+    let key_cap = match key.token_cap {
+        Some(cap) => match sqlx::query(
+            "SELECT COALESCE(SUM(total_tokens), 0) AS used FROM usage WHERE api_key_id = ?",
+        )
+        .bind(key.id)
+        .fetch_one(&st.pool)
+        .await
+        {
+            Ok(row) => Some((cap, row.get::<i64, _>("used"))),
+            Err(err) => return Err(Box::new(unreadable(err))),
+        },
+        None => None,
+    };
+    if let Some((cap, used)) = key_cap
+        && used >= cap
+    {
+        return Err(refuse(Refusal::KeyCap { cap, in_flight: 0 }));
+    }
+    let day_cap = match account.get::<Option<i64>, _>("daily_token_cap") {
+        Some(cap) => match sqlx::query(
+            "SELECT COALESCE(SUM(total_tokens), 0) AS used FROM usage \
+             WHERE user_id = ? AND strftime('%Y-%m-%d', created_at) = date('now')",
+        )
+        .bind(key.user_id)
+        .fetch_one(&st.pool)
+        .await
+        {
+            Ok(row) => Some((cap, row.get::<i64, _>("used"))),
+            Err(err) => return Err(Box::new(unreadable(err))),
+        },
+        None => None,
+    };
+    if let Some((cap, used)) = day_cap
+        && used >= cap
+    {
+        return Err(refuse(Refusal::DayCap { cap, in_flight: 0 }));
+    }
+    let ask = Ask {
+        key_id: key.id,
+        user_id: key.user_id,
+        prompt_tokens,
+        read_at,
+        rpm,
+        key_cap,
+        day_cap,
+    };
+    st.reservations.reserve(ask).map_err(refuse)
 }
 
 // A cap reached with requests still running counts their input as the gateway estimated it, so the answer
@@ -433,12 +463,15 @@ fn drain_buffer(buffer: &mut Vec<u8>, generated: &mut String, report: &mut Repor
     }
 }
 
-async fn record(st: &State, row: &UsageRow) {
+// A row that could not be written settles the request's hold all the same: the rows are what the limits
+// count, and a lost row is counted as one (`/metrics`) rather than held against a limit for ever.
+async fn record(st: &State, row: &UsageRow, reservation: &mut Reservation) {
     st.metrics.recorded(row);
-    if let Err(err) = usage::record(st, row).await {
+    if let Err(err) = usage::record(st, row, || reservation.settle()).await {
         st.metrics.usage_write_failure();
         tracing::error!("usage record failed: {err}");
     }
+    reservation.settle();
 }
 
 // What the stream task still needs after the handler has returned, passed as one value rather
@@ -600,7 +633,7 @@ fn stream_body(
         // row's event, so a page goes from one to the other without a moment showing neither. The row is
         // counted for `/metrics` here as well, because it does not go through `record`.
         ctx.st.metrics.recorded(&row);
-        let event = match usage::write(&ctx.st, &row).await {
+        let event = match usage::write(&ctx.st, &row, || ctx.reservation.settle()).await {
             Ok(event) => Some(event),
             Err(err) => {
                 ctx.st.metrics.usage_write_failure();
@@ -731,6 +764,9 @@ pub async fn chat_completions(
         // The upstream's answer says which model it used, but that is not read here.
         let model = model.unwrap_or_else(|| String::from("unknown"));
         attempted = true;
+        // From here the upstream is asked, so the request keeps its place in the minute even if its client
+        // leaves before a row is written.
+        reservation.sent();
         let mut request = st
             .http
             .post(&url)
@@ -878,9 +914,9 @@ pub async fn chat_completions(
                 created_at: crate::clock::now(),
                 stream: None,
             },
+            &mut reservation,
         )
         .await;
-        reservation.settle();
 
         let mut out = Response::new(Body::empty());
         *out.status_mut() = status;
@@ -935,9 +971,9 @@ pub async fn chat_completions(
             created_at: crate::clock::now(),
             stream: None,
         },
+        &mut reservation,
     )
     .await;
-    reservation.settle();
     // Ended by the gateway because it was stopping, not by a connection that failed.
     if cut.is_some() {
         return shutting_down();

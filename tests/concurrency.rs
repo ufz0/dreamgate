@@ -1315,8 +1315,10 @@ async fn a_key_cap_counts_the_input_of_requests_still_running() {
     set_key_limits(&st, "dreamgate_test", None, Some(1)).await;
     let router = build_router(st.clone());
 
+    // Markers from one, because the mock reports the marker as its usage, and a row of nothing would leave
+    // the cap unreached for a check that runs after it.
     let responses =
-        join_all((0..10).map(|n| gateway_call(&router, "dreamgate_test", n, false))).await;
+        join_all((1..=10).map(|n| gateway_call(&router, "dreamgate_test", n, false))).await;
     let answers = answers(responses).await;
     assert_eq!(
         answers.iter().filter(|(s, _)| *s == StatusCode::OK).count(),
@@ -1353,8 +1355,10 @@ async fn an_account_daily_limit_counts_the_input_of_requests_still_running() {
         .unwrap();
     let router = build_router(st.clone());
 
+    // Markers from one, because the mock reports the marker as its usage, and a row of nothing would leave
+    // the cap unreached for a check that runs after it.
     let responses =
-        join_all((0..10).map(|n| gateway_call(&router, "dreamgate_test", n, false))).await;
+        join_all((1..=10).map(|n| gateway_call(&router, "dreamgate_test", n, false))).await;
     let answers = answers(responses).await;
     assert_eq!(
         answers.iter().filter(|(s, _)| *s == StatusCode::OK).count(),
@@ -1413,6 +1417,96 @@ async fn a_request_turned_away_at_a_full_connection_gives_its_place_in_the_minut
     .await;
     assert_eq!(third[0].0, StatusCode::TOO_MANY_REQUESTS);
     assert_eq!(third[0].1["error"]["type"], "rate_limit");
+}
+
+// The rows of the last minute still count after a restart, which empties what the gateway holds in the
+// process: they add to the requests that arrive together, rather than standing in for them.
+#[tokio::test]
+async fn after_a_restart_the_rows_of_the_last_minute_add_to_a_burst() {
+    let mock = Mock::new(200, 0);
+    let st = test_state(test_limits(64, 64), 8).await;
+    let base_url = mock_upstream(&mock).await;
+    seed(&st, "ada", &base_url, "dreamgate_test", None).await;
+    set_key_limits(&st, "dreamgate_test", Some(2), None).await;
+    let before = build_router(st.clone());
+    assert_eq!(
+        gateway_call(&before, "dreamgate_test", 1, false)
+            .await
+            .status(),
+        StatusCode::OK
+    );
+
+    let mut restarted = st.clone();
+    restarted.reservations = Default::default();
+    let router = build_router(restarted);
+    let responses =
+        join_all((0..20).map(|n| gateway_call(&router, "dreamgate_test", n, false))).await;
+    let admitted = responses
+        .iter()
+        .filter(|response| response.status() == StatusCode::OK)
+        .count();
+    assert_eq!(admitted, 1, "the row from before the restart did not count");
+}
+
+// A single answer whose client leaves after it reached a connection is not recorded, because the request is
+// dropped with the client's connection, but the upstream was asked, so it keeps its place in the minute.
+#[tokio::test]
+async fn a_request_whose_client_left_after_it_reached_a_connection_keeps_its_place_in_the_minute() {
+    let mock = Mock::new(2000, 0);
+    let st = test_state(test_limits(64, 64), 8).await;
+    let base_url = mock_upstream(&mock).await;
+    seed(&st, "ada", &base_url, "dreamgate_test", None).await;
+    set_key_limits(&st, "dreamgate_test", Some(1), None).await;
+    let router = build_router(st.clone());
+
+    let leaving = {
+        let router = router.clone();
+        tokio::spawn(async move { gateway_call(&router, "dreamgate_test", 1, false).await })
+    };
+    for _ in 0..200 {
+        if mock.peak() == 1 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(mock.peak(), 1, "the request never reached the mock");
+    leaving.abort();
+    let _ = leaving.await;
+
+    let next = answers(vec![
+        gateway_call(&router, "dreamgate_test", 2, false).await,
+    ])
+    .await;
+    assert_eq!(next[0].0, StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(next[0].1["error"]["type"], "rate_limit");
+}
+
+// A disabled account is answered as disabled even when its key is also at a limit, because the account is
+// checked before the limits.
+#[tokio::test]
+async fn a_disabled_account_is_answered_as_disabled_before_its_keys_limit() {
+    let mock = Mock::new(0, 0);
+    let st = test_state(test_limits(64, 64), 8).await;
+    let base_url = mock_upstream(&mock).await;
+    seed(&st, "ada", &base_url, "dreamgate_test", None).await;
+    set_key_limits(&st, "dreamgate_test", Some(1), None).await;
+    let router = build_router(st.clone());
+    assert_eq!(
+        gateway_call(&router, "dreamgate_test", 1, false)
+            .await
+            .status(),
+        StatusCode::OK
+    );
+    sqlx::query("UPDATE users SET enabled = 0")
+        .execute(&st.pool)
+        .await
+        .unwrap();
+    let refused = answers(vec![
+        gateway_call(&router, "dreamgate_test", 2, false).await,
+    ])
+    .await;
+    assert_eq!(refused[0].0, StatusCode::FORBIDDEN);
+    assert_eq!(refused[0].1["error"]["type"], "account_disabled");
 }
 
 // Not part of the normal run: it measures, so it is only read when asked for. Run with
