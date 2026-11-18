@@ -1670,6 +1670,17 @@ async fn the_health_check_round_marks_a_connection_that_answers() {
     // The first round runs as soon as the task starts, and the mock answers at once, so the window is
     // far longer than the round needs. A round that stops is only started again after 30 seconds, so a
     // round that cannot read the row is caught here as a row that still reads unknown.
+    // A failure older than the figures' window is removed after the round, and a recent one is kept.
+    for at in ["2020-01-01T00:00:00Z".to_string(), dreamgate::clock::now()] {
+        sqlx::query(
+            "INSERT INTO connection_failures (connection_id, kind, created_at) VALUES (?, 'unreachable', ?)",
+        )
+        .bind(id)
+        .bind(at)
+        .execute(&st.pool)
+        .await
+        .unwrap();
+    }
     let round = tokio::spawn(dreamgate::registry::health_checker(st.clone()));
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
@@ -1678,12 +1689,16 @@ async fn the_health_check_round_marks_a_connection_that_answers() {
             .fetch_one(&st.pool)
             .await
             .unwrap();
-        if health == "ok" {
+        let failures: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM connection_failures")
+            .fetch_one(&st.pool)
+            .await
+            .unwrap();
+        if health == "ok" && failures == 1 {
             break;
         }
         assert!(
             Instant::now() < deadline,
-            "the connection still reads {health} after the first round"
+            "the connection still reads {health}, with {failures} failures, after the first round"
         );
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
@@ -6202,4 +6217,69 @@ async fn the_failures_table_is_added_to_a_database_written_before_it() {
             "idx_failures_created"
         ]
     );
+}
+
+// A request whose client leaves while a later connection is still working on it still has the failures it met
+// written, from where they were dropped; and a failure of a connection removed while the request ran is left out
+// without losing the others.
+#[tokio::test]
+async fn failures_are_written_when_the_client_leaves_and_a_removed_connection_loses_no_others() {
+    let app = Router::new().route(
+        "/v1/chat/completions",
+        post(|| async {
+            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+            Json(json!({}))
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+    let st = test_state().await;
+    let router = build_router(st.clone());
+    let cookie = register(&router, "ada").await;
+    let mut dead = Vec::new();
+    for (name, priority) in [("dead-1", 0), ("dead-2", 1)] {
+        let (_, created) = post_json(
+            &router,
+            "/api/connections",
+            &cookie,
+            json!({ "name": name, "base_url": "http://127.0.0.1:1", "priority": priority }),
+        )
+        .await;
+        dead.push(created);
+    }
+    post_json(
+        &router,
+        "/api/connections",
+        &cookie,
+        json!({ "name": "slow", "base_url": format!("http://{addr}"), "priority": 2 }),
+    )
+    .await;
+    let (_, created) = post_json(&router, "/api/keys", &cookie, json!({ "name": "k" })).await;
+    let key = created["key"].as_str().unwrap().to_string();
+
+    let mut request = Box::pin(gateway_call(
+        &router,
+        &key,
+        json!({ "model": "m", "messages": [{ "role": "user", "content": "hi" }] }),
+    ));
+    // The client stays until both dead connections have failed and the slow one has the request, then the first
+    // is removed and the client leaves.
+    let _ = tokio::time::timeout(std::time::Duration::from_millis(500), &mut request).await;
+    let removed = call(
+        &router,
+        Request::delete(format!("/api/connections/{}", dead[0]["id"]))
+            .header("cookie", &cookie)
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(removed.status(), StatusCode::OK);
+    drop(request);
+
+    let failures = failures_written(&st.pool, 1).await;
+    assert_eq!(failures.len(), 1, "{failures:?}");
+    assert_eq!(failures[0]["connection_id"], dead[1]["id"]);
+    assert_eq!(failures[0]["passed_on"], true);
 }

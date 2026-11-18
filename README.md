@@ -514,18 +514,19 @@ URL hash (`#/overview`, `#/activity`, `#/keys`, `#/connections`, `#/connect`, `#
   put the whole stall window into it; a stream its client left, or one the gateway cut short while stopping,
   keeps its row and its time. The failures are kept with the request while it runs and written together when
   it ends, so going on to the next connection never waits for a write, and a failure that cannot be written is
-  logged and changes nothing for the request. They go to a table of their own, because a usage row only says
-  which connection answered; they go with a connection when it is removed, and the health round removes those
-  older than the day, because nothing reads them after it. A few things are counted as they are: a failure of
-  the model list counts against its connection and is never passed on, while a model list that was answered is
-  not counted as an answer; a single answer the gateway cut short while stopping is recorded as a 503 against
-  the connection that was working on it, so it shows among that connection's errors although the connection
-  did not fail; and a failure just before the gateway cut a request while stopping counts as passed on,
-  because the request had already gone on. Admin-only, like the per-account figures, and that rule is on the
-  routes as well as on the page. The key a connection carries is returned to an admin alone, and so is its
-  address; every signed-in account still sees the connection itself — its name, health, priority, default
-  model and the ids its last list named — because the gate readout and the model list need it; a key holder
-  reads the ids of the connections that are turned on from `/v1/models` as well.
+  logged and changes nothing for the request; a failure of a connection removed while the request ran is left
+  out, and the request's others are kept. They go to a table of their own, because a usage row only says which
+  connection answered; they go with a connection when it is removed, and the health round removes those older
+  than the day, because nothing reads them after it. A few things are counted as they are: a failure of the
+  model list counts against its connection and is never passed on, while a model list that was answered is not
+  counted as an answer; a single answer the gateway cut short while stopping is recorded as a 503 against the
+  connection that was working on it, so it shows among that connection's errors although the connection did
+  not fail; and a failure just before the gateway cut a request while stopping counts as passed on, because
+  the request had already gone on. Admin-only, like the per-account figures, and that rule is on the routes as
+  well as on the page. The key a connection carries is returned to an admin alone, and so is its address;
+  every signed-in account still sees the connection itself — its name, health, priority, default model and the
+  ids its last list named — because the gate readout and the model list need it; a key holder reads the ids of
+  the connections that are turned on from `/v1/models` as well.
 - **Connect a client** — the base URL, a key picker, a copyable curl request.
 - **Sandbox** — chat with any model a connection serves, through the same gateway the clients
   use, so the request is recorded like any other. Pick a key and a model from the gateway's
@@ -711,8 +712,10 @@ passed on and one it could not, a failure before a full connection still passed 
 never passed on, a single answer that broke off passed on and a stream that broke off counted as a failure and
 not as an answer, an error answer counted and left out of the times, rows older than the day left out, the
 answer and its time on the connection that gave it, a failure that cannot be written leaving the request as it
-was, an admin's alone, gone with the connection when it is removed, and the table and its indexes added to a
-database written before them — the model recorded for a streamed request when nothing is pinned to a key or a
+was, the failures written when the client leaves, a connection removed while the request ran left out without
+losing the others, the health round removing failures older than the day, an admin's alone, gone with the
+connection when it is removed, and the table and its indexes added to a database written before them — the
+model recorded for a streamed request when nothing is pinned to a key or a
 connection,
 per-key limits and their validation, the per-key, per-account and per-model figures carrying the input and the
 output apart, including for a key or an account with no usage and after a key is deleted, the keys list being the

@@ -362,8 +362,10 @@ async function refresh(path) {
     state.keys = (await api('/api/keys')).keys;
     await loadOtherKeys();
   }
+  // The connections are shown as soon as they are read, and their figures, which read a day of rows, follow.
   if (path === 'connections') {
     state.connections = (await api('/api/connections')).connections;
+    render(false);
     await loadConnectionFigures();
   }
   if (path === 'stats') state.summary = await api('/api/stats/summary');

@@ -188,8 +188,14 @@ impl Drop for Failures {
         }
         let pending = std::mem::take(&mut self.pending);
         let st = self.st.clone();
-        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
-            runtime.spawn(async move { write_failures(&st, pending).await });
+        match tokio::runtime::Handle::try_current() {
+            Ok(runtime) => {
+                runtime.spawn(async move { write_failures(&st, pending).await });
+            }
+            Err(_) => tracing::warn!(
+                "{} connection failures were let go with no runtime to write them",
+                pending.len()
+            ),
         }
     }
 }
@@ -198,8 +204,11 @@ async fn write_failures(st: &State, pending: Vec<Failure>) {
     if pending.is_empty() {
         return;
     }
+    // The failures are written in one statement, which lands whole or not at all, so a connection removed while
+    // the request ran is left out rather than let its reference fail the others with it.
     let mut insert = sqlx::QueryBuilder::new(
-        "INSERT INTO connection_failures (connection_id, kind, passed_on, usage_id, created_at) ",
+        "INSERT INTO connection_failures (connection_id, kind, passed_on, usage_id, created_at) \
+         SELECT * FROM (",
     );
     insert.push_values(pending, |mut row, failure| {
         row.push_bind(failure.connection_id)
@@ -208,6 +217,7 @@ async fn write_failures(st: &State, pending: Vec<Failure>) {
             .push_bind(failure.usage_id)
             .push_bind(failure.at);
     });
+    insert.push(") WHERE column1 IN (SELECT id FROM connections)");
     if let Err(err) = insert.build().execute(&st.pool).await {
         tracing::warn!("a connection's failures could not be written down: {err}");
     }

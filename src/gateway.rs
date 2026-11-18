@@ -786,12 +786,14 @@ fn stream_body(
                 None
             }
         };
-        // A stream that broke off or went quiet is named by its row, so its figures count it as a failure.
+        // A stream that broke off or went quiet is named by its row, so its figures count it as a failure. The
+        // stream is settled first, so its row's event and the client's end of the stream do not wait for this
+        // write; the slots, which a stop waits for, are still held until it is done.
         if let Some(id) = row_id {
             ctx.failures.cut_short(id);
         }
-        ctx.failures.write().await;
         inflight.settle(event);
+        ctx.failures.write().await;
         // Released here rather than when the handler returned, so a stream is still counted
         // while it is running. The connection slot is given back at the same point, because the request
         // is still in flight for as long as the stream is being read.
@@ -1307,9 +1309,10 @@ pub async fn list_models(AxumState(st): AxumState<State>, headers: HeaderMap) ->
                 Ok(bytes) => bytes,
                 Err(err) => {
                     let err = err.without_url();
+                    // Left to be written as it drops, on a task of its own, so a client that leaves cannot cut
+                    // the write short.
                     let mut failures = registry::Failures::new(&st);
                     upstream_failed(&st, &conn, &err, &mut failures, "broken");
-                    failures.write().await;
                     return error(
                         StatusCode::BAD_GATEWAY,
                         "upstream_unavailable",
@@ -1331,7 +1334,6 @@ pub async fn list_models(AxumState(st): AxumState<State>, headers: HeaderMap) ->
             let err = err.without_url();
             let mut failures = registry::Failures::new(&st);
             upstream_failed(&st, &conn, &err, &mut failures, "unreachable");
-            failures.write().await;
             error(
                 StatusCode::BAD_GATEWAY,
                 "upstream_unavailable",

@@ -12,9 +12,9 @@ use crate::api::{error, server_error};
 use crate::auth::Caller;
 use crate::state::State;
 
-// Usage rows are stored as UTC text in one shape, `clock::now`'s. The buckets of the charts read a day or an hour
-// out of it with strftime; a filter on a moment compares the text with a moment written the same way, which
-// orders as the time does and can use the index on the column. The column must be qualified wherever a join
+// Usage rows are stored as UTC text in one shape, `clock::now`'s. The charts read a day or an hour out of it with
+// strftime and filter their window the same way, against SQLite's own clock; the connection figures compare the
+// text with a moment written in the same shape, which orders as the time does and can use the index on the column. The column must be qualified wherever a join
 // makes user_id ambiguous.
 fn scope_clause(scoped: bool, column: &str) -> String {
     if scoped {
