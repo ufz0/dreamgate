@@ -51,6 +51,11 @@ function healthChip(health) {
   return `<span class="chip ${kind}">${glyph ? `<span class="icon">${icon(glyph)}</span>` : ''}<span>${esc(label)}</span></span>`;
 }
 
+// How many rows the Activity view keeps while new ones arrive. A page left open on a busy gateway would otherwise
+// hold every row since it was opened and rebuild the whole table for each one; the rows let go are still there
+// with "Load older", which goes on from the last row kept.
+const ACTIVITY_KEPT = 500;
+
 const state = {
   me: null,
   summary: { self: {}, global: {}, hourly: [], daily: [], models: [], users: [] },
@@ -61,6 +66,9 @@ const state = {
   // read failed, so neither is shown as a connection that had no requests.
   connectionFigures: null,
   connectionFiguresError: null,
+  // The Activity view's rows, read a page at a time with the filters that were applied, and the id to read the
+  // page after them from.
+  activity: freshActivity(),
   keyOwner: '',
   connections: [],
   events: [],
@@ -263,6 +271,11 @@ function route() {
   // on every page load.
   if (state.view === 'sandbox' && !state.models.length && state.keys.length) loadModels().then(() => renderSandbox());
   if (state.view === 'connections') loadConnectionFigures().then(() => state.view === 'connections' && renderConnections());
+  if (state.view === 'activity' && !state.activity.loaded && !state.activity.loading) {
+    loadActivity(false)
+      .then((landed) => landed && renderActivity())
+      .catch(report);
+  }
 }
 
 function render(arrived) {
@@ -285,6 +298,7 @@ function renderNav() {
 async function load() {
   // What was in flight belongs to the session that was open before; this one is told its own.
   state.progress = { shares: [], streams: [] };
+  resetActivity();
   state.settings = await api('/api/settings');
   state.summary = await api('/api/stats/summary');
   state.keys = (await api('/api/keys')).keys;
@@ -442,6 +456,8 @@ function subscribe() {
     }
     state.events.unshift(payload.event);
     state.events = state.events.slice(0, 50);
+    // A row that arrives belongs at the top of the Activity view only while nothing narrows what it shows.
+    if (!activityFiltered()) arriveInActivity(payload.event);
     const event = payload.event;
     retireStream(event.stream);
     // Every event counts toward the total the gate has produced, but only the caller's own events
@@ -764,22 +780,142 @@ function renderFeed(arrived) {
 
 // Activity
 
-// The recent rows and the models are an admin's for every account and anyone else's for their own, the
-// same scope the live stream keeps, so the lede says which.
+// What the view starts from: no rows, no filters, and the number of rows it keeps as rows arrive. "Load older"
+// raises it to what is shown plus as many again as the view keeps at first, so a page the reader asked for is
+// let go only after that many rows have arrived on top of it, and the count stays bounded by what they read.
+function freshActivity() {
+  return { filters: {}, rows: [], next: null, loaded: false, loading: false, reading: false, arrived: [], kept: ACTIVITY_KEPT, ticket: 0 };
+}
+
+// The rows are the signed-in account's own, or every account's for an admin, so none of them, nor the filters
+// they were read with, outlive the session they were read in.
+function resetActivity() {
+  state.activity = freshActivity();
+  $('activity-filters').reset();
+  for (const id of ['activity-key', 'activity-user', 'activity-connection']) $(id).innerHTML = '';
+}
+
+// A row that arrives while the first page is being read may have been written after the read, so it is kept and
+// put on top of the page once the page is in, unless the page already has it.
+function arriveInActivity(event) {
+  const activity = state.activity;
+  if (activity.loading) {
+    activity.arrived.push(event);
+    return;
+  }
+  if (!activity.loaded) return;
+  activity.rows.unshift(event);
+  // Nothing is let go while an older page is being read, because that page goes on from the last row kept.
+  if (!activity.reading && activity.rows.length > activity.kept) {
+    activity.rows.length = activity.kept;
+    activity.next = activity.rows[activity.kept - 1].id;
+  }
+}
+
+// What the form shows, which is what Show, Export CSV and a new page read, so neither reads a filter other than
+// the one on the screen.
+function formFilters() {
+  return Object.fromEntries([...new FormData($('activity-filters'))].filter(([, value]) => value));
+}
+
+function activityFiltered() {
+  return Object.values(state.activity.filters).some(Boolean);
+}
+
+function activityQuery(extra = {}) {
+  const params = new URLSearchParams();
+  for (const [name, value] of Object.entries({ ...state.activity.filters, ...extra })) if (value) params.set(name, value);
+  return params.toString();
+}
+
+// The first page with the filters as they are, or the page after the rows already shown.
+// Only the latest read lands, so a read answered late cannot replace what a later one showed, and none lands
+// in the state of a session that has since ended. It says whether it landed.
+async function loadActivity(older) {
+  const activity = state.activity;
+  const ticket = ++activity.ticket;
+  if (older) {
+    activity.reading = true;
+  } else {
+    activity.loading = true;
+    activity.arrived = [];
+  }
+  try {
+    const page = await api(`/api/stats/activity?${activityQuery(older ? { before: activity.next } : {})}`);
+    if (ticket !== activity.ticket || activity !== state.activity) return false;
+    if (older) {
+      activity.rows = activity.rows.concat(page.events);
+      activity.kept = activity.rows.length + ACTIVITY_KEPT;
+    } else {
+      const newest = page.events[0]?.id ?? 0;
+      const arrived = activityFiltered() ? [] : activity.arrived.filter((event) => event.id > newest);
+      activity.rows = arrived.sort((a, b) => b.id - a.id).concat(page.events);
+      activity.kept = ACTIVITY_KEPT;
+    }
+    activity.next = page.next;
+    activity.loaded = true;
+    return true;
+  } finally {
+    if (ticket === activity.ticket) {
+      activity.loading = false;
+      activity.reading = false;
+      activity.arrived = [];
+    }
+  }
+}
+
+// Filters are applied by reading their first page. A read that is refused leaves the filters that were applied
+// before it, so arriving rows and "Load older" go on as they did rather than repeating the refusal.
+async function applyActivityFilters(filters) {
+  const previous = state.activity.filters;
+  state.activity.filters = filters;
+  try {
+    return await loadActivity(false);
+  } catch (err) {
+    if (state.activity.filters === filters) state.activity.filters = previous;
+    throw err;
+  }
+}
+
+function fillSelect(select, options, current) {
+  select.innerHTML = options.map((o) => `<option value="${esc(o.value)}"${o.value === current ? ' selected' : ''}>${esc(o.label)}</option>`).join('');
+}
+
+// The filters offer what the caller can see: its own keys, and for an admin every account's keys and the
+// accounts themselves. A select that is already filled keeps what it shows, which may be a choice not applied
+// yet, so a row arriving does not undo it.
+function renderActivityFilters() {
+  const admin = state.me.role === 'admin';
+  const f = state.activity.filters;
+  const shown = (select, applied) => (select.options.length ? select.value : applied || '');
+  const keys = [...state.keys, ...(admin ? state.otherKeys : [])];
+  fillSelect($('activity-key'), [{ value: '', label: 'Any' }, ...keys.map((k) => ({ value: String(k.id), label: k.owner ? `${k.name} (${k.owner})` : k.name }))], shown($('activity-key'), f.key));
+  $('activity-user-field').hidden = !admin;
+  if (admin) fillSelect($('activity-user'), [{ value: '', label: 'Any' }, ...state.summary.users.map((u) => ({ value: String(u.id), label: u.username }))], shown($('activity-user'), f.user));
+  fillSelect($('activity-connection'), [{ value: '', label: 'Any' }, ...state.connections.map((c) => ({ value: String(c.id), label: c.name }))], shown($('activity-connection'), f.connection));
+  $('activity-models').innerHTML = state.summary.models.map((m) => `<option value="${esc(m.model)}"></option>`).join('');
+}
+
+// The rows and the models are an admin's for every account and anyone else's for their own, the same scope the
+// live stream keeps, so the lede says which.
 function renderActivity() {
+  if (!state.me) return;
   const admin = state.me.role === 'admin';
   $('activity-lede').textContent = `${
-    admin ? 'The last 50 requests that crossed the gate from every account' : 'The last 50 requests this account sent through the gate'
-  }, newest first, with what each cost. New rows arrive as they happen. Times are UTC.`;
+    admin ? 'The requests that crossed the gate from every account' : 'The requests this account sent through the gate'
+  }, newest first, with what each cost${activityFiltered() ? ', narrowed by the filters below' : '. New rows arrive as they happen'}. Times are UTC.`;
+  if (document.activeElement?.closest?.('#activity-filters') == null) renderActivityFilters();
+  $('activity-older').hidden = !state.activity.next;
   const columns = ['Time', 'Key', admin ? 'Account' : null, 'Model', 'Input tokens', 'Output tokens', 'Latency', 'Status'].filter(Boolean);
   $('activity-head').innerHTML = `<tr>${columns.map((c) => `<th>${esc(c)}</th>`).join('')}</tr>`;
 
-  $('activity-body').innerHTML = state.events.length
-    ? state.events
+  const rows = state.activity.rows;
+  $('activity-body').innerHTML = rows.length
+    ? rows
         .map(
           (event) =>
             `<tr>
-              <td>${esc(event.created_at.slice(11, 19))}</td>
+              <td class="nowrap">${esc(event.created_at.slice(0, 10))} ${esc(event.created_at.slice(11, 19))}</td>
               <td><span class="clamp">${esc(keyLabel(event))}</span></td>
               ${admin ? `<td><span class="clamp">${esc(event.user)}</span></td>` : ''}
               <td><span class="clamp">${esc(event.model || 'no model')}</span></td>
@@ -790,7 +926,9 @@ function renderActivity() {
             </tr>`,
         )
         .join('')
-    : `<tr><td colspan="${columns.length}">No requests recorded yet. Send one through the gateway and it appears here.</td></tr>`;
+    : `<tr><td colspan="${columns.length}">${
+        activityFiltered() ? 'No request matches these filters.' : 'No requests recorded yet. Send one through the gateway and it appears here.'
+      }</td></tr>`;
 
   $('models-body').innerHTML = state.summary.models.length
     ? state.summary.models
@@ -1485,11 +1623,60 @@ $('sign-out').addEventListener('click', async () => {
   // for whoever signs in next.
   state.progress = { shares: [], streams: [] };
   names.clear();
+  resetActivity();
+  // A message from the session that ended, such as a refused export, is not for whoever signs in next.
+  notice('');
   showAuth();
 });
 
 window.addEventListener('hashchange', () => {
   if (state.me) route();
+});
+
+$('activity-filters').addEventListener('submit', async (event) => {
+  event.preventDefault();
+  try {
+    if (await applyActivityFilters(formFilters())) renderActivity();
+  } catch (err) {
+    report(err);
+  }
+});
+
+// Every control is emptied rather than reset, because a reset puts a select back on the option the page marked
+// as the applied one.
+$('activity-clear').addEventListener('click', async () => {
+  for (const field of $('activity-filters').elements) if (field.name) field.value = '';
+  try {
+    if (await applyActivityFilters({})) renderActivity();
+  } catch (err) {
+    report(err);
+  }
+});
+
+$('activity-older').addEventListener('click', async () => {
+  try {
+    if (await loadActivity(true)) renderActivity();
+  } catch (err) {
+    report(err);
+  }
+});
+
+// The export is the filters the form shows, every matching row rather than the pages shown, downloaded with the
+// session the page already has. They are applied first, which reads a page with them: a download that fails
+// says nothing on the page, so a filter the server refuses, or a session that has ended, is reported here
+// instead.
+$('activity-export').addEventListener('click', async () => {
+  try {
+    if (!(await applyActivityFilters(formFilters()))) return;
+    renderActivity();
+  } catch (err) {
+    report(err);
+    return;
+  }
+  const link = document.createElement('a');
+  link.href = `/api/stats/activity.csv?${activityQuery()}`;
+  link.download = 'dreamgate-activity.csv';
+  link.click();
 });
 
 $('key-form').addEventListener('submit', async (event) => {

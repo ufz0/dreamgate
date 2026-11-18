@@ -496,9 +496,33 @@ URL hash (`#/overview`, `#/activity`, `#/keys`, `#/connections`, `#/connect`, `#
   request, and the speed is measured over the rows whose counts an upstream reported rather than over
   estimated ones; when nothing reported timings those rows are not shown. Totals across accounts are in
   the Accounts view.
-- **Activity** — the last 50 recorded requests, newest first, with each one's input and output tokens,
-  plus usage by model for the eight models with the most tokens, input and output together, each split
-  into the two: every account's for an admin, and otherwise this account's own. The page says which.
+- **Activity** — the recorded requests, newest first, with each one's date and time in UTC, its input and
+  output tokens, latency and status, fifty to a page with older pages loaded on request, plus usage by model
+  for the eight models with the most tokens, input and output together, each split into the two: every
+  account's for an admin, and otherwise this account's own. The page says which. The requests can be narrowed
+  by key, account (for an admin), connection, model, outcome — answered, or an error status — and whole days
+  in UTC, both included; while a filter is set, a row that arrives is not put at the top, because it may not
+  match. While none is set, rows that arrive go on top and the view keeps the newest 500, or, once "Load
+  older" has been used, what it shows then and 500 more, so a page left open does not grow without end and a
+  page the reader asked for stays until that many rows have arrived on top of it; the ones it lets go are
+  still there with "Load older", and none are let go while an older page is being read. When filters are
+  applied twice in a row, only the later read lands, and filters the server refuses are not kept in place of
+  the ones before them. Signing out drops the rows and the filters, so whoever signs in next starts from their
+  own. **Export CSV** downloads every request the filters on the form match, not only the pages shown,
+  applying them first so a filter the server refuses, or a session that has ended, is reported on the page
+  rather than as a failed download. The file has the account, key, connection, model, status, whether it
+  streamed, whether the counts are the gateway's estimate, the tokens, the cache hit and the times; a figure
+  nothing reported is an empty cell rather than a zero, and a name that starts like a spreadsheet formula is
+  written with an apostrophe before it so it opens as text — at its start, after every `;`, at the start of
+  every line in it, and after a quote that opens one of those parts, because a spreadsheet in a locale that
+  separates lists with `;` splits the cell at a `;` and starts a new row at a line break, whatever the quotes
+  say. The file is UTF-8 without a byte-order mark, which some spreadsheets need to be told when they open it.
+  The history is `/api/stats/activity`, with `key`, `user`, `connection`, `model`, `outcome` (`ok` or
+  `error`), `since` and `until` (`YYYY-MM-DD`), `limit` (a whole number from 1, fifty when left out and read
+  as 500 above that) and `before` (the `next` the previous page gave); the file is `/api/stats/activity.csv`
+  with the same filters. A member's history is its own account's, and asking for another account's is refused;
+  a value left empty is left out, a value that cannot be read is answered 400 rather than ignored, and a
+  parameter the history does not take is ignored.
 - **Keys** — create, copy, disable and delete keys, with per-key usage split into input and output
   tokens (a key's token cap counts the two together), and a note when a key's binding points at a
   connection that is turned off. A key that is turned off stays listed and reads dimmer than the keys
@@ -740,7 +764,15 @@ marked down that lists it going ahead of one that is up and does not, a connecti
 model being the ones matched, a connection's default moving no other connection for a model no list names,
 `:latest` matched both ways, a list with an entry without an id read as none and an empty one kept, a list that
 breaks off leaving the last one, the model list merging the lists in the order a key reaches them with the dates
-a check read and a connection marked down included, each connection's figures for the last day — a failure it
+a check read and a connection marked down included, the activity history paged by row with each page
+naming the next, narrowed by key, account, model, outcome and whole UTC days, a member's history being
+its own and another account's refused, a filter that cannot be read refused, the CSV export carrying
+every matching row across the pages it is read in with empty cells for what nothing reported, quoting
+and a formula written as text at a cell's start, after a `;`, after a line break and after a quote that
+opens a part, a page larger than the most read as the most, a limit that cannot be read refused, a value
+left empty left out, a connection filter, a key deleted through the API reading as none with its row
+kept, a day ending before the first second of the next, a member's export its own rows and another
+account's key id giving it none, each connection's figures for the last day — a failure it
 passed on and one it could not, a failure before a full connection still passed on, a model list's failure
 never passed on, a single answer that broke off passed on and a stream that broke off counted as a failure and
 not as an answer, an error answer counted and left out of the times, rows older than the day left out, the
