@@ -122,6 +122,40 @@ pub async fn health_readings(st: &State) -> Result<Vec<(i64, String, String)>, s
         .collect())
 }
 
+// Writes down that a connection failed a request, for its figures on the Connections view, and gives back the
+// row's id so the request can mark it as passed on if it goes on to another connection. A failure that cannot be
+// written is logged and otherwise let go: the request it belongs to is answered all the same.
+pub async fn record_failure(st: &State, connection_id: i64, kind: &str) -> Option<i64> {
+    let written = sqlx::query(
+        "INSERT INTO connection_failures (connection_id, kind, created_at) VALUES (?, ?, ?) RETURNING id",
+    )
+    .bind(connection_id)
+    .bind(kind)
+    .bind(crate::clock::now())
+    .fetch_one(&st.pool)
+    .await;
+    match written {
+        Ok(row) => Some(row.get::<i64, _>("id")),
+        Err(err) => {
+            tracing::warn!("a connection's failure could not be written down: {err}");
+            None
+        }
+    }
+}
+
+// The request went on to another connection after these failures, which is what a failover is.
+pub async fn passed_on(st: &State, failures: &[i64]) {
+    for id in failures {
+        if let Err(err) = sqlx::query("UPDATE connection_failures SET passed_on = 1 WHERE id = ?")
+            .bind(id)
+            .execute(&st.pool)
+            .await
+        {
+            tracing::warn!("a failover could not be written down: {err}");
+        }
+    }
+}
+
 pub async fn candidates(st: &State, preferred: Option<i64>) -> Vec<Connection> {
     let rows = sqlx::query(
         "SELECT id, name, base_url, api_key, default_model, enabled, priority, health, last_checked_at, \

@@ -39,6 +39,7 @@ pub fn build_router(st: State) -> Router {
         .route("/presence", routing::get(presence::summary))
         .route("/stats/summary", routing::get(stats::summary))
         .route("/stats/recent", routing::get(stats::recent))
+        .route("/stats/connections", routing::get(stats::connections))
         .route("/live", routing::get(live::stream_events))
         .route("/keys", routing::get(keys::list).post(keys::create))
         .route("/keys/others", routing::get(keys::other_accounts))

@@ -57,6 +57,7 @@ const state = {
   keys: [],
   // Keys that belong to another account, read only by an admin, and which of them the page shows.
   otherKeys: [],
+  connectionFigures: [],
   keyOwner: '',
   connections: [],
   events: [],
@@ -284,6 +285,7 @@ async function load() {
   state.summary = await api('/api/stats/summary');
   state.keys = (await api('/api/keys')).keys;
   state.connections = (await api('/api/connections')).connections;
+  await loadConnectionFigures();
   state.events = (await api('/api/stats/recent')).events;
   await loadOtherKeys();
   await refreshPresence();
@@ -291,6 +293,11 @@ async function load() {
   showShell();
   route();
   subscribe();
+}
+
+// Each connection's last day is read with the Connections view, which only an admin sees.
+async function loadConnectionFigures() {
+  state.connectionFigures = state.me?.role === 'admin' ? (await api('/api/stats/connections')).connections : [];
 }
 
 // Only an admin can read another account's keys, so a member never asks for them.
@@ -341,7 +348,10 @@ async function refresh(path) {
     state.keys = (await api('/api/keys')).keys;
     await loadOtherKeys();
   }
-  if (path === 'connections') state.connections = (await api('/api/connections')).connections;
+  if (path === 'connections') {
+    state.connections = (await api('/api/connections')).connections;
+    await loadConnectionFigures();
+  }
   if (path === 'stats') state.summary = await api('/api/stats/summary');
   render(false);
 }
@@ -864,6 +874,7 @@ function renderConnections() {
             <td>${esc(connection.default_model || 'the model the client asks for')}</td>
             <td class="num">${esc(connection.priority)}</td>
             <td>${healthChip(connection.health)} ${modelsNote(connection.models)}</td>
+            <td>${connectionFigures(connection.id)}</td>
             <td class="num">
               <button class="link" data-check="${connection.id}">Check health</button>
               <button class="link danger" data-drop="${connection.id}">Remove</button>
@@ -871,7 +882,23 @@ function renderConnections() {
           </tr>`,
         )
         .join('')
-    : `<tr><td colspan="6">No connection yet. Add one above. Any endpoint that speaks the OpenAI API works, including llama.cpp, Ollama and vLLM.</td></tr>`;
+    : `<tr><td colspan="7">No connection yet. Add one above. Any endpoint that speaks the OpenAI API works, including llama.cpp, Ollama and vLLM.</td></tr>`;
+}
+
+// What a connection did in the last day. A failure is a request it was sent and did not answer, or whose answer
+// broke off or went quiet; passed on is how many of those went to another connection. The times are kept apart
+// for single answers and streams, because a stream's time is its whole length. A figure nothing measured is left
+// out rather than shown as nothing.
+function connectionFigures(id) {
+  const f = (state.connectionFigures || []).find((figures) => figures.id === id);
+  if (!f || (!f.answered && !f.failures)) return '<span class="muted">no requests</span>';
+  const parts = [`${nf.format(f.answered)} answered`];
+  if (f.errors) parts.push(`${nf.format(f.errors)} errors`);
+  if (f.failures) parts.push(`${nf.format(f.failures)} failed, ${nf.format(f.passed_on)} passed on`);
+  const times = [];
+  if (f.single.p50_ms !== null) times.push(`answers ${nf.format(f.single.p50_ms)} ms, p95 ${nf.format(f.single.p95_ms)} ms`);
+  if (f.streamed.p50_ms !== null) times.push(`streams ${nf.format(f.streamed.p50_ms)} ms, p95 ${nf.format(f.streamed.p95_ms)} ms`);
+  return `${esc(parts.join(' · '))}${times.length ? `<br><span class="muted">${esc(times.join(' · '))}</span>` : ''}`;
 }
 
 // What the last check read of a connection's model list, which is what a request for a model is routed by.

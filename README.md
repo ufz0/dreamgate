@@ -500,11 +500,20 @@ URL hash (`#/overview`, `#/activity`, `#/keys`, `#/connections`, `#/connect`, `#
 - **Connections** — add and health-check upstreams. A connection that no check has reached yet reads "not
   checked yet" rather than down, here and in the gate readout on the Overview, because the gateway only puts
   one whose check failed behind the others. Beside its health is how many models its last list named, with the
-  names on hover, or "models unknown" when no list has been read. Admin-only, like the per-account figures,
-  and that rule is on the routes as well as on the page. The key a connection carries is returned to an admin
-  alone, and so is its address; every signed-in account still sees the connection itself — its name, health,
-  priority, default model and the ids its last list named — because the gate readout and the model list need
-  it; a key holder reads the ids of the connections that are turned on from `/v1/models` as well.
+  names on hover, or "models unknown" when no list has been read. A column shows each connection's last 24
+  hours, from `/api/stats/connections`: the requests it answered and how many of those answers were errors;
+  how often it failed a request it was sent — it could not be reached or gave no answer, its answer broke
+  off, or its stream went quiet for the stall window — and how many of those requests were passed on to
+  another connection, which is a failover; and the median and 95th percentile of how long its answers took,
+  single answers and streams apart, because a stream's time is its whole length. An answer that was an error
+  is left out of the times, so a refusal that comes back at once cannot make a connection look fast, and a
+  time nothing measured is left out rather than shown as zero. The failures are written to a table of their
+  own, because a usage row only says which connection answered, and they go with a connection when it is
+  removed. Admin-only, like the per-account figures, and that rule is on the routes as well as on the page.
+  The key a connection carries is returned to an admin alone, and so is its address; every signed-in account
+  still sees the connection itself — its name, health, priority, default model and the ids its last list
+  named — because the gate readout and the model list need it; a key holder reads the ids of the connections
+  that are turned on from `/v1/models` as well.
 - **Connect a client** — the base URL, a key picker, a copyable curl request.
 - **Sandbox** — chat with any model a connection serves, through the same gateway the clients
   use, so the request is recorded like any other. Pick a key and a model from the gateway's
@@ -686,7 +695,9 @@ model being the ones matched, a connection's default moving no other connection 
 `:latest` matched both ways, a list with an entry without an id read as none and an empty one kept, a list that
 breaks off leaving the last one, the model list merging the lists in the order a key reaches them with the dates
 a check read and a
-connection marked down included,
+connection marked down included, each connection's figures for
+the last day — a failure it passed on and one it could not, the answer and its time on the connection that gave
+it, an admin's alone, and gone with the connection when it is removed —
 the model recorded for a streamed request when nothing is pinned to a key or a connection,
 per-key limits and their validation, the per-key, per-account and per-model figures carrying the input and the
 output apart, including for a key or an account with no usage and after a key is deleted, the keys list being the
@@ -735,7 +746,7 @@ buckets that are cumulative, a usage row that could not be written by a single a
 in flight on the gateway and on its connection, and which connections are up — and, in a test binary of its own
 so its subscriber is the global one, the access log writing one line per request, a failure as much as a
 success, with neither its headers nor its query. The stall test in `tests/concurrency.rs` checks the stall count
-as well. A health check whose database does not answer within the second is not tested, because a database that
+as well, and that the stall is written down against its connection. A health check whose database does not answer within the second is not tested, because a database that
 hangs cannot be held still in a test.
 
 The concurrency tests (`tests/concurrency.rs`) run the gateway against a mock upstream that counts how many

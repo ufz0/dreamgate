@@ -5791,3 +5791,124 @@ async fn the_model_list_passes_on_dates_and_includes_a_connection_marked_down() 
         ])
     );
 }
+
+// A connection that fails a request is written down against it, and when the request goes on to another
+// connection that failure is a failover; the one that answered counts the answer and how long it took. The
+// figures are an admin's alone, and a connection's failures go with it when it is removed.
+#[tokio::test]
+async fn each_connection_counts_its_answers_its_failures_and_the_requests_it_passed_on() {
+    let st = test_state().await;
+    let router = build_router(st.clone());
+    let base_url = mock_upstream().await;
+    let cookie = register(&router, "ada").await;
+    let (_, dead) = post_json(
+        &router,
+        "/api/connections",
+        &cookie,
+        json!({ "name": "dead", "base_url": "http://127.0.0.1:1", "priority": 0 }),
+    )
+    .await;
+    let (_, up) = post_json(
+        &router,
+        "/api/connections",
+        &cookie,
+        json!({ "name": "up", "base_url": base_url, "priority": 1 }),
+    )
+    .await;
+    let (_, created) = post_json(&router, "/api/keys", &cookie, json!({ "name": "k" })).await;
+    let response = gateway_call(
+        &router,
+        created["key"].as_str().unwrap(),
+        json!({ "model": "m", "messages": [{ "role": "user", "content": "hi" }] }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let figures = get_json(&router, "/api/stats/connections", &cookie).await;
+    let of = |connection: &Value| {
+        figures["connections"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|figures| figures["id"] == connection["id"])
+            .cloned()
+            .unwrap()
+    };
+    let (dead_figures, up_figures) = (of(&dead), of(&up));
+    assert_eq!(dead_figures["failures"], 1);
+    assert_eq!(dead_figures["passed_on"], 1);
+    assert_eq!(dead_figures["answered"], 0);
+    assert_eq!(dead_figures["single"]["p50_ms"], Value::Null);
+    assert_eq!(up_figures["answered"], 1);
+    assert_eq!(up_figures["failures"], 0);
+    assert_eq!(up_figures["single"]["count"], 1);
+    assert!(up_figures["single"]["p50_ms"].is_i64());
+    assert_eq!(up_figures["streamed"]["p50_ms"], Value::Null);
+
+    open_registration(&router, &cookie).await;
+    no_approval(&router, &cookie).await;
+    let member = register(&router, "bob").await;
+    let refused = call(
+        &router,
+        Request::get("/api/stats/connections")
+            .header("cookie", &member)
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(refused.status(), StatusCode::FORBIDDEN);
+
+    let removed = call(
+        &router,
+        Request::delete(format!("/api/connections/{}", dead["id"]))
+            .header("cookie", &cookie)
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(removed.status(), StatusCode::OK);
+    let left = sqlx::query("SELECT COUNT(*) AS n FROM connection_failures")
+        .fetch_one(&st.pool)
+        .await
+        .unwrap()
+        .get::<i64, _>("n");
+    assert_eq!(left, 0, "a removed connection's failures were kept");
+}
+
+// A request that every connection fails was passed on from all but the last, which had nothing to pass it to.
+#[tokio::test]
+async fn the_last_connection_to_fail_a_request_did_not_pass_it_on() {
+    let st = test_state().await;
+    let router = build_router(st.clone());
+    let cookie = register(&router, "ada").await;
+    for (name, priority) in [("first", 0), ("second", 1)] {
+        post_json(
+            &router,
+            "/api/connections",
+            &cookie,
+            json!({ "name": name, "base_url": "http://127.0.0.1:1", "priority": priority }),
+        )
+        .await;
+    }
+    let (_, created) = post_json(&router, "/api/keys", &cookie, json!({ "name": "k" })).await;
+    let response = gateway_call(
+        &router,
+        created["key"].as_str().unwrap(),
+        json!({ "model": "m", "messages": [{ "role": "user", "content": "hi" }] }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    let figures = get_json(&router, "/api/stats/connections", &cookie).await;
+    let counted: Vec<(i64, i64)> = figures["connections"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| {
+            (
+                f["failures"].as_i64().unwrap(),
+                f["passed_on"].as_i64().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(counted, [(1, 1), (1, 0)]);
+}

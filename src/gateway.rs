@@ -105,8 +105,14 @@ fn unreadable(err: sqlx::Error) -> Response {
 // What a client is told about a failed upstream is its connection's name and the first line of the
 // error, without the address. The log is where an admin looks for why, so it gets the whole chain of
 // causes — refused, a name that did not resolve, a certificate, a timeout — which the first line
-// leaves out.
-fn upstream_failed(st: &State, conn: &Connection, err: &(dyn std::error::Error + 'static)) {
+// leaves out. The failure is also written down for the connection's figures, and its id comes back so the
+// request can mark it as passed on.
+async fn upstream_failed(
+    st: &State,
+    conn: &Connection,
+    err: &(dyn std::error::Error + Send + Sync + 'static),
+    kind: &str,
+) -> Option<i64> {
     st.metrics.upstream_failure(&conn.name);
     let mut causes = err.to_string();
     let mut source = err.source();
@@ -116,6 +122,7 @@ fn upstream_failed(st: &State, conn: &Connection, err: &(dyn std::error::Error +
         source = cause.source();
     }
     tracing::warn!(connection = %conn.name, "upstream failed: {causes}");
+    registry::record_failure(st, conn.id, kind).await
 }
 
 // A disabled account cannot use a key at all. Every gateway endpoint reads the account the same
@@ -677,6 +684,7 @@ fn stream_body(
                 Ok(None) => break,
                 Err(_) => {
                     ctx.st.metrics.stream_stall();
+                    registry::record_failure(&ctx.st, ctx.conn.id, "stalled").await;
                     tracing::warn!(
                         "upstream went quiet for {stall:?} and the stream was closed: {}",
                         ctx.model
@@ -723,7 +731,7 @@ fn stream_body(
                 }
                 Err(err) => {
                     let err = err.without_url();
-                    upstream_failed(&ctx.st, &ctx.conn, &err);
+                    upstream_failed(&ctx.st, &ctx.conn, &err, "broken").await;
                     let _ = ended.set(err.to_string());
                     break;
                 }
@@ -945,6 +953,9 @@ async fn forward(st: State, headers: HeaderMap, body: Value, endpoint: Endpoint)
     // upstream that was never asked.
     let mut full: Vec<String> = Vec::new();
     let mut attempted = false;
+    // The failures of connections this request was sent to, until it is sent to another one, which is what
+    // makes them failovers.
+    let mut failed: Vec<i64> = Vec::new();
     // The connection a request was waiting on when the gateway ended it because it was stopping, and the model
     // it was sent there with.
     let mut cut: Option<(i64, String)> = None;
@@ -967,6 +978,8 @@ async fn forward(st: State, headers: HeaderMap, body: Value, endpoint: Endpoint)
         // The upstream's answer says which model it used, but that is not read here.
         let model = model.unwrap_or_else(|| String::from("unknown"));
         attempted = true;
+        registry::passed_on(&st, &failed).await;
+        failed.clear();
         // From here the upstream is asked, so the request keeps its place in the minute even if its client
         // leaves before a row is written.
         reservation.sent();
@@ -1015,7 +1028,7 @@ async fn forward(st: State, headers: HeaderMap, body: Value, endpoint: Endpoint)
         let upstream = match sent {
             Ok(upstream) => upstream,
             Err(err) => {
-                upstream_failed(&st, conn, &*err);
+                failed.extend(upstream_failed(&st, conn, &*err, "unreachable").await);
                 last_error = format!("{}: {err}", conn.name);
                 continue;
             }
@@ -1065,7 +1078,7 @@ async fn forward(st: State, headers: HeaderMap, body: Value, endpoint: Endpoint)
             Ok(bytes) => bytes,
             Err(err) => {
                 let err = err.without_url();
-                upstream_failed(&st, conn, &err);
+                failed.extend(upstream_failed(&st, conn, &err, "broken").await);
                 last_error = format!("{}: {err}", conn.name);
                 continue;
             }
@@ -1278,7 +1291,7 @@ pub async fn list_models(AxumState(st): AxumState<State>, headers: HeaderMap) ->
                 Ok(bytes) => bytes,
                 Err(err) => {
                     let err = err.without_url();
-                    upstream_failed(&st, &conn, &err);
+                    upstream_failed(&st, &conn, &err, "broken").await;
                     return error(
                         StatusCode::BAD_GATEWAY,
                         "upstream_unavailable",
@@ -1298,7 +1311,7 @@ pub async fn list_models(AxumState(st): AxumState<State>, headers: HeaderMap) ->
         // As on the completion path, the connection is named and its address is not.
         Err(err) => {
             let err = err.without_url();
-            upstream_failed(&st, &conn, &err);
+            upstream_failed(&st, &conn, &err, "unreachable").await;
             error(
                 StatusCode::BAD_GATEWAY,
                 "upstream_unavailable",

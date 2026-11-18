@@ -856,7 +856,14 @@ async fn a_stream_that_goes_quiet_is_closed_and_its_slot_is_given_back() {
         "nothing was reported for a stream closed at the silence"
     );
 
-    // A stream closed at the silence is counted for a scrape.
+    // A stream closed at the silence is written down against its connection, and counted for a scrape.
+    let stalled =
+        sqlx::query("SELECT COUNT(*) AS n FROM connection_failures WHERE kind = 'stalled'")
+            .fetch_one(&st.pool)
+            .await
+            .unwrap()
+            .get::<i64, _>("n");
+    assert_eq!(stalled, 1);
     let scrape = router
         .clone()
         .oneshot(
