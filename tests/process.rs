@@ -272,23 +272,39 @@ fn terminate(child: &Running) {
 
 // The second signal is the one that ends what is in flight, and only a third stops the process at once. When
 // the drain ends on its own, because nothing was in flight, the second signal still does not stop it at once:
-// to the one who sent it, it is the second. A request whose head is only half sent keeps the process waiting on
-// its connection after the drain, so there is time to send the others.
+// to the one who sent it, it is the second. A request whose handler is waiting for a body that never comes keeps
+// the process waiting on its connection after the drain, so there is time to send the others.
 #[test]
 fn only_a_third_signal_stops_the_process_at_once() {
     let dir = scratch("signals");
     let (mut child, addr) = start(&dir);
-    let mut half_sent = std::net::TcpStream::connect(&addr).unwrap();
-    std::io::Write::write_all(&mut half_sent, b"GET /health HTTP/1.1\r\nHost: gateway\r\n")
+    // The server says it is inside the request by answering 100 Continue, which it does only once the handler
+    // reads the body, so the signals are sent after that. A connection whose first bytes the server has not read
+    // yet is closed at once when the server stops, because it cannot tell yet which protocol it speaks, so a head
+    // written just before the first signal could leave nothing to wait on.
+    let mut waiting = std::net::TcpStream::connect(&addr).unwrap();
+    std::io::Write::write_all(
+        &mut waiting,
+        b"POST /api/login HTTP/1.1\r\nHost: gateway\r\ncontent-type: application/json\r\n\
+          content-length: 100\r\nexpect: 100-continue\r\n\r\n",
+    )
+    .unwrap();
+    waiting
+        .set_read_timeout(Some(Duration::from_secs(5)))
         .unwrap();
+    let mut answer = [0u8; 64];
+    let read = std::io::Read::read(&mut waiting, &mut answer).unwrap();
+    let answer = String::from_utf8_lossy(&answer[..read]).to_string();
+    assert!(answer.starts_with("HTTP/1.1 100"), "{answer:?}");
 
     terminate(&child);
     std::thread::sleep(Duration::from_millis(300));
     terminate(&child);
     std::thread::sleep(Duration::from_millis(500));
+    let early = child.0.try_wait().unwrap();
     assert!(
-        child.0.try_wait().unwrap().is_none(),
-        "the second signal stopped the process at once"
+        early.is_none(),
+        "the process stopped before the third signal: {early:?}"
     );
 
     terminate(&child);
@@ -304,7 +320,7 @@ fn only_a_third_signal_stops_the_process_at_once() {
         std::thread::sleep(Duration::from_millis(20));
     };
     assert_eq!(status.code(), Some(1));
-    drop(half_sent);
+    drop(waiting);
     let _ = std::fs::remove_dir_all(&dir);
 }
 
