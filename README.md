@@ -199,12 +199,20 @@ curl -X POST http://127.0.0.1:8787/v1/chat/completions \
 
 Beside chat completions, the gateway forwards `POST /v1/completions` and `POST /v1/embeddings` the same way —
 the same keys, limits, routing, failover and recording — so a client's RAG embeddings and an editor's
-autocomplete go through it as well. When an upstream reports nothing, the input is estimated from `prompt` or
-`input` (a string, a list of strings, or token ids, each id one token), and the output from the text a
-completion generated; an embedding generates no text, so its row records none, and it is never streamed, so
-nothing about streaming is added to its body. Any other path under `/v1` is answered 404 `not_found` in the
-error shape an OpenAI client reads, and a served path asked with a method it does not take 405, rather than
-with the empty answer of the dashboard's file server.
+autocomplete go through it as well. One thing differs for an embedding: it is sent with the model the client
+names, because its vectors only mean something next to the ones the same model made, and a key's own model and a
+connection's default, which are models that generate, fill in only when the client names none. When an upstream
+reports nothing, the input is estimated from `prompt` and an editor's `suffix`, or from `input` (a string, a
+list of strings, token ids, each id one token, or parts with a `text` field), or from `messages` for a server
+that takes an embedding's input as chat; the output is estimated from the text a completion generated. An
+embedding generates no text, so its row records none, and it is never streamed, so nothing about streaming is
+added to its body. A row does not say which endpoint it came from, so the latency on the Overview and in
+`/metrics` mixes quick embeddings with generations. An upstream's answer is passed on whatever its status, so a
+connection that does not serve an endpoint answers a request for it with its own error, which is recorded like
+any answer; with connections that serve different endpoints, bind the key that a client uses for embeddings to a
+connection that serves them. Any path under `/v1` the gateway does not serve, `/v1` itself included, is answered
+404 `not_found` in the error shape an OpenAI client reads, and a served path asked with a method it does not
+take 405, rather than with the empty answer of the dashboard's file server.
 
 Streaming works as a straight pass-through, so a client that expects SSE gets SSE. When an
 upstream reports usage, DreamGate records those numbers; when it does not (several Ollama
@@ -409,9 +417,10 @@ that does not answer within a second leaves those lines out, with a warning logg
 scrape past a scraper's own timeout. The counts are of this run of the process, kept in memory and starting at
 zero on a restart the way a Prometheus counter is expected to:
 
-- `dreamgate_responses_total{route, status, type}` — every answer the two gateway endpoints gave, with the error
-  type it carried, so a refusal at a limit or a full connection, which is deliberately not a usage row, is
-  counted here. A stream is counted by the status its head was sent with.
+- `dreamgate_responses_total{route, status, type}` — every answer the gateway endpoints gave, with the error type
+  it carried, so a refusal at a limit or a full connection, which is deliberately not a usage row, is counted
+  here. A stream is counted by the status its head was sent with. A path under `/v1` that is not served is
+  counted under the one route `/v1/{*rest}`, so a client cannot add a label for every path it makes up.
 - `dreamgate_upstream_failures_total{connection}` — requests to a connection that failed before or while it
   answered, including the ones a request then fell over from and a stream cut midway by an error.
 - `dreamgate_tokens_total{direction, source}` — the input and the output of recorded requests, with what an
@@ -421,8 +430,9 @@ zero on a restart the way a Prometheus counter is expected to:
 - `dreamgate_usage_write_failures_total` and `dreamgate_stream_stalls_total` — rows that could not be written,
   which the caps then do not count, and streams closed for going quiet.
 - `dreamgate_in_flight`, `dreamgate_in_flight_limit` and `dreamgate_connection_in_flight{connection}` — the
-  completion requests admitted and not yet finished, for the gateway and for each enabled connection a request
-  has reached since the start. The model list is not admitted that way, so it is not in them.
+  chat, completion and embedding requests admitted and not yet finished, for the gateway and for each enabled
+  connection a request has reached since the start. The model list is not admitted that way, so it is not in
+  them.
 - `dreamgate_connection_up{connection}` — 1 when the last health check reached an enabled connection and 0 when
   it failed; a connection no check has reached yet is left out rather than reported as either, and so is one
   that is turned off, because no check reaches it.
@@ -632,13 +642,15 @@ recorded row carries in `/api/stats/recent` and in its event on `/api/live`, tru
 estimated and false for one the upstream reported, answered at once or streamed, SSE
 pass-through, embeddings forwarded and recorded with the input the upstream reported or the gateway's estimate of
 it, no output and nothing about streaming added, legacy completions forwarded single and streamed with the
-generated text estimated when nothing is reported, an unknown path or method under `/v1` answered as JSON,
+generated text estimated when nothing is reported, a single completion estimated from its prompt, its suffix and
+the text it generated, an embedding sent with the model the client names whatever the key's or the connection's
+model, an unknown path or method under `/v1`, and `/v1` itself, answered as JSON,
 that a client's reasoning level reaches the upstream unchanged, that a request naming no model
 reaches the upstream without one and is recorded as `unknown`, upstream failover,
 a connection marked down being tried after the ones that are not rather than skipped, including when every
 connection is marked down, and a connection that is full passing the request on to one marked down,
 with a failure there naming the full one beside it, the model list asking a connection that is up before one
-marked down, an upstream that fails named by its connection and not by its address at both gateway endpoints,
+marked down, an upstream that fails named by its connection and not by its address at the gateway endpoints,
 the round of health checks marking a connection that answers,
 the model recorded for a streamed request when nothing is pinned to a key or a connection,
 per-key limits and their validation, the per-key, per-account and per-model figures carrying the input and the
@@ -666,7 +678,7 @@ with a connection that does not exist answered as a mistake in what was sent, a 
 with a database that refuses a connection or an account answered as a server error with a reference and none
 of the driver's text, the model list refusing a
 disabled account the same way the completion path does, a request refused rather than let through when its
-key's per-minute count, its cap or its account's day cannot be read, both gateway endpoints refusing a key
+key's per-minute count, its cap or its account's day cannot be read, the gateway endpoints refusing a key
 whose account cannot be read and answering one whose account is gone as unknown, sign-in attempts being
 bounded per account, a
 session refused past the window the cookie lasts, the cookie marked Secure only when the request came

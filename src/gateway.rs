@@ -118,10 +118,10 @@ fn upstream_failed(st: &State, conn: &Connection, err: &(dyn std::error::Error +
     tracing::warn!(connection = %conn.name, "upstream failed: {causes}");
 }
 
-// A disabled account cannot use a key at all. Both gateway endpoints read the account the same
+// A disabled account cannot use a key at all. Every gateway endpoint reads the account the same
 // way, so a key on its own cannot reach an upstream for an account that is turned off. Deleting an
 // account deletes its keys with it, so a key whose account is gone is a key that is being deleted,
-// and both endpoints answer it the way they answer a key that no longer exists.
+// and every endpoint answers it the way it answers a key that no longer exists.
 async fn account_row(st: &State, user_id: i64) -> Result<Option<SqliteRow>, sqlx::Error> {
     sqlx::query("SELECT username, enabled, daily_token_cap FROM users WHERE id = ?")
         .bind(user_id)
@@ -300,11 +300,21 @@ fn in_flight_note(in_flight: i64) -> String {
     }
 }
 
+// A generation is sent with the key's own model first, then the connection's default, and the model the
+// client asks for only when neither is set. An embedding is not: its vectors only mean something next to the
+// ones the same model made, and a key's or a connection's model is a model that generates, so the one the
+// client names is sent, and the other two fill in only when it names none.
 fn resolve_model(
+    endpoint: Endpoint,
     key_model: Option<&str>,
     conn: &Connection,
     requested: Option<&str>,
 ) -> Option<String> {
+    if endpoint == Endpoint::Embeddings
+        && let Some(requested) = requested
+    {
+        return Some(requested.to_string());
+    }
     key_model
         .map(String::from)
         .or_else(|| conn.default_model.clone())
@@ -329,22 +339,42 @@ impl Endpoint {
         }
     }
 
-    // The estimate of what was sent in, used until an upstream reports its own count.
+    // The estimate of what was sent in, used until an upstream reports its own count. A completion's input
+    // is its prompt and, for an editor filling in the middle of a file, the text after the cursor as well. Some
+    // servers take an embedding's input as chat messages, so those are read when there is no `input`.
     fn prompt_tokens(self, body: &Value) -> i64 {
+        let field = |name: &str| body.get(name).unwrap_or(&Value::Null);
         match self {
-            Endpoint::Chat => tokens::prompt_estimate(body.get("messages").unwrap_or(&Value::Null)),
+            Endpoint::Chat => tokens::prompt_estimate(field("messages")),
             Endpoint::Completions => {
-                tokens::input_estimate(body.get("prompt").unwrap_or(&Value::Null))
+                tokens::input_estimate(field("prompt")) + tokens::input_estimate(field("suffix"))
             }
-            Endpoint::Embeddings => {
-                tokens::input_estimate(body.get("input").unwrap_or(&Value::Null))
-            }
+            Endpoint::Embeddings => match body.get("input") {
+                Some(input) => tokens::input_estimate(input),
+                None => tokens::prompt_estimate(field("messages")),
+            },
         }
     }
 
     // An embedding is not a stream, whatever a request asks for, so nothing about streaming is added to it.
     fn wants_stream(self, body: &Value) -> bool {
         self != Endpoint::Embeddings && body.get("stream").and_then(Value::as_bool).unwrap_or(false)
+    }
+
+    // A single answer, read for what it reports and what it generated. An embedding's answer is mostly its
+    // vectors, which can be megabytes of numbers nothing here reads, so only the two fields the report comes
+    // from are kept and the rest is skipped without being built into a value.
+    fn parse_answer(self, bytes: &[u8]) -> Option<Value> {
+        if self == Endpoint::Embeddings {
+            #[derive(serde::Deserialize)]
+            struct Reported {
+                usage: Option<Value>,
+                timings: Option<Value>,
+            }
+            let reported = serde_json::from_slice::<Reported>(bytes).ok()?;
+            return Some(json!({ "usage": reported.usage, "timings": reported.timings }));
+        }
+        serde_json::from_str::<Value>(&String::from_utf8_lossy(bytes)).ok()
     }
 
     // The text a single answer generated, for the estimate when the upstream reports nothing. A chat answer
@@ -892,7 +922,7 @@ async fn forward(st: State, headers: HeaderMap, body: Value, endpoint: Endpoint)
             full.push(conn.name.clone());
             continue;
         };
-        let model = resolve_model(key.model.as_deref(), conn, requested);
+        let model = resolve_model(endpoint, key.model.as_deref(), conn, requested);
         let url = registry::endpoint(&conn.base_url, endpoint.path());
         let payload = build_payload(&body, model.as_deref(), wants_stream);
         // The row and the stream in flight name the model the gateway sent, and say unknown when it sent none.
@@ -1002,7 +1032,7 @@ async fn forward(st: State, headers: HeaderMap, body: Value, endpoint: Endpoint)
                 continue;
             }
         };
-        let parsed = serde_json::from_str::<Value>(&String::from_utf8_lossy(&bytes)).ok();
+        let parsed = endpoint.parse_answer(&bytes);
         let mut report = Report::default();
         if let Some(value) = parsed.as_ref() {
             read_report(value, &mut report);

@@ -228,6 +228,7 @@ async fn mock_embeddings(Json(body): Json<Value>) -> Json<Value> {
     let mut answer = json!({
         "data": [{ "embedding": [0.1, 0.2] }],
         "streaming_fields": body.get("stream_options").is_some(),
+        "model_sent": body.get("model"),
     });
     if body.get("model").and_then(Value::as_str) == Some("reports-usage") {
         answer["usage"] = json!({ "prompt_tokens": 5, "total_tokens": 5 });
@@ -5109,4 +5110,89 @@ async fn an_unknown_path_or_method_under_v1_is_answered_as_json() {
         json_body(response).await["error"]["type"],
         "invalid_request"
     );
+}
+
+// An embedding is sent with the model the client names, because its vectors only mean something next to the
+// ones the same model made: a key's own model and a connection's default are models that generate, and they
+// fill in only when the client names none.
+#[tokio::test]
+async fn an_embedding_is_sent_with_the_model_the_client_names() {
+    let st = test_state().await;
+    let router = build_router(st.clone());
+    let base_url = mock_upstream().await;
+    let cookie = register(&router, "ada").await;
+    post_json(
+        &router,
+        "/api/connections",
+        &cookie,
+        json!({ "name": "test", "base_url": base_url, "default_model": "chat-default" }),
+    )
+    .await;
+    let (_, pinned) = post_json(
+        &router,
+        "/api/keys",
+        &cookie,
+        json!({ "name": "pinned", "model": "chat-pinned" }),
+    )
+    .await;
+    let (_, plain) = post_json(&router, "/api/keys", &cookie, json!({ "name": "plain" })).await;
+
+    for key in [&pinned, &plain] {
+        let response = endpoint_call(
+            &router,
+            "/v1/embeddings",
+            key["key"].as_str().unwrap(),
+            json!({ "model": "embedder", "input": "hello" }),
+        )
+        .await;
+        assert_eq!(json_body(response).await["model_sent"], "embedder");
+    }
+    let response = endpoint_call(
+        &router,
+        "/v1/embeddings",
+        pinned["key"].as_str().unwrap(),
+        json!({ "input": "hello" }),
+    )
+    .await;
+    assert_eq!(json_body(response).await["model_sent"], "chat-pinned");
+    let response = endpoint_call(
+        &router,
+        "/v1/embeddings",
+        plain["key"].as_str().unwrap(),
+        json!({ "input": "hello" }),
+    )
+    .await;
+    assert_eq!(json_body(response).await["model_sent"], "chat-default");
+}
+
+// A single completion the upstream reports nothing for is estimated from its prompt, the text after the cursor
+// an editor sends with it, and the text it generated.
+#[tokio::test]
+async fn a_single_completion_is_estimated_from_its_prompt_suffix_and_text() {
+    let (st, router, key) = endpoint_setup().await;
+    let response = endpoint_call(
+        &router,
+        "/v1/completions",
+        &key,
+        json!({ "model": "silent", "prompt": "say hello", "suffix": "and then stop" }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let usage = recorded_usage(&st.pool).await;
+    assert_eq!(usage[0]["estimated"], true);
+    // "say hello" is three and "and then stop" three, a word of four letters or fewer being one; "hello there
+    // world" is two for each word.
+    assert_eq!(usage[0]["prompt_tokens"], 6);
+    assert_eq!(usage[0]["completion_tokens"], 6);
+}
+
+// `/v1` itself is under `/v1` as much as any path below it.
+#[tokio::test]
+async fn v1_itself_is_answered_as_json() {
+    let router = build_router(test_state().await);
+    for path in ["/v1", "/v1/"] {
+        let response = call(&router, Request::get(path).body(Body::empty()).unwrap()).await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND, "{path}");
+        assert_eq!(json_body(response).await["error"]["type"], "not_found");
+    }
 }

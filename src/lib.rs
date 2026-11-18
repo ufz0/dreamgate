@@ -86,6 +86,8 @@ pub fn build_router(st: State) -> Router {
             "/v1/embeddings",
             routing::post(gateway::embeddings).fallback(gateway::method_not_allowed),
         )
+        .route("/v1", routing::any(gateway::not_found))
+        .route("/v1/", routing::any(gateway::not_found))
         .route("/v1/{*rest}", routing::any(gateway::not_found))
         .route_layer(middleware::from_fn_with_state(st.clone(), metrics::count));
 

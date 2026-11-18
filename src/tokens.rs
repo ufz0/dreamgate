@@ -38,12 +38,14 @@ pub fn prompt_estimate(messages: &Value) -> i64 {
 
 // The input of the completions and embeddings endpoints: a string, a list of strings, or text a client has
 // already turned into token ids, either one list of them or a list of lists. Ids are counted as they are,
-// because each is one token.
+// because each is one token. Some servers take parts with a `text` field, as chat content is sent; the text is
+// counted, and a part without one, such as an image, is not, as it is not in a chat prompt either.
 pub fn input_estimate(input: &Value) -> i64 {
     match input {
         Value::String(text) => estimate_tokens(text),
         Value::Number(_) => 1,
         Value::Array(items) => items.iter().map(input_estimate).sum(),
+        Value::Object(part) => part.get("text").map_or(0, input_estimate),
         _ => 0,
     }
 }
@@ -77,5 +79,9 @@ mod tests {
         assert_eq!(input_estimate(&serde_json::json!([1, 2, 3])), 3);
         assert_eq!(input_estimate(&serde_json::json!([[1, 2], [3]])), 3);
         assert_eq!(input_estimate(&serde_json::json!(null)), 0);
+        assert_eq!(
+            input_estimate(&serde_json::json!([{ "type": "text", "text": "hello there" }])),
+            4
+        );
     }
 }
