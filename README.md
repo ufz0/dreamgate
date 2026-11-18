@@ -153,10 +153,11 @@ was taken by an older version.
    only visible in the API response. Left out, the default is used; a stated value has to be positive,
    because a capability of zero would admit nothing, which is not what leaving it out means.
 2. Create a key. A DreamGate key is what clients use — the upstream key stays server-side.
-   Optionally bind a key to one connection, pin a model, or set a requests-per-minute limit
-   and a token cap. An admin can set a token limit for any account from the Accounts view;
-   that limit counts the tokens used in the current day — the input and the generated text
-   together, as they are recorded in the usage row — and resets at 00:00 UTC, and it
+   Optionally bind a key to one connection, pin a model, or set a requests-per-minute limit and a token cap.
+   A pinned model is the one chat and completions are sent with; an embedding keeps the model its client
+   names, so a pin does not limit which embedding model a key can ask for. An admin can set a token limit for
+   any account from the Accounts view; that limit counts the tokens used in the current day — the input and
+   the generated text together, as they are recorded in the usage row — and resets at 00:00 UTC, and it
    applies on top of a key's own cap, so a key cannot be used to work around it. Clearing
    the value clears the limit. A key's own cap is the same sum over the life of the key. Splitting
    the figures on the Overview does not change what either limit counts.
@@ -229,9 +230,9 @@ request — the request goes out without one, exactly as the client sent it, and
 own default. DreamGate does not put a name of its own in its place. The row for such a request, when a
 connection answered it, whatever the status, records the model as `unknown`, because what is recorded is the
 model the gateway sent, not the one the upstream answered with. A request that no connection answered, because
-every one it was sent to failed before answering, records the model the key pins or the request names, which
-here is none: its row has no model, the Activity table shows it as no model, and the usage by model counts it
-under `unknown`.
+every one it was sent to failed before answering, records the model the key pins or the request names — for an
+embedding, the one the request names first — which here is none: its row has no model, the Activity table shows
+it as no model, and the usage by model counts it under `unknown`.
 
 An estimate counts everything the model produced, not only the answer. Reasoning models put their
 working in `reasoning_content` (or `reasoning`) beside the reply, and that text is counted as
@@ -420,7 +421,8 @@ zero on a restart the way a Prometheus counter is expected to:
 - `dreamgate_responses_total{route, status, type}` — every answer the gateway endpoints gave, with the error type
   it carried, so a refusal at a limit or a full connection, which is deliberately not a usage row, is counted
   here. A stream is counted by the status its head was sent with. A path under `/v1` that is not served is
-  counted under the one route `/v1/{*rest}`, so a client cannot add a label for every path it makes up.
+  counted under `/v1/{*rest}`, or `/v1` and `/v1/` for those two, so a client cannot add a label for every path
+  it makes up.
 - `dreamgate_upstream_failures_total{connection}` — requests to a connection that failed before or while it
   answered, including the ones a request then fell over from and a stream cut midway by an error.
 - `dreamgate_tokens_total{direction, source}` — the input and the output of recorded requests, with what an
@@ -596,8 +598,8 @@ a session or a DreamGate key.
   from another site carries no session cookie, so a cross-site form cannot act as the signed-in account.
 - Adding, removing or checking a connection is an admin action in the API as well as in the page, and
   the key a connection carries and its address are returned to an admin alone, because an address names an
-  internal host and port and can carry a credential of its own. A disabled account is refused at both
-  gateway endpoints, not only at the completion path.
+  internal host and port and can carry a credential of its own. A disabled account is refused at every
+  gateway endpoint, not only at the completion path.
 - A key, its account and its limits are read from the database on every request, and a read that fails — a
   write holding the database past the busy timeout, a disk that fails — answers 503 `unavailable` with a short
   reference and is logged under it, rather than letting the request through unchecked: a limit that could not

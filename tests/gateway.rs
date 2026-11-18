@@ -5147,14 +5147,20 @@ async fn an_embedding_is_sent_with_the_model_the_client_names() {
         .await;
         assert_eq!(json_body(response).await["model_sent"], "embedder");
     }
-    let response = endpoint_call(
-        &router,
-        "/v1/embeddings",
-        pinned["key"].as_str().unwrap(),
+    // A model left blank names none, as leaving it out does.
+    for body in [
         json!({ "input": "hello" }),
-    )
-    .await;
-    assert_eq!(json_body(response).await["model_sent"], "chat-pinned");
+        json!({ "model": " ", "input": "hello" }),
+    ] {
+        let response = endpoint_call(
+            &router,
+            "/v1/embeddings",
+            pinned["key"].as_str().unwrap(),
+            body,
+        )
+        .await;
+        assert_eq!(json_body(response).await["model_sent"], "chat-pinned");
+    }
     let response = endpoint_call(
         &router,
         "/v1/embeddings",
@@ -5194,5 +5200,57 @@ async fn v1_itself_is_answered_as_json() {
         let response = call(&router, Request::get(path).body(Body::empty()).unwrap()).await;
         assert_eq!(response.status(), StatusCode::NOT_FOUND, "{path}");
         assert_eq!(json_body(response).await["error"]["type"], "not_found");
+    }
+}
+
+// An embedding that no connection answered records the model it was sent with, which is the one its client
+// named, not the key's.
+#[tokio::test]
+async fn an_embedding_no_connection_answered_records_the_model_its_client_named() {
+    let st = test_state().await;
+    let router = build_router(st.clone());
+    let cookie = register(&router, "ada").await;
+    post_json(
+        &router,
+        "/api/connections",
+        &cookie,
+        json!({ "name": "dead", "base_url": "http://127.0.0.1:1" }),
+    )
+    .await;
+    let (_, pinned) = post_json(
+        &router,
+        "/api/keys",
+        &cookie,
+        json!({ "name": "pinned", "model": "chat-pinned" }),
+    )
+    .await;
+    let response = endpoint_call(
+        &router,
+        "/v1/embeddings",
+        pinned["key"].as_str().unwrap(),
+        json!({ "model": "embedder", "input": "hello" }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    assert_eq!(recorded_usage(&st.pool).await[0]["model"], "embedder");
+}
+
+// A server that takes an embedding's input as chat messages is estimated from them, and so is a body whose
+// input is null.
+#[tokio::test]
+async fn an_embedding_sent_as_messages_is_estimated_from_them() {
+    let (st, router, key) = endpoint_setup().await;
+    for body in [
+        json!({ "model": "silent", "messages": [{ "role": "user", "content": "hello there" }] }),
+        json!({ "model": "silent", "input": null, "messages": [{ "role": "user", "content": "hello there" }] }),
+    ] {
+        let response = endpoint_call(&router, "/v1/embeddings", &key, body).await;
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+    let usage = recorded_usage(&st.pool).await;
+    assert_eq!(usage.len(), 2);
+    for row in usage {
+        assert_eq!(row["estimated"], true);
+        assert!(row["prompt_tokens"].as_i64().unwrap() > 0, "{row}");
     }
 }

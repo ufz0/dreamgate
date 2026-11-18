@@ -300,6 +300,11 @@ fn in_flight_note(in_flight: i64) -> String {
     }
 }
 
+// A model the client left blank names none, as leaving it out does.
+fn named(requested: Option<&str>) -> Option<&str> {
+    requested.filter(|model| !model.trim().is_empty())
+}
+
 // A generation is sent with the key's own model first, then the connection's default, and the model the
 // client asks for only when neither is set. An embedding is not: its vectors only mean something next to the
 // ones the same model made, and a key's or a connection's model is a model that generates, so the one the
@@ -311,7 +316,7 @@ fn resolve_model(
     requested: Option<&str>,
 ) -> Option<String> {
     if endpoint == Endpoint::Embeddings
-        && let Some(requested) = requested
+        && let Some(requested) = named(requested)
     {
         return Some(requested.to_string());
     }
@@ -349,7 +354,7 @@ impl Endpoint {
             Endpoint::Completions => {
                 tokens::input_estimate(field("prompt")) + tokens::input_estimate(field("suffix"))
             }
-            Endpoint::Embeddings => match body.get("input") {
+            Endpoint::Embeddings => match body.get("input").filter(|input| !input.is_null()) {
                 Some(input) => tokens::input_estimate(input),
                 None => tokens::prompt_estimate(field("messages")),
             },
@@ -1113,6 +1118,11 @@ async fn forward(st: State, headers: HeaderMap, body: Value, endpoint: Endpoint)
             connection_id: cut.as_ref().map(|(id, _)| *id),
             model: match &cut {
                 Some((_, model)) => Some(model.clone()),
+                // No connection answered, so no connection's default was sent; for an embedding the model the
+                // client named was, ahead of the key's.
+                None if endpoint == Endpoint::Embeddings => named(requested)
+                    .map(String::from)
+                    .or_else(|| key.model.clone()),
                 None => key.model.clone().or_else(|| requested.map(String::from)),
             },
             prompt_tokens,
