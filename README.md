@@ -715,8 +715,7 @@ answer and its time on the connection that gave it, a failure that cannot be wri
 was, the failures written when the client leaves, a connection removed while the request ran left out without
 losing the others, the health round removing failures older than the day, an admin's alone, gone with the
 connection when it is removed, and the table and its indexes added to a database written before them — the
-model recorded for a streamed request when nothing is pinned to a key or a
-connection,
+model recorded for a streamed request when nothing is pinned to a key or a connection,
 per-key limits and their validation, the per-key, per-account and per-model figures carrying the input and the
 output apart, including for a key or an account with no usage and after a key is deleted, the keys list being the
 caller's own with the other

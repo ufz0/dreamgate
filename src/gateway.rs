@@ -793,6 +793,9 @@ fn stream_body(
             ctx.failures.cut_short(id);
         }
         inflight.settle(event);
+        // The sender goes with the stream: the client reads the end of it once the sender is gone, and the task
+        // would otherwise keep it until the write below is done.
+        drop(tx);
         ctx.failures.write().await;
         // Released here rather than when the handler returned, so a stream is still counted
         // while it is running. The connection slot is given back at the same point, because the request
