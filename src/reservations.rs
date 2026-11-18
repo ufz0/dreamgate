@@ -3,15 +3,17 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 // The requests a key and an account have that the usage rows cannot show yet, held against their limits. The
-// limits are counted in the rows, but a row is written when a request ends, so requests sent at the same moment
-// all read the same rows and all passed: twenty at once on a key limited to two a minute were twenty admitted.
-// A request is therefore checked and held here in one step, under one lock, against what the rows said plus
-// what they could not say: the requests still running, those whose row was written after the rows were read,
-// and those that reached a connection and ended without a row. Which rows a reading saw is known exactly: each
-// limit is read together with the highest row id at that moment, in one statement, and a row's id is given in
-// the order rows are written, so a request whose row has a higher id was not in that reading. Each counts once for the per-minute limit, and
-// with its estimated input for the token caps; its output is not known until it has been generated, so it cannot
-// be held in advance.
+// limits are counted in the rows, but a row is written when a request ends, so requests sent at the same
+// moment all read the same rows and all passed: twenty at once on a key limited to two a minute were twenty
+// admitted. A request is therefore checked and held here in one step, under one lock, against what the rows
+// said plus what they could not say: the requests still running, those whose row was written after the rows
+// were read, and those that reached a connection and ended without a row. Which rows a reading saw is known
+// by id: each limit is read together with the highest row id at that moment, in one statement, and a row's id
+// is given in the order rows are written, so a request whose row has a higher id was not in that reading.
+// Each counts once for the per-minute limit, and with its estimated input for the token caps; its output is
+// not known until it has been generated, so it cannot be held in advance. Ids are reused when the newest rows
+// go with a deleted account, so a request recorded under such an id while a check is reading would be taken
+// as counted; that takes an account deleted in the middle of one check, and is not guarded against.
 //
 // It lives in the process, like the slots of `limits`, and a restart empties it. The rows are what the limits
 // are counted from, so a restart forgets only what it ended anyway, and a limit set while requests are running
@@ -181,8 +183,9 @@ impl Inner {
 
 // Whether a held request is one the reading could not show: still running, recorded with a row the reading
 // did not reach, or, for the per-minute limit alone, ended without a row in the last minute. A request whose
-// row has just been committed but not yet reported here is counted both ways for those few instructions, which
-// can only refuse, never let one more through.
+// row has been committed but whose id has not reached its hold yet — the time it takes the database's answer to
+// come back to the task that wrote it — is counted both ways meanwhile, which can only refuse, never let one more
+// through.
 fn unseen_by(stage: Stage, seen: i64, now: Instant, per_minute: bool) -> bool {
     match stage {
         Stage::Running => true,
