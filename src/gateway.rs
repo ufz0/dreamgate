@@ -757,6 +757,10 @@ pub async fn chat_completions(
             );
             out.headers_mut()
                 .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-cache"));
+            // nginx holds a response back until its buffer fills unless it is told not to, which would turn a
+            // stream into one late answer; this header tells it so for this response alone.
+            out.headers_mut()
+                .insert("x-accel-buffering", HeaderValue::from_static("no"));
             // The slots are handed to the stream task, so they are held until the stream ends rather than
             // until this handler returns.
             let ctx = StreamContext {

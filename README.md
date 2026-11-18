@@ -60,6 +60,89 @@ Environment variables:
   closed for going quiet, a failure answered with a reference, or a database statement that took longer than
   a second. The lines are coloured only when standard output is a terminal and `NO_COLOR` is not set
 
+## Deploying
+
+The binary serves the dashboard from `web/` under its working directory, so it runs from a directory that has
+`web/` in it, and the database path is relative to that directory too unless `DREAMGATE_DB` is absolute. On
+the command line, `dreamgate` with no arguments serves, `dreamgate backup FILE` writes a backup (below),
+`dreamgate help` (or `-h`, `--help`) prints how it is used and exits with 0, and anything else prints the same
+to standard error and exits with 2, rather than starting a server nobody asked for.
+
+**Docker.** The `Dockerfile` at the root builds with the toolchain CI pins and runs as an unprivileged user,
+uid 10001, with the database on the `/data` volume and a health check against `/health` on the default port:
+
+```sh
+docker build -t dreamgate .
+docker run -d --name dreamgate -p 127.0.0.1:8787:8787 -v dreamgate-data:/data --stop-timeout 60 dreamgate
+```
+
+The port is published on loopback for a reverse proxy on the same host (below): published on every interface,
+it is plain HTTP, passwords and session cookies included, and Docker's own rules open it past a host firewall. A
+directory mounted at `/data` instead of a volume has to be writable by uid 10001. `docker stop` sends SIGTERM,
+which starts the drain (see Stopping); the stop timeout has to be longer than the grace window plus fifteen
+seconds — up to ten for the connections still open and five for the last rows — or Docker kills the process
+while those rows are written. In Compose that is `stop_grace_period: 60s`.
+
+**systemd.** `deploy/dreamgate.service` is an example unit: the binary in `/usr/local/bin`, the dashboard's
+files in `/opt/dreamgate/web`, the database in the state directory systemd makes for the service, bound to
+loopback for a reverse proxy in front, with `TimeoutStopSec` longer than the drain and the usual hardening.
+Settings that are secrets go in `/etc/dreamgate.env`, mode 0600, which the unit reads if it is there.
+
+**Behind a reverse proxy.** DreamGate does not terminate TLS itself, so a production instance sits behind a
+proxy that does, with `DREAMGATE_ADDR=127.0.0.1:8787` so only the proxy reaches it. Three things matter to the
+proxy: it has to pass a stream on as it arrives rather than buffer it, it has to wait at least as long as a
+stream may go quiet (`DREAMGATE_STREAM_STALL_SECS`) and as long as a single answer may take, which sends nothing
+until it is done (`DREAMGATE_REQUEST_TIMEOUT_SECS`), both 120 by default, and it has to send
+`X-Forwarded-Proto`, which is how the session cookie is marked `Secure`. Both kinds of event stream
+already send `X-Accel-Buffering: no`, which nginx reads per response. Caddy does all of it as it is:
+
+```
+gateway.example.com {
+    reverse_proxy 127.0.0.1:8787
+}
+```
+
+nginx's defaults read a response for 60 seconds, buffer it, take bodies of 1 MB, and leave the scheme out, so
+each is set:
+
+```nginx
+location / {
+    proxy_pass http://127.0.0.1:8787;
+    proxy_http_version 1.1;
+    proxy_set_header Connection "";
+    proxy_set_header Host $host;
+    proxy_set_header X-Forwarded-Proto $scheme;
+    proxy_buffering off;
+    proxy_read_timeout 300s;
+    client_max_body_size 2m;
+}
+```
+
+The gateway takes a request body of up to 2 MB (`BODY_LIMIT` in `src/lib.rs`), so `client_max_body_size` larger
+than that only lets a proxy pass on what the gateway then refuses. `proxy_read_timeout` has to stay above both
+time limits above if either is raised.
+
+**Backups.** Copying the database file while the gateway runs is not a backup: with the write-ahead log, the
+latest rows can still be in `dreamgate.db-wal` beside it, and a copy taken during a write is torn. `dreamgate
+backup FILE` writes a consistent copy of the database in `DREAMGATE_DB` with SQLite's `VACUUM INTO`, while the
+gateway runs or not. It does not create or migrate the database it copies. It makes `FILE` itself before
+anything is copied into it and refuses one that is already there, an empty file or a link included, so an
+earlier backup, or a file someone else left in a shared directory, is never written into; on Unix the copy is
+readable by its owner alone from the moment it is made, and a copy that fails partway is removed, unless the
+process is killed in the middle of it. On Windows it keeps the permissions of its directory. Treat a backup as a
+secret: it holds every DreamGate key and every upstream key in the clear. With the systemd unit above,
+`deploy/dreamgate-backup.service` and `deploy/dreamgate-backup.timer` take one a day into
+`/var/backups/dreamgate`, which they make, and remove the copies older than two weeks; in Docker, `docker exec
+dreamgate dreamgate backup /data/backup.db`, then `docker cp dreamgate:/data/backup.db .` to take it off the
+volume the database is on, and remove it from there.
+
+**Restoring.** Stop the gateway first, and make sure no `dreamgate.db-wal` or `dreamgate.db-shm` is left beside
+the database: a database put in place under a write-ahead log that belongs to another one is how SQLite
+databases are corrupted. Put the copy in place as `DREAMGATE_DB`, owned by the user the gateway runs as — with
+the systemd unit, `chown "$(stat -L -c %u:%g /var/lib/dreamgate)" dreamgate.db`, because the user only has a
+name while the service runs; in Docker, uid 10001 — and start the gateway again, which migrates the copy if it
+was taken by an older version.
+
 ## Using it
 
 1. In the dashboard, add a connection. Any OpenAI-compatible base URL works:
@@ -599,7 +682,7 @@ The numbers are not part of the normal run: they measure, so they are only read 
 single-threaded runtime would measure one worker rather than the gateway. There is no Go-style race detector in
 Rust, so what stands in its place is that shared state is only reachable through types the compiler requires to
 be `Send` and `Sync`, plus running the concurrency tests repeatedly. The environment variables themselves are
-read in `src/main.rs`, the composition root. One test reaches it (`tests/process.rs`, on Unix): it starts the
+read in `src/main.rs`, the composition root. The tests in `tests/process.rs` (on Unix) reach it. One starts the
 built binary with its address, database and grace window set through the environment, opens a stream through it,
 sends the process SIGTERM in the middle of the stream, and checks that the stream arrives whole, that a new
 connection meanwhile is answered 503 `draining` at `/health` and 503 `shutting_down` at the gateway rather than
@@ -612,10 +695,17 @@ recorded, and so is one that passed the first check and waited on the database w
 list and the health check say so; a stream in flight is let finish with the drain ending only once its row is
 written, and while the drain waits what is in flight reads as that stream alone; a stream and a single answer
 still running when the window passes are ended and recorded, and so is a stream whose client stopped reading. A
-dashboard's live stream ending as the stop begins is tested in `tests/gateway.rs`. The pool size is still not
-exercised by a test; the other things tested in `src/main.rs` are the dashboard address the startup line names
-and the log filter chosen from `RUST_LOG`, set or not, each a unit test beside the function that picks it. The
-two time bounds are exercised, because the tests build the client and the state through the same functions the
-gateway uses; the connect timeout and the number of connections kept idle are read through that builder but no
-test asserts what they do. The pool and the busy timeout are exercised through `db::connect` against a
-shared-cache in-memory database, which is not the same mechanism as writer contention on a file.
+dashboard's live stream ending as the stop begins is tested in `tests/gateway.rs`. The others in
+`tests/process.rs` run `dreamgate backup` against a database that is open with its latest row still in the
+write-ahead log, and check that the copy has the row and is readable by its owner alone, that a second backup to
+the same file fails, and so does one to an empty file that is already there, which stays empty, that a backup of
+a database that is not there fails without creating it, and that one of a file that is not a database fails and
+leaves neither the copy nor its journal behind; and that an argument the binary does not know exits with 2 and
+the usage, within a deadline and away from the default port. Both kinds of event stream are checked, in
+`tests/gateway.rs`, for the header that keeps nginx from buffering them. The pool size is still not exercised by
+a test; the other things tested in `src/main.rs` are the dashboard address the startup line names and the log
+filter chosen from `RUST_LOG`, set or not, each a unit test beside the function that picks it. The two time
+bounds are exercised, because the tests build the client and the state through the same functions the gateway
+uses; the connect timeout and the number of connections kept idle are read through that builder but no test
+asserts what they do. The pool and the busy timeout are exercised through `db::connect` against a shared-cache
+in-memory database, which is not the same mechanism as writer contention on a file.

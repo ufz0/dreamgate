@@ -7,8 +7,32 @@ use dreamgate::{build_router, db, limits, live, metrics, registry, state};
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::filter::LevelFilter;
 
+const USAGE: &str = "\
+usage: dreamgate              serve the gateway and the dashboard, configured through DREAMGATE_* variables
+       dreamgate backup FILE  write a consistent copy of the database in DREAMGATE_DB to FILE, which must
+                              not exist yet; it can be taken while the gateway is running";
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Read without assuming the arguments are text, so one that is not is answered with the usage rather
+    // than with a panic.
+    let args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
+    let args: Option<Vec<&str>> = args.iter().map(|arg| arg.to_str()).collect();
+    match args.as_deref() {
+        Some([]) => {}
+        Some(["backup", target]) => std::process::exit(backup(target).await),
+        Some(["help" | "-h" | "--help"]) => {
+            println!("{USAGE}");
+            return Ok(());
+        }
+        // Anything else was meant as something this does not do, so it says so rather than starting a
+        // server nobody asked for.
+        _ => {
+            eprintln!("{USAGE}");
+            std::process::exit(2);
+        }
+    }
+
     // Coloured only on a terminal, and not when NO_COLOR asks for none: written to a file or to the
     // journal, the colour codes are noise in every line.
     let colour = std::io::IsTerminal::is_terminal(&std::io::stdout())
@@ -90,6 +114,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     st.pool.close().await;
     tracing::info!("stopped");
     Ok(())
+}
+
+async fn backup(target: &str) -> i32 {
+    let database =
+        std::env::var("DREAMGATE_DB").unwrap_or_else(|_| "data/dreamgate.db".to_string());
+    match db::backup(&database, Path::new(target)).await {
+        Ok(()) => {
+            println!("backed up {database} to {target}");
+            0
+        }
+        Err(err) => {
+            eprintln!("dreamgate backup: {err}");
+            1
+        }
+    }
 }
 
 // A bind to every interface names no host to connect to: Windows refuses that address, and browsers block

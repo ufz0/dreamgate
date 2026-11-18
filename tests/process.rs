@@ -307,3 +307,129 @@ fn only_a_third_signal_stops_the_process_at_once() {
     drop(half_sent);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// A backup taken while the database is open and its latest rows are still in the write-ahead log: the copy
+// has them, it is readable by its owner alone because it holds every key, and an earlier backup is never
+// overwritten.
+#[tokio::test]
+async fn the_backup_command_copies_a_database_that_is_in_use() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = scratch("backup");
+    let database = dir.join("dreamgate.db");
+    let pool = dreamgate::db::connect(&format!("sqlite://{}", database.display()), 2)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO users (username, password_hash, role, enabled, pending, created_at) \
+         VALUES ('ada', 'hash', 'admin', 1, 0, '2026-01-01T00:00:00Z')",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    assert!(
+        std::fs::metadata(dir.join("dreamgate.db-wal")).is_ok_and(|wal| wal.len() > 0),
+        "the row should still be in the write-ahead log"
+    );
+
+    let target = dir.join("copy.db");
+    let run = |target: &PathBuf| {
+        Command::new(env!("CARGO_BIN_EXE_dreamgate"))
+            .args(["backup", target.to_str().unwrap()])
+            .env("DREAMGATE_DB", &database)
+            .output()
+            .unwrap()
+    };
+    let first = run(&target);
+    assert!(
+        first.status.success(),
+        "{}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    assert_eq!(
+        std::fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    let copy = sqlx::sqlite::SqlitePoolOptions::new()
+        .connect(&format!("sqlite://{}", target.display()))
+        .await
+        .unwrap();
+    let name: String = sqlx::query("SELECT username FROM users")
+        .fetch_one(&copy)
+        .await
+        .unwrap()
+        .get("username");
+    assert_eq!(name, "ada");
+    copy.close().await;
+
+    let again = run(&target);
+    assert!(!again.status.success(), "an earlier backup was overwritten");
+    assert!(
+        String::from_utf8_lossy(&again.stderr).contains("cannot create"),
+        "the error did not say it was about the copy"
+    );
+
+    // An empty file someone else made is refused as well, rather than written into, and left as it was.
+    let planted = dir.join("planted.db");
+    std::fs::write(&planted, b"").unwrap();
+    assert!(
+        !run(&planted).status.success(),
+        "an empty file was written into"
+    );
+    assert_eq!(std::fs::metadata(&planted).unwrap().len(), 0);
+
+    // A copy that fails partway is not left behind, because what it has copied can be keys.
+    let garbage = dir.join("garbage.db");
+    std::fs::write(&garbage, vec![b'x'; 8192]).unwrap();
+    let partial = dir.join("partial.db");
+    let failed = Command::new(env!("CARGO_BIN_EXE_dreamgate"))
+        .args(["backup", partial.to_str().unwrap()])
+        .env("DREAMGATE_DB", &garbage)
+        .output()
+        .unwrap();
+    assert!(!failed.status.success());
+    assert!(!partial.exists(), "a failed copy was left behind");
+    assert!(!dir.join("partial.db-journal").exists());
+
+    // A database that is not there is an error, not an empty file made and copied.
+    let missing = Command::new(env!("CARGO_BIN_EXE_dreamgate"))
+        .args(["backup", dir.join("other.db").to_str().unwrap()])
+        .env("DREAMGATE_DB", dir.join("absent.db"))
+        .output()
+        .unwrap();
+    assert!(!missing.status.success());
+    assert!(!dir.join("absent.db").exists());
+
+    pool.close().await;
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// An argument the binary does not know is not taken as a reason to start serving. Were it taken as one, the
+// process would serve until killed, so it is given a deadline, a port of its own and a directory of its own,
+// rather than the default port and the package's data directory.
+#[test]
+fn an_unknown_command_says_how_the_binary_is_used() {
+    let dir = scratch("unknown-command");
+    let child = Command::new(env!("CARGO_BIN_EXE_dreamgate"))
+        .arg("serve-everything")
+        .env("DREAMGATE_ADDR", "127.0.0.1:0")
+        .current_dir(&dir)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut child = Running(child);
+    let started = Instant::now();
+    while child.0.try_wait().unwrap().is_none() {
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "the binary started serving instead of answering with its usage"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let mut stderr = String::new();
+    std::io::Read::read_to_string(&mut child.0.stderr.take().unwrap(), &mut stderr).unwrap();
+    assert_eq!(child.0.wait().unwrap().code(), Some(2));
+    assert!(stderr.contains("usage: dreamgate"));
+    let _ = std::fs::remove_dir_all(&dir);
+}

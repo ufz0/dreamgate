@@ -173,6 +173,9 @@ pub async fn stream_events(AxumState(st): AxumState<State>, caller: Caller) -> R
     );
     out.headers_mut()
         .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-cache"));
+    // As on the gateway's own streams: a proxy that buffers would hold the page's updates back.
+    out.headers_mut()
+        .insert("x-accel-buffering", HeaderValue::from_static("no"));
     *out.body_mut() = Body::from_stream(body);
     out.into_response()
 }

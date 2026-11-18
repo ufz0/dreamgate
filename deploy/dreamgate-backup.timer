@@ -1,0 +1,12 @@
+# Runs dreamgate-backup.service once a day, as /etc/systemd/system/dreamgate-backup.timer, and catches up on
+# a day the machine was off. Enable it with `systemctl enable --now dreamgate-backup.timer`.
+
+[Unit]
+Description=Daily DreamGate database backup
+
+[Timer]
+OnCalendar=daily
+Persistent=true
+
+[Install]
+WantedBy=timers.target
