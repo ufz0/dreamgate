@@ -290,6 +290,9 @@ pub async fn register(
 pub struct LoginBody {
     pub username: String,
     pub password: String,
+    // A one-time code an admin gave out: with it, the password is the new one to set rather than one to check.
+    #[serde(default)]
+    pub setup_code: Option<String>,
 }
 
 pub async fn login(
@@ -298,6 +301,20 @@ pub async fn login(
     Json(body): Json<LoginBody>,
 ) -> Response {
     let username = body.username.trim().to_string();
+    let setup_code = body
+        .setup_code
+        .as_deref()
+        .map(crate::users::plain_setup_code)
+        .filter(|code| !code.is_empty());
+    // A password that is too short to set is answered before the account is read, so the answer is the same
+    // whether the username exists or not.
+    if setup_code.is_some() && body.password.len() < 8 {
+        return error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "password must be at least 8 characters",
+        );
+    }
     if !attempt_allowed(&st, &username) {
         return error(
             StatusCode::TOO_MANY_REQUESTS,
@@ -306,7 +323,8 @@ pub async fn login(
         );
     }
     let row = match sqlx::query(
-        "SELECT id, username, password_hash, role, enabled, pending FROM users WHERE username = ?",
+        "SELECT id, username, password_hash, role, enabled, pending, setup_code_hash, setup_code_expires_at \
+         FROM users WHERE username = ?",
     )
     .bind(&username)
     .fetch_optional(&st.pool)
@@ -319,12 +337,24 @@ pub async fn login(
     };
     // The same answer for an account that does not exist and a password that does not match, so a
     // sign-in attempt cannot be used to find out which usernames the instance has.
+    let with_code = setup_code.is_some();
+    let refused = || {
+        if with_code {
+            error(
+                StatusCode::UNAUTHORIZED,
+                "invalid_credentials",
+                "username or setup code is not correct, or the code has expired",
+            )
+        } else {
+            error(
+                StatusCode::UNAUTHORIZED,
+                "invalid_credentials",
+                "username or password is not correct",
+            )
+        }
+    };
     let Some(row) = row else {
-        return error(
-            StatusCode::UNAUTHORIZED,
-            "invalid_credentials",
-            "username or password is not correct",
-        );
+        return refused();
     };
     if row.get::<i64, _>("pending") == 1 {
         return error(
@@ -344,25 +374,19 @@ pub async fn login(
             "this account is disabled",
         );
     }
-    // An account made by an admin has no password until the person signs in for the first time;
-    // what they enter then becomes their own password.
-    match row.get::<Option<String>, _>("password_hash") {
-        Some(hash) => {
-            if !password_matches(&body.password, &hash).await {
-                return error(
-                    StatusCode::UNAUTHORIZED,
-                    "invalid_credentials",
-                    "username or password is not correct",
-                );
-            }
-        }
-        None => {
-            if body.password.len() < 8 {
-                return error(
-                    StatusCode::BAD_REQUEST,
-                    "invalid_request",
-                    "password must be at least 8 characters",
-                );
+    match (setup_code, row.get::<Option<String>, _>("password_hash")) {
+        // A setup code sets the password, on an account that has none yet or as a reset of one that has.
+        (Some(code), _) => {
+            let Some(stored) = row.get::<Option<String>, _>("setup_code_hash") else {
+                return refused();
+            };
+            // The expiry is RFC 3339 text in UTC, written the way `clock::now` writes, so the two compare as
+            // text.
+            let live = row
+                .get::<Option<String>, _>("setup_code_expires_at")
+                .is_some_and(|expires_at| expires_at > crate::clock::now());
+            if !live || !password_matches(&code, &stored).await {
+                return refused();
             }
             let hash = match hash_password(&body.password).await {
                 Ok(hash) => hash,
@@ -370,33 +394,45 @@ pub async fn login(
                     return server_error(err);
                 }
             };
-            // Two first sign-ins at once both read that there is no password. Only the write that
-            // still finds none sets it, and the other is answered as what it now is: a password
-            // that does not match. The write also has to find the account still enabled and not
-            // held, because an admin can change either while the password is being hashed, and a
-            // sign-in that lands after that is not let in on what it read before.
+            // Two sign-ins with the same code both read it. Only the write that still finds the code it
+            // checked sets the password and uses the code up, and the other is answered as what it now is: a
+            // code that does not work. The write also has to find the account still enabled and not held,
+            // because an admin can change either while the password is being hashed, and a sign-in that lands
+            // after that is not let in on what it read before.
             match sqlx::query(
-                "UPDATE users SET password_hash = ? \
-                 WHERE id = ? AND password_hash IS NULL AND enabled = 1 AND pending = 0",
+                "UPDATE users SET password_hash = ?, setup_code_hash = NULL, setup_code_expires_at = NULL \
+                 WHERE id = ? AND setup_code_hash = ? AND enabled = 1 AND pending = 0",
             )
             .bind(&hash)
             .bind(id)
+            .bind(&stored)
             .execute(&st.pool)
             .await
             {
                 Ok(done) if done.rows_affected() == 1 => {}
-                Ok(_) => {
-                    return error(
-                        StatusCode::UNAUTHORIZED,
-                        "invalid_credentials",
-                        "username or password is not correct",
-                    );
-                }
+                Ok(_) => return refused(),
                 Err(err) => {
                     return server_error(err);
                 }
             }
+            // A new password ends the sign-ins made with the old one: a reset is most often asked for because
+            // the old one is lost or known to someone else.
+            if let Err(err) = sqlx::query("DELETE FROM sessions WHERE user_id = ?")
+                .bind(id)
+                .execute(&st.pool)
+                .await
+            {
+                return server_error(err);
+            }
         }
+        (None, Some(hash)) => {
+            if !password_matches(&body.password, &hash).await {
+                return refused();
+            }
+        }
+        // An account with no password is signed into only with a setup code. Without one it is answered as a
+        // wrong password, so the answer does not say which accounts are waiting for a code.
+        (None, None) => return refused(),
     }
 
     let token = match create_session(&st, id).await {

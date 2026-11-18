@@ -47,6 +47,7 @@ pub fn build_router(st: State) -> Router {
             routing::patch(keys::update).delete(keys::delete),
         )
         .route("/users", routing::post(users::create))
+        .route("/users/{id}/setup-code", routing::post(users::setup_code))
         .route(
             "/users/{id}",
             routing::patch(users::update).delete(users::remove),

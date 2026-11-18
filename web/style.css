@@ -609,3 +609,7 @@ input:focus-visible, select:focus-visible, textarea:focus-visible, button:focus-
 @media (prefers-reduced-motion: reduce) {
   * { transition: none !important; animation: none !important; }
 }
+
+/* A setup code is read out and typed, so it is set large in the fixed-width face. */
+#setup-code-value { font: 500 17px/1.4 var(--font-mono); letter-spacing: 0.04em; word-break: break-all; }
+#setup-code-toggle:not([hidden]) { display: block; margin: -6px 0 14px -8px; }

@@ -15,7 +15,9 @@ pub const SCHEMA: &[&str] = &[
         daily_token_cap INTEGER,
         enabled INTEGER NOT NULL DEFAULT 1,
         pending INTEGER NOT NULL DEFAULT 0,
-        created_at TEXT NOT NULL
+        created_at TEXT NOT NULL,
+        setup_code_hash TEXT,
+        setup_code_expires_at TEXT
     )",
     "CREATE TABLE IF NOT EXISTS sessions (
         token TEXT PRIMARY KEY,
@@ -263,6 +265,7 @@ pub async fn migrate(pool: &SqlitePool) -> Result<(), sqlx::Error> {
     add_usage_columns(pool).await?;
     add_connection_limit(pool).await?;
     add_connection_models(pool).await?;
+    add_setup_codes(pool).await?;
     relax_key_reference(pool).await?;
     for statement in INDEXES {
         sqlx::query(*statement).execute(pool).await?;
@@ -281,6 +284,23 @@ async fn add_usage_columns(pool: &SqlitePool) -> Result<(), sqlx::Error> {
             continue;
         }
         let statement = format!("ALTER TABLE usage ADD COLUMN {column} INTEGER");
+        sqlx::query(sqlx::AssertSqlSafe(statement.as_str()))
+            .execute(pool)
+            .await?;
+    }
+    Ok(())
+}
+
+// A setup code is how the person an admin made an account for, or gave a new code to, sets its password. Both
+// columns are nullable, so an account written before the change reads as having no code: one with a password
+// signs in with it as before, and one without waits for an admin to give it a code, because no code means
+// nothing can set its password.
+async fn add_setup_codes(pool: &SqlitePool) -> Result<(), sqlx::Error> {
+    for column in ["setup_code_hash", "setup_code_expires_at"] {
+        if has_column(pool, "users", column).await? {
+            continue;
+        }
+        let statement = format!("ALTER TABLE users ADD COLUMN {column} TEXT");
         sqlx::query(sqlx::AssertSqlSafe(statement.as_str()))
             .execute(pool)
             .await?;

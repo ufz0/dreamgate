@@ -1062,6 +1062,35 @@ async function sendChat(text) {
 }
 
 // Accounts. The view is admin-only, so the limit control is always editable here.
+function utcTime(at) {
+  return `${at.slice(0, 16).replace('T', ' ')} UTC`;
+}
+
+// Whether the account can be signed into, and until when a code given to it works; the code itself is shown
+// once, when it is made.
+function passwordState(user) {
+  const code = user.setup_code_expires_at;
+  const live = code && new Date(code) > new Date();
+  if (!user.has_password) {
+    return live
+      ? `<span class="muted">no password yet · setup code works until ${esc(utcTime(code))}</span>`
+      : '<span class="danger">no password and no working setup code · give it a new one</span>';
+  }
+  return live ? `<span class="muted">reset code works until ${esc(utcTime(code))}</span>` : '';
+}
+
+// A code is shown once, so the dialog says so and offers to copy it.
+function showSetupCode(issued, why) {
+  $('setup-code-title').textContent = `Setup code for ${issued.username}`;
+  $('setup-code-text').textContent = `${
+    why === 'made'
+      ? 'They sign in with this code and choose their password.'
+      : 'They sign in with this code and choose a new password; until then their old one keeps working, and any code given before this one no longer does.'
+  } It works once, until ${utcTime(issued.setup_code_expires_at)}, and is not shown again.`;
+  $('setup-code-value').textContent = issued.setup_code;
+  $('setup-code').showModal();
+}
+
 function renderAccounts() {
   renderAccountSettings();
   $('accounts-body').innerHTML = state.summary.users.length
@@ -1083,6 +1112,7 @@ function renderAccounts() {
                   <button class="secondary" data-password="${user.id}">Set password</button>
                 </span>
                 ${user.pending ? '<span class="muted">waiting for approval</span>' : ''}
+                ${passwordState(user)}
                 ${disabled ? '<span class="danger">disabled</span>' : ''}
               </span>
             </td>
@@ -1098,6 +1128,7 @@ function renderAccounts() {
             <td class="num">${nf.format(user.completion_tokens)}</td>
             <td class="num">
               ${user.pending ? `<button class="link" data-approve="${user.id}">Approve</button>` : ''}
+              <button class="link" data-setup-code="${user.id}">New setup code</button>
               <button class="link" data-status="${user.id}" data-enabled="${user.enabled}">${disabled ? 'Enable' : 'Disable'}</button>
               ${user.id === state.me.id ? '<span class="muted">signed in</span>' : `<button class="link danger" data-account="${user.id}">Delete</button>`}
             </td>
@@ -1195,7 +1226,21 @@ function renderAuth() {
 // An account made by an admin has no password until the person signs in for the first time, so
 // the entry screen says which password becomes theirs. It only applies once accounts exist.
 function showFirstPasswordNote() {
-  $('first-password-note').hidden = !(state.settings.has_accounts && mode === 'login');
+  const login = state.settings.has_accounts && mode === 'login';
+  $('first-password-note').hidden = !login;
+  $('setup-code-toggle').hidden = !login;
+  if (!login) showSetupCodeField(false);
+}
+
+// With a setup code, the password typed is the new one to set rather than one to check, so the field says so
+// and a password manager offers to save it.
+function showSetupCodeField(open) {
+  $('setup-code-field').hidden = !open;
+  $('setup-code-toggle').setAttribute('aria-expanded', String(open));
+  $('setup-code-toggle').textContent = open ? 'Sign in with a password instead' : 'I have a setup code';
+  $('password-label').textContent = open ? 'New password' : 'Password';
+  $('auth-password').autocomplete = open ? 'new-password' : 'current-password';
+  if (!open) $('setup-code-field').querySelector('input').value = '';
 }
 
 function showShell() {
@@ -1223,6 +1268,7 @@ function setMode(next) {
 // so the entry screen says what happens next instead of loading the app.
 async function submitAuth(form) {
   const data = Object.fromEntries(new FormData(form));
+  if (mode !== 'login' || !data.setup_code) delete data.setup_code;
   try {
     const account = await postJson(`/api/${mode}`, data);
     if (account.pending) {
@@ -1314,6 +1360,11 @@ $('mode-login').addEventListener('click', () => {
   notice('');
   setMode('login');
 });
+$('setup-code-toggle').addEventListener('click', () => {
+  notice('');
+  showSetupCodeField($('setup-code-field').hidden);
+});
+$('setup-code-close').addEventListener('click', () => $('setup-code').close());
 $('toggle-rail').addEventListener('click', toggleRail);
 $('scrim').addEventListener('click', () => {
   $('shell').removeAttribute('data-drawer');
@@ -1450,7 +1501,8 @@ $('account-form').addEventListener('submit', async (event) => {
     const created = await postJson('/api/users', body);
     form.reset();
     await refresh('stats');
-    notice(`Made account "${created.username}". The password is theirs when they sign in for the first time.`);
+    notice(`Made account "${created.username}".`);
+    showSetupCode(created, 'made');
   } catch (err) {
     report(err);
   }
@@ -1542,6 +1594,17 @@ document.addEventListener('click', async (event) => {
       return;
     }
     await changeAccount(user, { username: value }, `Renamed "${user.username}" to "${value}".`);
+    return;
+  }
+  if (button.dataset.setupCode) {
+    const user = account(button.dataset.setupCode);
+    try {
+      const issued = await postJson(`/api/users/${user.id}/setup-code`, {});
+      await refresh('stats');
+      showSetupCode(issued, 'reset');
+    } catch (err) {
+      report(err);
+    }
     return;
   }
   if (button.dataset.password) {
