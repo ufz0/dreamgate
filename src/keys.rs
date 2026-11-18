@@ -1,7 +1,7 @@
 use axum::extract::{Path, State as AxumState};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Json, Response};
-use chrono::{DateTime, NaiveDate, SecondsFormat, Utc};
+use chrono::{DateTime, Datelike, NaiveDate, SecondsFormat, Utc};
 use serde::{Deserialize, Deserializer};
 use serde_json::json;
 use sqlx::Row;
@@ -66,17 +66,25 @@ fn expiry(given: &str) -> Result<String, Box<Response>> {
             "the expiry has already passed; turn the key off to stop it now",
         ));
     }
+    // A year past 9999 is written with a sign, which sorts before every year of four digits, so it would compare
+    // as long passed. A key that is meant never to expire is given no expiry.
+    if at.year() > 9999 {
+        return Err(refuse(
+            "the expiry must be before the year 10000; leave it out for a key that does not expire",
+        ));
+    }
     Ok(at.to_rfc3339_opts(SecondsFormat::Secs, true))
 }
 
-// What an admin is shown of another account's key: enough to tell it from the others and to match it against a
-// key someone reports, not enough to use it.
+// What an admin is shown of another account's key: the fixed `dreamgate_` prefix and the first and last four of
+// its random characters, enough to tell it from the others and to match it against a key someone reports, while
+// the ninety random bits of a version 4 UUID between them stay hidden.
 fn key_hint(key: &str) -> String {
     let chars: Vec<char> = key.chars().collect();
-    if chars.len() <= 14 {
+    if chars.len() <= 18 {
         return "…".to_string();
     }
-    let start: String = chars[..10].iter().collect();
+    let start: String = chars[..14].iter().collect();
     let end: String = chars[chars.len() - 4..].iter().collect();
     format!("{start}…{end}")
 }
@@ -279,21 +287,17 @@ pub async fn update(
             Err(refused) => return *refused,
         },
     };
-    if let Some(expires_at) = expires_at
-        && let Err(err) = sqlx::query("UPDATE api_keys SET expires_at = ? WHERE id = ?")
-            .bind(expires_at)
-            .bind(id)
-            .execute(&st.pool)
-            .await
-    {
-        return server_error(err);
-    }
+    // The expiry is written in the same statement as the rest, so a change refused for another field, a binding
+    // to a connection that is gone, changes the expiry no more than it changes the name.
     let result = sqlx::query(
-        "UPDATE api_keys SET name = COALESCE(?, name), connection_id = COALESCE(?, connection_id), \
+        "UPDATE api_keys SET expires_at = CASE WHEN ? THEN ? ELSE expires_at END, \
+                name = COALESCE(?, name), connection_id = COALESCE(?, connection_id), \
                 model = COALESCE(?, model), enabled = COALESCE(?, enabled), \
                 rpm_limit = COALESCE(?, rpm_limit), token_cap = COALESCE(?, token_cap) \
          WHERE id = ?",
     )
+    .bind(expires_at.is_some())
+    .bind(expires_at.flatten())
     .bind(body.name)
     .bind(body.connection_id)
     .bind(body.model)
@@ -313,10 +317,13 @@ pub async fn update(
 // recorded for it. The old secret stops working at once, which is the point of rotating a key that may have
 // leaked. The new one is given back to its owner; an admin rotating another account's key is not given it,
 // for the same reason the list does not show it, and the owner reads it from their own list.
+// The body is an empty JSON object rather than nothing: a form on another page of the same site can post with the
+// session cookie but cannot send JSON, so it cannot rotate someone's key out from under their clients.
 pub async fn rotate(
     AxumState(st): AxumState<State>,
     Path(id): Path<i64>,
     caller: Caller,
+    Json(_): Json<serde_json::Value>,
 ) -> Response {
     let owner = match sqlx::query("SELECT user_id FROM api_keys WHERE id = ?")
         .bind(id)
@@ -335,9 +342,12 @@ pub async fn rotate(
         );
     }
     let key = new_key();
-    match sqlx::query("UPDATE api_keys SET key = ? WHERE id = ?")
+    // Only the key that was checked: an id freed by a delete in the meantime can be given to another account's new
+    // key, which this must not rotate.
+    match sqlx::query("UPDATE api_keys SET key = ? WHERE id = ? AND user_id = ?")
         .bind(&key)
         .bind(id)
+        .bind(owner)
         .execute(&st.pool)
         .await
     {

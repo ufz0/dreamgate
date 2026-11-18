@@ -5993,3 +5993,155 @@ async fn a_key_written_before_expiry_does_not_expire() {
         .get::<Option<String>, _>("expires_at");
     assert_eq!(expires_at, None);
 }
+
+// The expiry read exactly: a date past 9999 refused, an RFC 3339 time with an offset kept as the same moment in
+// UTC, blank on a new key read as none and on a change as clearing it, left out on a change left as it was, and a
+// change refused for another field leaving it as it was. A member rotates their own key and is given it, a key
+// that does not exist is not found, a rotation without a JSON body is refused, and neither a model list nor a
+// refused request counts as the key being used.
+#[tokio::test]
+async fn a_keys_expiry_is_read_exactly_and_a_refused_change_changes_nothing() {
+    let st = test_state().await;
+    let router = build_router(st.clone());
+    let base_url = mock_upstream().await;
+    let admin = register(&router, "ada").await;
+    post_json(
+        &router,
+        "/api/connections",
+        &admin,
+        json!({ "name": "test", "base_url": base_url, "default_model": "reports-usage" }),
+    )
+    .await;
+    for far in ["9999-12-31", "+12345-01-01T00:00:00Z"] {
+        let (status, _) = post_json(
+            &router,
+            "/api/keys",
+            &admin,
+            json!({ "name": "far", "expires_at": far }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{far}");
+    }
+    let (_, latest) = post_json(
+        &router,
+        "/api/keys",
+        &admin,
+        json!({ "name": "latest", "expires_at": "9999-12-30" }),
+    )
+    .await;
+    assert_eq!(latest["expires_at"], "9999-12-31T00:00:00Z");
+    let (_, blank) = post_json(
+        &router,
+        "/api/keys",
+        &admin,
+        json!({ "name": "blank", "expires_at": "  " }),
+    )
+    .await;
+    assert_eq!(blank["expires_at"], Value::Null);
+
+    let id = blank["id"].as_i64().unwrap();
+    let key = blank["key"].as_str().unwrap().to_string();
+    let stored = |router: Router, cookie: String| async move {
+        get_json(&router, "/api/keys", &cookie).await["keys"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|key| key["name"] == "blank")
+            .unwrap()
+            .clone()
+    };
+    let patch = |body: Value| {
+        let router = router.clone();
+        let admin = admin.clone();
+        async move {
+            send_json(
+                &router,
+                http::Method::PATCH,
+                &format!("/api/keys/{id}"),
+                &admin,
+                body,
+            )
+            .await
+            .0
+        }
+    };
+    assert_eq!(
+        patch(json!({ "expires_at": "2099-06-01T12:00:00+02:00" })).await,
+        StatusCode::OK
+    );
+    assert_eq!(
+        stored(router.clone(), admin.clone()).await["expires_at"],
+        "2099-06-01T10:00:00Z"
+    );
+    assert_eq!(patch(json!({ "name": "blank" })).await, StatusCode::OK);
+    assert_eq!(
+        stored(router.clone(), admin.clone()).await["expires_at"],
+        "2099-06-01T10:00:00Z",
+        "an expiry left out stays"
+    );
+    assert_eq!(
+        patch(json!({ "connection_id": 999, "expires_at": "2098-01-01" })).await,
+        StatusCode::BAD_REQUEST
+    );
+    assert_eq!(
+        stored(router.clone(), admin.clone()).await["expires_at"],
+        "2099-06-01T10:00:00Z",
+        "a change refused for another field changes the expiry no more"
+    );
+    assert_eq!(patch(json!({ "expires_at": "" })).await, StatusCode::OK);
+    assert_eq!(
+        stored(router.clone(), admin.clone()).await["expires_at"],
+        Value::Null
+    );
+
+    // Neither a model list nor a refused request is a use of the key.
+    models_call(&router, &key).await;
+    patch(json!({ "enabled": false })).await;
+    gateway_call(
+        &router,
+        &key,
+        json!({ "messages": [{ "role": "user", "content": "hi" }] }),
+    )
+    .await;
+    assert_eq!(
+        stored(router.clone(), admin.clone()).await["last_used_at"],
+        Value::Null
+    );
+
+    let (status, _) = post_json(&router, "/api/keys/999/rotate", &admin, json!({})).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let without_json = call(
+        &router,
+        Request::post(format!("/api/keys/{id}/rotate"))
+            .header("cookie", &admin)
+            .header("content-type", "application/x-www-form-urlencoded")
+            .body(Body::from("x=1"))
+            .unwrap(),
+    )
+    .await;
+    assert!(
+        without_json.status().is_client_error(),
+        "{}",
+        without_json.status()
+    );
+    assert_eq!(
+        stored(router.clone(), admin.clone()).await["key"],
+        key,
+        "not rotated"
+    );
+
+    open_registration(&router, &admin).await;
+    no_approval(&router, &admin).await;
+    let member = register(&router, "ben").await;
+    let (_, bens) = post_json(&router, "/api/keys", &member, json!({ "name": "b" })).await;
+    let (status, rotated) = post_json(
+        &router,
+        &format!("/api/keys/{}/rotate", bens["id"]),
+        &member,
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(rotated["key"].as_str().unwrap().starts_with("dreamgate_"));
+    assert_ne!(rotated["key"], bens["key"]);
+}

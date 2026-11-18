@@ -169,7 +169,7 @@
             <div class="field">
               <label for="key-expires">Expires</label>
               <p class="help" id="key-expires-help">The key works through this day in UTC and is refused after it. Leave it empty for a key that does not expire.</p>
-              <input id="key-expires" name="expires_at" type="date" aria-describedby="key-expires-help">
+              <input id="key-expires" name="expires_at" type="date" max="9999-12-30" aria-describedby="key-expires-help">
             </div>
           </div>
           <button type="submit">Create key</button>

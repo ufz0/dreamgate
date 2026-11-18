@@ -501,14 +501,21 @@ URL hash (`#/overview`, `#/activity`, `#/keys`, `#/connections`, `#/connect`, `#
   and see those keys with the account each one belongs to. Each key says when it was last used — the time of
   its last recorded request, read from the usage rows, so a request refused before it was recorded and a
   model list do not count — and when it expires, if it does. A key can be given an expiry when it is made
-  (`expires_at`, a date written `YYYY-MM-DD`, which it works through in UTC, or an RFC 3339 time), and
-  `PATCH /api/keys/{id}` sets or, with null, clears it; a time that has passed is refused, because a key is
-  stopped now by turning it off. A key past its expiry is refused at the gateway with 403 `key_expired`.
-  Rotating a key (`POST /api/keys/{id}/rotate`) gives it a new secret and keeps everything else — its id,
-  name, limits, binding and recorded usage — and the old secret is refused at once. The key itself is shown
-  to its owner alone: another account's key reaches an admin as a hint, its first ten and last four
-  characters, enough to tell it apart and to match one someone reports, and an admin who rotates another
-  account's key is not given the new one, which the owner reads from their own list.
+  (`expires_at`, a date written `YYYY-MM-DD`, which it works through in UTC, or an RFC 3339 time, whose offset
+  is turned into UTC), and `PATCH /api/keys/{id}` sets it or, with null or an empty string, clears it; a time
+  that has passed is refused, because a key is stopped now by turning it off, and so is one in the year 10000
+  or later, which would be stored with a sign and read as long passed: a key meant never to expire is given no
+  expiry. A change refused for any of its fields changes the expiry no more than the rest. A key past its
+  expiry is refused at the gateway with 403 `key_expired`; a request already running when it passes, a stream
+  included, runs to its end. The page shows an expiry given as a date as the day it works through. Rotating a
+  key (`POST /api/keys/{id}/rotate`, with an empty JSON object as its body, so a plain form on another page of
+  the same site cannot rotate it) gives it a new secret and keeps everything else — its id, name, limits,
+  binding, recorded usage and its place in the per-minute limit — and the old secret is refused for every
+  request after it; one already running on it runs to its end. The key itself is shown to its owner alone:
+  another account's key reaches an admin as a hint (`key_hint`), the fixed `dreamgate_` prefix with the first
+  four and the last four of its random characters, enough to tell it apart and to match one someone reports,
+  and an admin who rotates another account's key is not given the new one, which the owner reads from their
+  own list.
 - **Connections** — add and health-check upstreams. A connection that no check has reached yet reads "not
   checked yet" rather than down, here and in the gate readout on the Overview, because the gateway only puts
   one whose check failed behind the others. Beside its health is how many models its last list named, with the
@@ -636,10 +643,13 @@ a session or a DreamGate key.
   the key a connection carries and its address are returned to an admin alone, because an address names an
   internal host and port and can carry a credential of its own. A disabled account is refused at every
   gateway endpoint, not only at the completion path.
-- A key is shown to its owner alone. An admin manages every account's keys, and sees another account's key
-  by a hint of its first ten and last four characters, because a key is a credential that bills the account it
-  belongs to; rotating another account's key does not hand the admin the new one either. The keys are still
-  stored as they are, so the database itself is as sensitive as before.
+- - A key is shown to its owner alone, in the answers of the API and on the page. An admin manages every
+  account's keys, and sees another account's key by a hint, the fixed prefix with the first four and the last
+  four of its random characters, because a key is a credential that bills the account it belongs to; rotating
+  another account's key does not hand the admin the new one either. This keeps keys off an admin's screen, not
+  out of an admin's reach: an admin can set another account's password and sign in as it, and the owner would
+  notice only by their password no longer working. The keys are still stored as they are, so the database
+  itself is as sensitive as before.
 - A key, its account and its limits are read from the database on every request, and a read that fails — a
   write holding the database past the busy timeout, a disk that fails — answers 503 `unavailable` with a short
   reference and is logged under it, rather than letting the request through unchecked: a limit that could not
@@ -704,10 +714,13 @@ breaks off leaving the last one, the model list merging the lists in the order a
 a check read and a
 connection marked down included,
 the model recorded for a streamed request when nothing is pinned to a key or a connection,
-per-key limits and their validation, a key's expiry refused when it has passed, refusing the key at the gateway
-and the model list once it has, cleared with null and left empty on a key written before it, a key's last use,
-rotation keeping the id and the usage and refusing the old secret, an admin not given another account's new key
-or its key in the list, and a member unable to rotate another's, the per-key, per-account and per-model figures
+per-key limits and their validation, a key's expiry refused when it has passed or is past the year 9999, refusing
+the key at the gateway and the model list once it has, set with an offset and kept in UTC, left as it is when a
+change leaves it out or is refused for another field, cleared with null or an empty string and left empty on a key
+written before it, a key's last use, not moved by a model list or a refused request, rotation keeping the id and
+the usage and refusing the old secret, refused without a JSON body and not found for a key that does not exist,
+an admin not given another account's new key or its key in the list, a member rotating their own key and given
+it, and a member unable to rotate another's, the per-key, per-account and per-model figures
 carrying the input and the output apart, including for a key or an account with no usage and after a key is
 deleted, the keys list being the
 caller's own with the other

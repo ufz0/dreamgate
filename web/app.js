@@ -800,7 +800,10 @@ function keyModel(key, bound) {
 function keyTimes(key) {
   const used = key.last_used_at ? `last used ${key.last_used_at.slice(0, 16).replace('T', ' ')} UTC` : 'never used';
   if (!key.expires_at) return esc(used);
-  const at = `${key.expires_at.slice(0, 16).replace('T', ' ')} UTC`;
+  // An expiry given as a date is the first moment of the day after it, so it reads as the day it works through.
+  const at = key.expires_at.endsWith('T00:00:00Z')
+    ? `${new Date(Date.parse(key.expires_at) - 1).toISOString().slice(0, 10)} UTC, through the day`
+    : `${key.expires_at.slice(0, 16).replace('T', ' ')} UTC`;
   return new Date(key.expires_at) > new Date()
     ? `${esc(used)} · expires ${esc(at)}`
     : `${esc(used)} · <span class="danger">expired ${esc(at)}</span>`;
@@ -843,6 +846,8 @@ function keyOwnerOptions() {
 
 function renderKeys() {
   const admin = state.me.role === 'admin';
+  // A date that has already ended in UTC is refused, so it is not offered.
+  $('key-expires').min = new Date().toISOString().slice(0, 10);
   // The table above is this account's own keys for everyone; another account's keys are a
   // separate read an admin can ask for.
   $('other-keys-field').hidden = !admin;
@@ -1621,8 +1626,10 @@ document.addEventListener('click', async (event) => {
       `Give "${key.name}"${who} a new key? The old key stops working at once, so every client that uses it needs the new one. The key keeps its limits, its binding and its usage. ${after}`,
       'Rotate',
       async () => {
-        const rotated = await api(`/api/keys/${key.id}/rotate`, { method: 'POST' });
+        const rotated = await postJson(`/api/keys/${key.id}/rotate`, {});
+        // The Connect view and the Sandbox go on with the key they had picked, under its new secret.
         if (own && key.key === state.connectKey) state.connectKey = rotated.key;
+        if (own && key.key === state.sandboxKey) state.sandboxKey = rotated.key;
         await refresh('keys');
         notice(`Rotated "${key.name}". The old key no longer works.`);
       },
