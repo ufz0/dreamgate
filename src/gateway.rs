@@ -871,7 +871,7 @@ async fn forward(st: State, headers: HeaderMap, body: Value, endpoint: Endpoint)
         Err(blocked) => return *blocked,
     };
 
-    let candidates = registry::candidates(&st, key.connection_id).await;
+    let mut candidates = registry::candidates(&st, key.connection_id).await;
     if candidates.is_empty() {
         return error(
             StatusCode::BAD_GATEWAY,
@@ -881,6 +881,39 @@ async fn forward(st: State, headers: HeaderMap, body: Value, endpoint: Endpoint)
     }
     let wants_stream = endpoint.wants_stream(&body);
     let requested = body.get("model").and_then(Value::as_str);
+    // An upstream's answer is passed on as it is, a 404 for a model it does not have included, so the order is
+    // what decides whether a request for a model reaches one that serves it. A connection whose last list does
+    // not name the model it would be sent is tried after the others rather than left out, because a list is
+    // only read every 30 seconds and some servers answer to any name. That is only done when another connection
+    // would be sent the same model and its list names it: with nothing known for the model, moving one back would
+    // only hand the request to a connection known no better, whose 404 would then end it, and a connection whose
+    // own default it lists says nothing about a model it is not sent. The key's own connection is never moved,
+    // because binding a key is how a client is sent to the connection that serves it. The sort is stable, so the
+    // order within each part is the one `registry::candidates` gave, a connection marked down after the others;
+    // one marked down whose list names the model goes ahead of one that is up and does not.
+    let sent: Vec<Option<String>> = candidates
+        .iter()
+        .map(|conn| resolve_model(endpoint, key.model.as_deref(), conn, requested))
+        .collect();
+    let served = |model: &str| {
+        candidates.iter().zip(&sent).any(|(conn, sent)| {
+            sent.as_deref()
+                .is_some_and(|sent| registry::same_model(sent, model))
+                && conn.lists(model)
+        })
+    };
+    let moved: std::collections::HashSet<i64> = candidates
+        .iter()
+        .zip(&sent)
+        .filter(|(conn, sent)| {
+            Some(conn.id) != key.connection_id
+                && sent
+                    .as_deref()
+                    .is_some_and(|model| conn.lists_without(model) && served(model))
+        })
+        .map(|(conn, _)| conn.id)
+        .collect();
+    candidates.sort_by_key(|conn| moved.contains(&conn.id));
     // The request is admitted as a whole, before anything is asked of a connection, and the slots are held for
     // as long as it runs. Nothing is queued here: a connection that is full is skipped, so one slow
     // connection cannot hold unrelated requests behind it. Admitting once, at the start, is also what keeps a
@@ -1159,6 +1192,28 @@ async fn forward(st: State, headers: HeaderMap, body: Value, endpoint: Endpoint)
     error(StatusCode::BAD_GATEWAY, "upstream_unavailable", last_error)
 }
 
+// The models the connections listed at their last checks, each once, in the order of the key's connections,
+// and named after the first connection that lists it. A connection whose list has not been read is left out,
+// because what it serves is not known; nothing is made up for it. What is written is what that connection's list
+// said: the id and the time the model was made, when it gave one, and the connection as its owner in place of
+// the upstream's, which differs between upstreams for the same model.
+fn merged_models(candidates: &[registry::Connection]) -> Response {
+    let mut seen = std::collections::HashSet::new();
+    let mut data = Vec::new();
+    for conn in candidates {
+        for model in conn.models.iter().flatten() {
+            if seen.insert(model.id.as_str()) {
+                let mut entry = json!({ "id": model.id, "object": "model", "owned_by": conn.name });
+                if let Some(created) = model.created {
+                    entry["created"] = json!(created);
+                }
+                data.push(entry);
+            }
+        }
+    }
+    Json(json!({ "object": "list", "data": data })).into_response()
+}
+
 pub async fn list_models(AxumState(st): AxumState<State>, headers: HeaderMap) -> Response {
     if st.shutdown.phase() != Phase::Running {
         return shutting_down();
@@ -1191,17 +1246,19 @@ pub async fn list_models(AxumState(st): AxumState<State>, headers: HeaderMap) ->
         Ok(None) => return unknown_key(),
         Err(err) => return unreadable(err),
     }
-    let Some(conn) = registry::candidates(&st, key.connection_id)
-        .await
-        .first()
-        .cloned()
-    else {
+    let candidates = registry::candidates(&st, key.connection_id).await;
+    let Some(conn) = candidates.first().cloned() else {
         return error(
             StatusCode::BAD_GATEWAY,
             "no_upstream",
             "no enabled connection is available for this key",
         );
     };
+    if candidates.iter().any(|conn| conn.models.is_some()) {
+        return merged_models(&candidates);
+    }
+    // No list has been read yet, before the first round of checks or from upstreams whose list is not in the
+    // OpenAI shape, so the first connection is asked for its own.
     // The model list is a single answer, not a stream, so the same deadline covers it as covers any single
     // answer, as the client's total deadline did before this change.
     let result = st

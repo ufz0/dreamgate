@@ -249,8 +249,30 @@ it is enabled and the others by priority after it, and a connection that fails a
 to the next one. A connection whose last check marked it down is not skipped but tried last: the connections that
 are not marked down are tried first, then the ones that are, each in that same order, and no connection is tried
 twice for one request. A check is only every 30 seconds, so a connection marked down may be answering again, and
-a request still reaches one when every connection is marked down. The model list, `GET /v1/models`, reads the
-same order and asks the first connection in it, without falling over to the next.
+a request still reaches one when every connection is marked down.
+
+Each check also keeps the model list the connection answered with, and requests are routed by it. An upstream's
+answer is passed on as it is, a 404 for a model it does not have included, so a connection whose last list does
+not name the model it would be sent — for a generation the key's own model, the connection's default, or the one
+the client asked for, in that order, and for an embedding the one the client asked for first — is tried after
+the others when another connection that would be sent the same model lists it. It is moved back rather than left
+out, because a list is only read every 30 seconds and some servers answer to any name, and nothing is moved when
+no connection that would be sent the model lists it, because then none is known to serve it better and moving
+one back would only hand the request to another's 404. A connection whose default its list names keeps its own
+place by it, and moves no other connection for a model it is not sent. The key's own connection is never moved:
+binding a key is how a client is sent to the connection that serves it. A connection whose list has not been
+read keeps its place, because nothing is known against it, and otherwise the order is the one above, with one
+difference: a connection marked down whose list names the model goes ahead of one that is up and does not,
+because it is the only one that may serve it. A model Ollama lists as `name:latest` is found by `name` as well,
+and the other way round. A list is read whole or not at all: one in another shape, or with an entry that has no
+id, is kept as no list rather than as the part that could be read. A connection that fails its check, or whose
+list could not be read to its end, keeps the list it gave last.
+
+The model list, `GET /v1/models`, is those lists merged: each model once, in the order of the key's connections,
+and named (`owned_by`) after the first connection that lists it, with the time it was made (`created`) when that
+connection's list gave one. A connection whose list has not been read is left out of it, and one marked down is
+not. When no connection's list has been read yet, the list is asked of the first connection in the order,
+without falling over to the next.
 
 A recorded row also carries what the engine said about the request itself, when it said anything:
 the part of the prompt served from its cache, and how long reading the prompt took against how long
@@ -475,15 +497,17 @@ URL hash (`#/overview`, `#/activity`, `#/keys`, `#/connections`, `#/connect`, `#
   connection that is turned off. A key that is turned off stays listed and reads dimmer than the keys
   that work. The table is this account's own keys for anyone; under it an admin can pick another
   account, or all of them, and see those keys with the account each one belongs to.
-- **Connections** — add and health-check upstreams. A connection that no check has reached yet reads
-  "not checked yet" rather than down, here and in the gate readout on the Overview, because the gateway
-  only puts one whose check failed behind the others. Admin-only, like the per-account figures, and that
-  rule is on the routes as well as on the page. The key a connection carries is returned to an admin
+- **Connections** — add and health-check upstreams. A connection that no check has reached yet reads "not
+  checked yet" rather than down, here and in the gate readout on the Overview, because the gateway only puts
+  one whose check failed behind the others. Beside its health is how many models its last list named, with the
+  names on hover, or "models unknown" when no list has been read. Admin-only, like the per-account figures,
+  and that rule is on the routes as well as on the page. The key a connection carries is returned to an admin
   alone, and so is its address; every signed-in account still sees the connection itself — its name, health,
-  priority and default model — because the gate readout and the model list need it.
+  priority, default model and the ids its last list named — because the gate readout and the model list need
+  it; a key holder reads the ids of the connections that are turned on from `/v1/models` as well.
 - **Connect a client** — the base URL, a key picker, a copyable curl request.
 - **Sandbox** — chat with any model a connection serves, through the same gateway the clients
-  use, so the request is recorded like any other. Pick a key and a model from the connection's
+  use, so the request is recorded like any other. Pick a key and a model from the gateway's
   model list; the answer streams in as it arrives and the conversation stays in this page. A
   model that sends reasoning gets it as a separate section above the answer.
 - **Accounts** — per-account totals split into input and output tokens, beside what the account used
@@ -653,7 +677,16 @@ a connection marked down being tried after the ones that are not rather than ski
 connection is marked down, and a connection that is full passing the request on to one marked down,
 with a failure there naming the full one beside it, the model list asking a connection that is up before one
 marked down, an upstream that fails named by its connection and not by its address at the gateway endpoints,
-the round of health checks marking a connection that answers,
+the round of health checks marking a connection that answers, a check keeping the model list it read, reading a
+list in another shape as none and keeping the last list of a connection that does not answer, a request going
+first to a connection whose list names its model while one never read keeps its place and a key's own model is
+the one matched, a key's own connection never moved, nothing moved when no list names the model, a connection
+marked down that lists it going ahead of one that is up and does not, a connection's default and an embedding's
+model being the ones matched, a connection's default moving no other connection for a model no list names,
+`:latest` matched both ways, a list with an entry without an id read as none and an empty one kept, a list that
+breaks off leaving the last one, the model list merging the lists in the order a key reaches them with the dates
+a check read and a
+connection marked down included,
 the model recorded for a streamed request when nothing is pinned to a key or a connection,
 per-key limits and their validation, the per-key, per-account and per-model figures carrying the input and the
 output apart, including for a key or an account with no usage and after a key is deleted, the keys list being the
