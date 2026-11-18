@@ -363,7 +363,7 @@ and started again after the same 30 seconds, so health checking does not end wit
 
 A request that crossed the gate has been served, and billed by the upstream, so stopping the process must not
 lose its row. The gateway listens for the signals from before it prints that it is listening, so a stop sent
-once it has printed that is met by the steps below rather than by the signal's default, which ends a process at
+once that line is printed is met by the steps below rather than by the signal's default, which ends a process at
 once; a stop sent before then, while the database is opened and migrated, still ends it at once, with nothing
 taken yet to lose. On Ctrl-C, or the SIGTERM a service manager or a container runtime sends, the gateway:
 
@@ -756,8 +756,9 @@ process three signals with nothing in flight and a request holding it open whose
 that never comes, sent only once the server has answered it 100 Continue, and checks that the second does not
 stop it and the third does, with exit status 1. A unit test in `src/shutdown.rs` sends the process itself a
 SIGTERM, a SIGINT and another SIGTERM, each after the one before was taken in, and checks that none is lost.
-That the listeners are made before the listening line is printed is not tested, because a signal cannot be
-made to arrive in the moment between the two without stopping the process there by means of its own. The stopping phases are also
+That the listeners are made before the listening line is printed is not tested, because a signal cannot be made
+to arrive in the moment between the two without holding the process there, which only a hook in it could do. The
+stopping phases are also
 tested in `tests/concurrency.rs`: a request that arrives while stopping is turned away with 503 and not
 recorded, and so is one that passed the first check and waited on the database while the drain ended; the model
 list and the health check say so; a stream in flight is let finish with the drain ending only once its row is
