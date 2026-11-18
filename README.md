@@ -764,15 +764,15 @@ marked down that lists it going ahead of one that is up and does not, a connecti
 model being the ones matched, a connection's default moving no other connection for a model no list names,
 `:latest` matched both ways, a list with an entry without an id read as none and an empty one kept, a list that
 breaks off leaving the last one, the model list merging the lists in the order a key reaches them with the dates
-a check read and a connection marked down included, the activity history paged by row with each page naming the
-next, narrowed by key, account, model, outcome and whole UTC days, a member's history being its own and another
-account's refused, a filter that cannot be read refused, the CSV export carrying every matching row across the
-pages it is read in with empty cells for what nothing reported, quoting and a formula written as text at a
-cell's start, after a `;`, after a line break and after a quote that opens a part, a page larger than the most
-read as the most, a limit that cannot be read refused, a value left empty left out, a connection filter, a key
-deleted through the API reading as none with its row kept, a day ending before the first second of the next, a
-member's export its own rows and another account's key id giving it none, each connection's figures for the last
-day — a failure it
+a check read and a connection marked down included, the activity history paged by row with each page
+naming the next, narrowed by key, account, model, outcome and whole UTC days, a member's history being
+its own and another account's refused, a filter that cannot be read refused, the CSV export carrying
+every matching row across the pages it is read in with empty cells for what nothing reported, quoting
+and a formula written as text at a cell's start, after a `;`, after a line break and after a quote that
+opens a part, a page larger than the most read as the most, a limit that cannot be read refused, a value
+left empty left out, a connection filter, a key deleted through the API reading as none with its row
+kept, a day ending before the first second of the next, a member's export its own rows and another
+account's key id giving it none, each connection's figures for the last day — a failure it
 passed on and one it could not, a failure before a full connection still passed on, a model list's failure
 never passed on, a single answer that broke off passed on and a stream that broke off counted as a failure and
 not as an answer, an error answer counted and left out of the times, rows older than the day left out, the
