@@ -1230,7 +1230,8 @@ function showFirstPasswordNote() {
   const login = state.settings.has_accounts && mode === 'login';
   $('first-password-note').hidden = !login;
   $('setup-code-toggle').hidden = !login;
-  if (!login) showSetupCodeField(false);
+  // Run on every switch, so the password field says what it is for in the mode it is now in.
+  showSetupCodeField(login && !$('setup-code-field').hidden);
 }
 
 // With a setup code, the password typed is the new one to set rather than one to check, so the field says so
@@ -1610,7 +1611,7 @@ document.addEventListener('click', async (event) => {
     if (user.setup_code_expires_at && new Date(user.setup_code_expires_at) > new Date()) {
       confirmAction(
         'Replace the setup code?',
-        `The code "${user.username}" was given still works until ${utcTime(user.setup_code_expires_at)}. A new one replaces it, and the old one stops working.`,
+        `The code given to "${user.username}" still works until ${utcTime(user.setup_code_expires_at)}. A new one replaces it, and the old one stops working.`,
         'Replace',
         issue,
       );
@@ -1630,7 +1631,13 @@ document.addEventListener('click', async (event) => {
       notice('A new password must be at least 8 characters.', 'error');
       return;
     }
-    await changeAccount(user, { password: value }, `Set a new password for "${user.username}".`);
+    await changeAccount(
+      user,
+      { password: value },
+      user.id === state.me.id
+        ? 'Set your new password. Your other sessions are signed out.'
+        : `Set a new password for "${user.username}". They are signed out.`,
+    );
     return;
   }
   if (button.dataset.status) {

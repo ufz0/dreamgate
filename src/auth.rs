@@ -32,6 +32,9 @@ pub struct Caller {
     pub id: i64,
     pub username: String,
     pub role: String,
+    // The session the request came with, so an action that ends an account's sessions can keep the one the
+    // caller is using.
+    pub token: String,
 }
 
 // The session middleware resolves the account once; handlers take Caller as an
@@ -97,16 +100,20 @@ pub async fn require_session(
         id: row.get::<i64, _>("id"),
         username: row.get::<String, _>("username"),
         role: row.get::<String, _>("role"),
+        token,
     });
     next.run(req).await
 }
+
+// One cost for every hash, the one nothing matches included, so a refusal takes as long as a wrong password.
+const BCRYPT_COST: u32 = 10;
 
 // Bcrypt is genuinely CPU-bound: a cost-10 hash takes tens of milliseconds, which is long enough to
 // hold the runtime worker an async handler is standing on while other requests are only waiting for an
 // upstream. It is moved to the blocking pool, which is the one place this code uses it.
 pub async fn hash_password(password: &str) -> Result<String, String> {
     let password = password.to_string();
-    let joined = tokio::task::spawn_blocking(move || bcrypt::hash(&password, 10))
+    let joined = tokio::task::spawn_blocking(move || bcrypt::hash(&password, BCRYPT_COST))
         .await
         .map_err(|err| err.to_string())?;
     joined.map_err(|err| err.to_string())
@@ -117,8 +124,14 @@ pub async fn hash_password(password: &str) -> Result<String, String> {
 // time an answer takes does not say which usernames exist or which accounts are waiting for a code. It is made
 // on the blocking pool the first time it is needed, like any other hash.
 static NOTHING_TO_CHECK: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
-    bcrypt::hash("there is nothing to check this against", 10).unwrap_or_default()
+    bcrypt::hash("there is nothing to check this against", BCRYPT_COST).unwrap_or_default()
 });
+
+// Made at the start, on the blocking pool, so the first refusal after a start does not take longer than the
+// others by the time making it takes.
+pub fn prepare_refusals() {
+    tokio::task::spawn_blocking(|| std::sync::LazyLock::force(&NOTHING_TO_CHECK));
+}
 
 async fn check_nothing(given: &str) {
     let given = given.to_string();

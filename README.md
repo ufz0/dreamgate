@@ -621,8 +621,8 @@ because those reference it with `ON DELETE CASCADE`. An admin cannot delete the 
 signed in with. Changing one field changes only that field, so setting a password does not clear a
 limit. A password an admin sets cancels a setup code given before it and signs the account out, as a
 reset with a code does, because a password is set for someone most often when the old one is lost or
-known to someone else; an admin setting their own password stays signed in, because the page they set
-it from is one of those sessions and cannot be told apart from the others.
+known to someone else; an admin who sets their own password is signed out everywhere but the session
+they set it from, so that page stays signed in.
 
 It follows the system theme with a manual light/dark toggle next to Sign out, the sidebar collapses
 to an icon rail and becomes a drawer under 768px, and deleting a key, an account or a connection
@@ -730,16 +730,17 @@ queries and the split between a caller's own figures and the platform total, eve
 however many there are, including one past the twentieth by name that is waiting for approval, a taken username named when registering, including one held for approval, with any other failure
 answered as a server error, the registration setting being read before sign in and closed by default after the
 first account, approval being on by default and blocking a sign-in until an admin grants it, an
-account made by an admin signed into only with its setup code, the code used once, typed in any case and
-without its dashes, and refused with one answer when it is wrong, expired, or given for a username nobody has,
-a new code resetting a password that keeps working until it is used, then signing out the account's sessions,
-a password the admin sets cancelling a code and signing the other account out while the admin's own stays signed
-in, a code waiting for a disabled or pending account and working once it is let in, a blank code read as none,
-a code with no time refused, code sign-ins counting toward the attempt limit, a code working for seven days, an
-account from before codes with no password claimed by nobody until it is given one, the account races, run
-against several database connections at once: many registrations at the same moment on an empty instance making
-one admin that is not held for approval, and two sign-ins at the same moment with one setup code letting one in,
-with the other refused and the stored password the one that was let in, the account actions (disable,
+account made by an admin signed into only with its setup code, the code used once, typed in any case and without
+its dashes, and refused with one answer when it is wrong, expired, or given for a username nobody has, a new
+code resetting a password that keeps working until it is used, then signing out the account's sessions, a
+password the admin sets cancelling a code and signing the account out, the admin's own sessions included but the
+one it was set from, a code waiting for a disabled or pending account and working once it is let in, a blank
+code read as none, a code with no time refused, code sign-ins counting toward the attempt limit, a code working
+for seven days, an account from before codes with no password claimed by nobody until it is given one, the
+account races, run against several database connections at once: many registrations at the same moment on an
+empty instance making one admin that is not held for approval, and two sign-ins at the same moment with one
+setup code letting one in, with the other refused and the stored password the one that was let in, the account
+actions (disable,
 rename, new password, approve, delete) and what they do to a sign-in, a key and the recorded usage,
 that deleting a key leaves the rows recorded for it and the
 counters standing, the presence counts while a request is in flight, a stream's progress reaching the live

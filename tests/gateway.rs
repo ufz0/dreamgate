@@ -2713,13 +2713,14 @@ async fn a_setup_code_waits_for_the_account_to_be_let_in_and_counts_as_an_attemp
     assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
 }
 
-// A password an admin sets for someone else signs that account out; one an admin sets for themselves leaves the
-// page they set it from signed in.
+// A password an admin sets signs the account out, the admin's own included, except for the session the admin set
+// it from.
 #[tokio::test]
-async fn a_password_an_admin_sets_signs_the_other_account_out() {
+async fn a_password_an_admin_sets_signs_the_account_out_but_the_admins_page() {
     let st = test_state().await;
     let router = build_router(st.clone());
     let admin = register(&router, "ada").await;
+    let elsewhere = sign_in(&router, "ada", "test-password").await;
     let ada = get_json(&router, "/api/me", &admin).await["id"]
         .as_i64()
         .unwrap();
@@ -2759,7 +2760,16 @@ async fn a_password_an_admin_sets_signs_the_other_account_out() {
         assert_eq!(status, StatusCode::OK);
     }
     assert_eq!(me(session).await, StatusCode::UNAUTHORIZED);
-    assert_eq!(me(admin.clone()).await, StatusCode::OK);
+    assert_eq!(
+        me(elsewhere).await,
+        StatusCode::UNAUTHORIZED,
+        "the admin's other session ends"
+    );
+    assert_eq!(
+        me(admin.clone()).await,
+        StatusCode::OK,
+        "the page it was set from stays"
+    );
     sign_in(&router, "ben", "set-by-the-admin").await;
 }
 

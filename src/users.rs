@@ -325,9 +325,9 @@ pub async fn update(
                 };
                 // A password the admin sets is the newest word on it, so a code given out before it can no
                 // longer replace it. It also ends the account's sign-ins, as a reset with a code does, because an
-                // admin sets a password for someone most often when the old one is lost or known to someone else.
-                // An admin setting their own is the exception: the page they set it from is one of those
-                // sign-ins, and a session cannot be told apart from the others here.
+                // admin sets a password for someone most often when the old one is lost or known to someone else,
+                // their own included. The session the admin is using is kept, so the page they set it from stays
+                // signed in; for another account it is not one of that account's sessions, so all of them end.
                 let mut tx = match st.pool.begin().await {
                     Ok(tx) => tx,
                     Err(err) => return server_error(err),
@@ -343,9 +343,10 @@ pub async fn update(
                 {
                     return server_error(err);
                 }
-                if id != caller.id
-                    && let Err(err) = sqlx::query("DELETE FROM sessions WHERE user_id = ?")
+                if let Err(err) =
+                    sqlx::query("DELETE FROM sessions WHERE user_id = ? AND token != ?")
                         .bind(id)
+                        .bind(&caller.token)
                         .execute(&mut *tx)
                         .await
                 {
