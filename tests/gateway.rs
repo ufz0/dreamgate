@@ -3801,7 +3801,7 @@ async fn the_usage_indexes_are_in_place_after_the_table_is_rebuilt() {
     assert_eq!(key_action(&pool).await, "SET NULL", "the table was rebuilt");
     assert_eq!(
         usage_indexes(&pool).await.join(","),
-        "idx_usage_created,idx_usage_key,idx_usage_user"
+        "idx_usage_created,idx_usage_key,idx_usage_key_created,idx_usage_user"
     );
     // A per-account query reads through its index rather than the whole table.
     let plan = sqlx::query("EXPLAIN QUERY PLAN SELECT COUNT(*) FROM usage WHERE user_id = 1")
@@ -3819,7 +3819,7 @@ async fn the_usage_indexes_are_in_place_after_the_table_is_rebuilt() {
     db::migrate(&pool).await.unwrap();
     assert_eq!(
         usage_indexes(&pool).await.join(","),
-        "idx_usage_created,idx_usage_key,idx_usage_user"
+        "idx_usage_created,idx_usage_key,idx_usage_key_created,idx_usage_user"
     );
 }
 
@@ -3991,7 +3991,7 @@ async fn a_rebuild_left_unfinished_by_an_earlier_start_is_run_again() {
     assert_eq!(count(&pool, "sessions").await, 1);
     assert_eq!(
         usage_indexes(&pool).await.join(","),
-        "idx_usage_created,idx_usage_key,idx_usage_user"
+        "idx_usage_created,idx_usage_key,idx_usage_key_created,idx_usage_user"
     );
 }
 
@@ -7431,6 +7431,7 @@ async fn a_keys_day_and_month_limits_hold_and_each_answer_says_what_was_left() {
     .await
     .unwrap();
     let key = daily["key"].as_str().unwrap().to_string();
+    let key_daily = key.clone();
     let expected = [("40", "10", false), ("22", "9", false), ("4", "8", true)];
     for (tokens_left, requests_left, warned) in expected {
         let response = gateway_call(&router, &key, body.clone()).await;
@@ -7520,6 +7521,33 @@ async fn a_keys_day_and_month_limits_hold_and_each_answer_says_what_was_left() {
     )
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
+    // Null removes a day limit, and the key is then held by its month alone; a change that leaves the month out
+    // leaves it as it was.
+    let (status, _) = send_json(
+        &router,
+        http::Method::PATCH,
+        &format!("/api/keys/{}", daily["id"]),
+        &admin,
+        json!({ "daily_token_cap": null }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let keys = get_json(&router, "/api/keys", &admin).await;
+    let listed = keys["keys"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|key| key["name"] == "daily")
+        .unwrap()
+        .clone();
+    assert_eq!(listed["daily_token_cap"], Value::Null);
+    assert_eq!(listed["monthly_token_cap"], 1000);
+    let response = gateway_call(&router, &key_daily, body.clone()).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        header(&response, "x-dreamgate-tokens-window").as_deref(),
+        Some("key-month")
+    );
     let (_, plain) = post_json(&router, "/api/keys", &admin, json!({ "name": "plain" })).await;
     let response = gateway_call(&router, plain["key"].as_str().unwrap(), body).await;
     assert_eq!(
@@ -7566,4 +7594,96 @@ async fn a_key_written_before_its_day_and_month_limits_has_neither() {
         .unwrap();
     assert_eq!(row.get::<Option<i64>, _>("daily_token_cap"), None);
     assert_eq!(row.get::<Option<i64>, _>("monthly_token_cap"), None);
+}
+
+// A key's day begins at 00:00:00 UTC and its month at 00:00:00 UTC on the first, for the list and for the
+// gateway alike: a row at either first second counts, and one in the last second before it does not. On the first
+// of a month the day and the month begin together, and yesterday's last second is last month's.
+#[tokio::test]
+async fn a_keys_day_and_month_begin_at_their_first_second() {
+    use chrono::Datelike;
+    let st = test_state().await;
+    let router = build_router(st.clone());
+    let base_url = mock_upstream().await;
+    let admin = register(&router, "ada").await;
+    let ada = get_json(&router, "/api/me", &admin).await["id"]
+        .as_i64()
+        .unwrap();
+    post_json(
+        &router,
+        "/api/connections",
+        &admin,
+        json!({ "name": "test", "base_url": base_url, "default_model": "reports-usage" }),
+    )
+    .await;
+    let today = chrono::Utc::now().date_naive();
+    let day = |date: chrono::NaiveDate, time: &str| format!("{}T{time}Z", date.format("%Y-%m-%d"));
+    let first = today.with_day(1).unwrap();
+    // Each edge is given its own power of ten, so the sums say which rows were counted.
+    let rows = [
+        (day(today, "00:00:00"), 1),
+        (day(today.pred_opt().unwrap(), "23:59:59"), 10),
+        (day(first, "00:00:00"), 100),
+        (day(first.pred_opt().unwrap(), "23:59:59"), 1000),
+    ];
+    let (used_today, used_this_month) = if today.day() == 1 {
+        (101, 101)
+    } else {
+        (1, 111)
+    };
+
+    let body = json!({ "messages": [{ "role": "user", "content": "hi" }] });
+    // One key whose day has the least left, and one whose month has.
+    for (name, daily, monthly, window, left) in [
+        ("day", 1000, 1_000_000, "key-day", 1000 - used_today),
+        ("month", 1_000_000, 200, "key-month", 200 - used_this_month),
+    ] {
+        let (_, made) = post_json(
+            &router,
+            "/api/keys",
+            &admin,
+            json!({ "name": name, "daily_token_cap": daily, "monthly_token_cap": monthly }),
+        )
+        .await;
+        for (at, tokens) in &rows {
+            sqlx::query(
+                "INSERT INTO usage (api_key_id, user_id, model, prompt_tokens, completion_tokens, total_tokens, \
+                 latency_ms, status, created_at) VALUES (?, ?, 'm', ?, 0, ?, 5, 200, ?)",
+            )
+            .bind(made["id"].as_i64().unwrap())
+            .bind(ada)
+            .bind(tokens)
+            .bind(tokens)
+            .bind(at)
+            .execute(&st.pool)
+            .await
+            .unwrap();
+        }
+        let keys = get_json(&router, "/api/keys", &admin).await;
+        let listed = keys["keys"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|key| key["name"] == name)
+            .unwrap()
+            .clone();
+        assert_eq!(listed["used_today"], used_today, "{name}");
+        assert_eq!(listed["used_this_month"], used_this_month, "{name}");
+        let response = gateway_call(&router, made["key"].as_str().unwrap(), body.clone()).await;
+        let header = |name: &str| {
+            response
+                .headers()
+                .get(name)
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .to_string()
+        };
+        assert_eq!(header("x-dreamgate-tokens-window"), window);
+        assert_eq!(
+            header("x-dreamgate-tokens-remaining"),
+            left.to_string(),
+            "{name}"
+        );
+    }
 }

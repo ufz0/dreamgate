@@ -101,6 +101,9 @@ pub const SCHEMA: &[&str] = &[
 const INDEXES: &[&str] = &[
     "CREATE INDEX IF NOT EXISTS idx_usage_created ON usage (created_at)",
     "CREATE INDEX IF NOT EXISTS idx_usage_key ON usage (api_key_id)",
+    // A key's day and month limits sum its rows from a moment on; without the time beside the key the read would
+    // pass over every row the key ever had.
+    "CREATE INDEX IF NOT EXISTS idx_usage_key_created ON usage (api_key_id, created_at)",
     "CREATE INDEX IF NOT EXISTS idx_usage_user ON usage (user_id)",
     "CREATE INDEX IF NOT EXISTS idx_failures_created ON connection_failures (created_at)",
     // Removing a connection removes its failures, which would otherwise read the whole table to find them.

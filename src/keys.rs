@@ -31,8 +31,11 @@ pub struct UpdateKey {
     pub enabled: Option<bool>,
     pub rpm_limit: Option<i64>,
     pub token_cap: Option<i64>,
-    pub daily_token_cap: Option<i64>,
-    pub monthly_token_cap: Option<i64>,
+    // Left out, a day or a month limit stays as it is; null removes it.
+    #[serde(default, deserialize_with = "given")]
+    pub daily_token_cap: Option<Option<i64>>,
+    #[serde(default, deserialize_with = "given")]
+    pub monthly_token_cap: Option<Option<i64>>,
     // Left out, the expiry stays as it is; null clears it, so the key no longer expires.
     #[serde(default, deserialize_with = "given")]
     pub expires_at: Option<Option<String>>,
@@ -305,8 +308,8 @@ pub async fn update(
     if [
         body.rpm_limit,
         body.token_cap,
-        body.daily_token_cap,
-        body.monthly_token_cap,
+        body.daily_token_cap.flatten(),
+        body.monthly_token_cap.flatten(),
     ]
     .iter()
     .any(|limit| limit.is_some_and(|value| value < 1))
@@ -314,7 +317,7 @@ pub async fn update(
         return error(
             StatusCode::BAD_REQUEST,
             "invalid_request",
-            "limits must be a positive number, or left out",
+            "limits must be a positive number, or left unset",
         );
     }
     // Read before anything is written, so an expiry that cannot be read changes nothing else either.
@@ -334,8 +337,8 @@ pub async fn update(
                 name = COALESCE(?, name), connection_id = COALESCE(?, connection_id), \
                 model = COALESCE(?, model), enabled = COALESCE(?, enabled), \
                 rpm_limit = COALESCE(?, rpm_limit), token_cap = COALESCE(?, token_cap), \
-                daily_token_cap = COALESCE(?, daily_token_cap), \
-                monthly_token_cap = COALESCE(?, monthly_token_cap) \
+                daily_token_cap = CASE WHEN ? THEN ? ELSE daily_token_cap END, \
+                monthly_token_cap = CASE WHEN ? THEN ? ELSE monthly_token_cap END \
          WHERE id = ?",
     )
     .bind(expires_at.is_some())
@@ -346,8 +349,10 @@ pub async fn update(
     .bind(body.enabled.map(|v| v as i64))
     .bind(body.rpm_limit)
     .bind(body.token_cap)
-    .bind(body.daily_token_cap)
-    .bind(body.monthly_token_cap)
+    .bind(body.daily_token_cap.is_some())
+    .bind(body.daily_token_cap.flatten())
+    .bind(body.monthly_token_cap.is_some())
+    .bind(body.monthly_token_cap.flatten())
     .bind(id)
     .execute(&st.pool)
     .await;

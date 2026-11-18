@@ -309,52 +309,58 @@ async fn enforce_limits(
             in_flight: 0,
         }));
     }
-    // A key's day and month are UTC, as the account's day is, and are read from the moment they began written as
-    // the rows write a moment, so the comparison is one of text and the rows are found through the key's index.
-    let today = Utc::now();
-    let windows = [
-        (
-            key.daily_token_cap,
-            format!("{}T00:00:00Z", today.format("%Y-%m-%d")),
-            Window::KeyDay,
-        ),
-        (
-            key.monthly_token_cap,
-            format!("{}-01T00:00:00Z", today.format("%Y-%m")),
-            Window::KeyMonth,
-        ),
-    ];
-    let mut key_windows = [None, None];
-    for (slot, (cap, since, window)) in key_windows.iter_mut().zip(windows) {
-        let Some(cap) = cap else { continue };
-        let read = match sqlx::query(
-            "SELECT COALESCE(SUM(total_tokens), 0) AS used, \
-             (SELECT COALESCE(MAX(id), 0) FROM usage) AS seen FROM usage \
-             WHERE api_key_id = ? AND created_at >= ?",
-        )
-        .bind(key.id)
-        .bind(since)
-        .fetch_one(&st.pool)
-        .await
-        {
-            Ok(row) => reading(cap, row),
-            Err(err) => return Err(Box::new(unreadable(err))),
-        };
-        if read.used >= read.limit {
-            return Err(refuse(match window {
-                Window::KeyDay => Refusal::KeyDayCap {
+    // A key's day and month are UTC, as the account's day is, and begin at their first moment written as the rows
+    // write a moment, so the comparison is one of text and the rows are found through the index on the key and the
+    // time. The day lies within the month, so one read of the month gives both.
+    let (key_day_cap, key_month_cap) = match (key.daily_token_cap, key.monthly_token_cap) {
+        (None, None) => (None, None),
+        (day, month) => {
+            let now = Utc::now();
+            let row = match sqlx::query(
+                "SELECT COALESCE(SUM(CASE WHEN created_at >= ? THEN total_tokens END), 0) AS day, \
+                 COALESCE(SUM(total_tokens), 0) AS month, \
+                 (SELECT COALESCE(MAX(id), 0) FROM usage) AS seen FROM usage \
+                 WHERE api_key_id = ? AND created_at >= ?",
+            )
+            .bind(format!("{}T00:00:00Z", now.format("%Y-%m-%d")))
+            .bind(key.id)
+            .bind(format!("{}-01T00:00:00Z", now.format("%Y-%m")))
+            .fetch_one(&st.pool)
+            .await
+            {
+                Ok(row) => row,
+                Err(err) => return Err(Box::new(unreadable(err))),
+            };
+            let seen = row.get::<i64, _>("seen");
+            let day = day.map(|limit| Reading {
+                limit,
+                used: row.get::<i64, _>("day"),
+                seen,
+            });
+            let month = month.map(|limit| Reading {
+                limit,
+                used: row.get::<i64, _>("month"),
+                seen,
+            });
+            if let Some(read) = day
+                && read.used >= read.limit
+            {
+                return Err(refuse(Refusal::KeyDayCap {
                     cap: read.limit,
                     in_flight: 0,
-                },
-                _ => Refusal::KeyMonthCap {
+                }));
+            }
+            if let Some(read) = month
+                && read.used >= read.limit
+            {
+                return Err(refuse(Refusal::KeyMonthCap {
                     cap: read.limit,
                     in_flight: 0,
-                },
-            }));
+                }));
+            }
+            (day, month)
         }
-        *slot = Some(read);
-    }
-    let [key_day_cap, key_month_cap] = key_windows;
+    };
     let day_cap = match account.get::<Option<i64>, _>("daily_token_cap") {
         Some(cap) => match sqlx::query(
             "SELECT COALESCE(SUM(total_tokens), 0) AS used, \
@@ -399,7 +405,7 @@ async fn enforce_limits(
 // may read mean a window of a minute, and these windows are a day, a month, or a key's whole life.
 const WARN_BELOW_PERCENT: i64 = 20;
 
-fn left_headers(response: &mut Response, key: &KeyInfo, left: Left) {
+fn left_headers(response: &mut Response, left: Left) {
     let headers = response.headers_mut();
     let number = |value: i64| HeaderValue::from(value.max(0));
     if let Some((limit, remaining)) = left.requests {
@@ -414,18 +420,18 @@ fn left_headers(response: &mut Response, key: &KeyInfo, left: Left) {
             HeaderValue::from_static(window.label()),
         );
         if remaining.saturating_mul(100) <= limit.saturating_mul(WARN_BELOW_PERCENT) {
+            // The limit is named by what it is rather than by the key's name, which is the account's own text and
+            // could carry what a header cannot, or arrive garbled in a client that reads a header as Latin-1.
             let whose = match window {
-                Window::AccountDay => "the account's daily token limit".to_string(),
-                Window::Key => format!("key '{}'s token cap", key.name),
-                Window::KeyDay => format!("key '{}'s daily token limit", key.name),
-                Window::KeyMonth => format!("key '{}'s monthly token limit", key.name),
+                Window::AccountDay => "the account's daily token limit",
+                Window::Key => "the key's token cap",
+                Window::KeyDay => "the key's daily token limit",
+                Window::KeyMonth => "the key's monthly token limit",
             };
             let warning = format!(
                 "{} input and output tokens of {whose} of {limit} were left before this request",
                 remaining.max(0)
             );
-            // A key's name is the account's own text, so one a header cannot carry leaves the warning out
-            // rather than the answer.
             if let Ok(value) = HeaderValue::from_str(&warning) {
                 headers.insert("x-dreamgate-budget-warning", value);
             }
@@ -1025,14 +1031,48 @@ async fn forward(st: State, headers: HeaderMap, body: Value, endpoint: Endpoint)
     let present = presence::track(&st, key.user_id);
     let prompt_tokens = endpoint.prompt_tokens(&body);
     // Dropped without being settled, as on every early answer below, the hold is given back.
-    let mut reservation = match enforce_limits(&st, &key, prompt_tokens).await {
+    let reservation = match enforce_limits(&st, &key, prompt_tokens).await {
         Ok(reservation) => reservation,
         Err(blocked) => return *blocked,
     };
     // Every answer from here on carries what was left of the key's and the account's limits when the request was
-    // admitted, so the tail is one block whose answer the headers are added to, whichever way it ends.
+    // admitted, so the rest of the request is a function of its own whose answer the headers are added to,
+    // whichever way it ends.
     let left = reservation.left();
-    let mut response = async {
+    let admitted = Admitted {
+        key,
+        started,
+        prompt_tokens,
+        present,
+        reservation,
+    };
+    let mut response = admitted_request(st, body, endpoint, admitted).await;
+    left_headers(&mut response, left);
+    response
+}
+
+// What admission produced, handed on as one so the request after it is not a function of eight arguments.
+struct Admitted {
+    key: KeyInfo,
+    started: Instant,
+    prompt_tokens: i64,
+    present: Active,
+    reservation: Reservation,
+}
+
+async fn admitted_request(
+    st: State,
+    body: Value,
+    endpoint: Endpoint,
+    admitted: Admitted,
+) -> Response {
+    let Admitted {
+        key,
+        started,
+        prompt_tokens,
+        present,
+        mut reservation,
+    } = admitted;
     let mut candidates = registry::candidates(&st, key.connection_id).await;
     if candidates.is_empty() {
         return error(
@@ -1359,10 +1399,6 @@ async fn forward(st: State, headers: HeaderMap, body: Value, endpoint: Endpoint)
         );
     }
     error(StatusCode::BAD_GATEWAY, "upstream_unavailable", last_error)
-    }
-    .await;
-    left_headers(&mut response, &key, left);
-    response
 }
 
 // The models the connections listed at their last checks, each once, in the order of the key's connections,

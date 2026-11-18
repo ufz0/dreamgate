@@ -977,8 +977,8 @@ function keyTimes(key) {
 function keyLimits(key) {
   const lines = [key.rpm_limit ? `${key.rpm_limit}/min` : 'no rate limit'];
   lines.push(key.token_cap ? `${nf.format(key.token_cap)} input + output tokens` : 'no token cap');
-  if (key.daily_token_cap) lines.push(`${nf.format(key.used_today)} of ${nf.format(key.daily_token_cap)} today`);
-  if (key.monthly_token_cap) lines.push(`${nf.format(key.used_this_month)} of ${nf.format(key.monthly_token_cap)} this month`);
+  if (key.daily_token_cap) lines.push(`${nf.format(key.used_today)} of ${nf.format(key.daily_token_cap)} input + output tokens today`);
+  if (key.monthly_token_cap) lines.push(`${nf.format(key.used_this_month)} of ${nf.format(key.monthly_token_cap)} input + output tokens this month`);
   return lines.map(esc).join('<br>');
 }
 
