@@ -609,3 +609,8 @@ input:focus-visible, select:focus-visible, textarea:focus-visible, button:focus-
 @media (prefers-reduced-motion: reduce) {
   * { transition: none !important; animation: none !important; }
 }
+
+/* The Activity filters sit in one row that wraps, each as narrow as its control allows. */
+.filters { display: flex; flex-wrap: wrap; gap: 12px; align-items: flex-end; margin-bottom: 16px; }
+.filters .field { margin-bottom: 0; flex: 1 1 9rem; max-width: 14rem; }
+.filters .filter-actions { display: flex; gap: 8px; align-items: center; }

@@ -126,12 +126,27 @@
       <section class="view" data-view="activity" hidden>
         <h1>Activity</h1>
         <p class="lede" id="activity-lede"></p>
+        <form id="activity-filters" class="filters">
+          <label class="field">Key<select name="key" id="activity-key"></select></label>
+          <label class="field" id="activity-user-field">Account<select name="user" id="activity-user"></select></label>
+          <label class="field">Connection<select name="connection" id="activity-connection"></select></label>
+          <label class="field">Model<input name="model" list="activity-models" autocomplete="off"><datalist id="activity-models"></datalist></label>
+          <label class="field">Outcome<select name="outcome"><option value="">Any</option><option value="ok">Answered</option><option value="error">Errors</option></select></label>
+          <label class="field">From<input name="since" type="date"></label>
+          <label class="field">To<input name="until" type="date"></label>
+          <div class="filter-actions">
+            <button type="submit">Show</button>
+            <button type="button" class="secondary" id="activity-clear">Clear</button>
+            <button type="button" class="secondary" id="activity-export">Export CSV</button>
+          </div>
+        </form>
         <div class="table">
           <table id="activity">
             <thead id="activity-head"></thead>
             <tbody id="activity-body"></tbody>
           </table>
         </div>
+        <p class="value-line"><button type="button" class="link" id="activity-older" hidden>Load older requests</button></p>
         <h2>Usage by model, the eight with the most tokens, input and output together</h2>
         <div class="table">
           <table id="models">

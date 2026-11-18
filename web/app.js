@@ -61,6 +61,9 @@ const state = {
   // read failed, so neither is shown as a connection that had no requests.
   connectionFigures: null,
   connectionFiguresError: null,
+  // The Activity view's rows, read a page at a time with the filters that were applied, and the id to read the
+  // page after them from.
+  activity: { filters: {}, rows: [], next: null, loaded: false },
   keyOwner: '',
   connections: [],
   events: [],
@@ -263,6 +266,7 @@ function route() {
   // on every page load.
   if (state.view === 'sandbox' && !state.models.length && state.keys.length) loadModels().then(() => renderSandbox());
   if (state.view === 'connections') loadConnectionFigures().then(() => state.view === 'connections' && renderConnections());
+  if (state.view === 'activity' && !state.activity.loaded) loadActivity(false).then(() => renderActivity()).catch(report);
 }
 
 function render(arrived) {
@@ -442,6 +446,8 @@ function subscribe() {
     }
     state.events.unshift(payload.event);
     state.events = state.events.slice(0, 50);
+    // A row that arrives belongs at the top of the Activity view only while nothing narrows what it shows.
+    if (state.activity.loaded && !activityFiltered()) state.activity.rows.unshift(payload.event);
     const event = payload.event;
     retireStream(event.stream);
     // Every event counts toward the total the gate has produced, but only the caller's own events
@@ -764,22 +770,60 @@ function renderFeed(arrived) {
 
 // Activity
 
-// The recent rows and the models are an admin's for every account and anyone else's for their own, the
-// same scope the live stream keeps, so the lede says which.
+function activityFiltered() {
+  return Object.values(state.activity.filters).some(Boolean);
+}
+
+function activityQuery(extra = {}) {
+  const params = new URLSearchParams();
+  for (const [name, value] of Object.entries({ ...state.activity.filters, ...extra })) if (value) params.set(name, value);
+  return params.toString();
+}
+
+// The first page with the filters as they are, or the page after the rows already shown.
+async function loadActivity(older) {
+  const page = await api(`/api/stats/activity?${activityQuery(older ? { before: state.activity.next } : {})}`);
+  state.activity.rows = older ? state.activity.rows.concat(page.events) : page.events;
+  state.activity.next = page.next;
+  state.activity.loaded = true;
+}
+
+function fillSelect(select, options, current) {
+  select.innerHTML = options.map((o) => `<option value="${esc(o.value)}"${o.value === current ? ' selected' : ''}>${esc(o.label)}</option>`).join('');
+}
+
+// The filters offer what the caller can see: its own keys, and for an admin every account's keys and the
+// accounts themselves.
+function renderActivityFilters() {
+  const admin = state.me.role === 'admin';
+  const f = state.activity.filters;
+  const keys = [...state.keys, ...(admin ? state.otherKeys : [])];
+  fillSelect($('activity-key'), [{ value: '', label: 'Any' }, ...keys.map((k) => ({ value: String(k.id), label: k.owner ? `${k.name} (${k.owner})` : k.name }))], f.key || '');
+  $('activity-user-field').hidden = !admin;
+  if (admin) fillSelect($('activity-user'), [{ value: '', label: 'Any' }, ...state.summary.users.map((u) => ({ value: String(u.id), label: u.username }))], f.user || '');
+  fillSelect($('activity-connection'), [{ value: '', label: 'Any' }, ...state.connections.map((c) => ({ value: String(c.id), label: c.name }))], f.connection || '');
+  $('activity-models').innerHTML = state.summary.models.map((m) => `<option value="${esc(m.model)}"></option>`).join('');
+}
+
+// The rows and the models are an admin's for every account and anyone else's for their own, the same scope the
+// live stream keeps, so the lede says which.
 function renderActivity() {
   const admin = state.me.role === 'admin';
   $('activity-lede').textContent = `${
-    admin ? 'The last 50 requests that crossed the gate from every account' : 'The last 50 requests this account sent through the gate'
-  }, newest first, with what each cost. New rows arrive as they happen. Times are UTC.`;
+    admin ? 'The requests that crossed the gate from every account' : 'The requests this account sent through the gate'
+  }, newest first, with what each cost${activityFiltered() ? ', narrowed by the filters below' : '. New rows arrive as they happen'}. Times are UTC.`;
+  if (document.activeElement?.closest?.('#activity-filters') == null) renderActivityFilters();
+  $('activity-older').hidden = !state.activity.next;
   const columns = ['Time', 'Key', admin ? 'Account' : null, 'Model', 'Input tokens', 'Output tokens', 'Latency', 'Status'].filter(Boolean);
   $('activity-head').innerHTML = `<tr>${columns.map((c) => `<th>${esc(c)}</th>`).join('')}</tr>`;
 
-  $('activity-body').innerHTML = state.events.length
-    ? state.events
+  const rows = state.activity.rows;
+  $('activity-body').innerHTML = rows.length
+    ? rows
         .map(
           (event) =>
             `<tr>
-              <td>${esc(event.created_at.slice(11, 19))}</td>
+              <td>${esc(event.created_at.slice(0, 10))} ${esc(event.created_at.slice(11, 19))}</td>
               <td><span class="clamp">${esc(keyLabel(event))}</span></td>
               ${admin ? `<td><span class="clamp">${esc(event.user)}</span></td>` : ''}
               <td><span class="clamp">${esc(event.model || 'no model')}</span></td>
@@ -790,7 +834,9 @@ function renderActivity() {
             </tr>`,
         )
         .join('')
-    : `<tr><td colspan="${columns.length}">No requests recorded yet. Send one through the gateway and it appears here.</td></tr>`;
+    : `<tr><td colspan="${columns.length}">${
+        activityFiltered() ? 'No request matches these filters.' : 'No requests recorded yet. Send one through the gateway and it appears here.'
+      }</td></tr>`;
 
   $('models-body').innerHTML = state.summary.models.length
     ? state.summary.models
@@ -1437,6 +1483,46 @@ $('sign-out').addEventListener('click', async () => {
 
 window.addEventListener('hashchange', () => {
   if (state.me) route();
+});
+
+$('activity-filters').addEventListener('submit', async (event) => {
+  event.preventDefault();
+  state.activity.filters = Object.fromEntries([...new FormData(event.target)].filter(([, value]) => value));
+  try {
+    await loadActivity(false);
+    renderActivity();
+  } catch (err) {
+    report(err);
+  }
+});
+
+$('activity-clear').addEventListener('click', async () => {
+  $('activity-filters').reset();
+  state.activity.filters = {};
+  try {
+    await loadActivity(false);
+    renderActivity();
+  } catch (err) {
+    report(err);
+  }
+});
+
+$('activity-older').addEventListener('click', async () => {
+  try {
+    await loadActivity(true);
+    renderActivity();
+  } catch (err) {
+    report(err);
+  }
+});
+
+// The export is the filters as applied, every matching row rather than the pages shown, downloaded with the
+// session the page already has.
+$('activity-export').addEventListener('click', () => {
+  const link = document.createElement('a');
+  link.href = `/api/stats/activity.csv?${activityQuery()}`;
+  link.download = 'dreamgate-activity.csv';
+  link.click();
 });
 
 $('key-form').addEventListener('submit', async (event) => {

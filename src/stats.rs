@@ -1,12 +1,14 @@
 use std::collections::HashMap;
 
-use axum::extract::State as AxumState;
-use axum::http::StatusCode;
+use axum::body::Body;
+use axum::extract::{Query, State as AxumState};
+use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Json, Response};
-use chrono::{Duration, SecondsFormat, Utc};
-use futures_util::TryStreamExt;
+use chrono::{Duration, NaiveDate, SecondsFormat, Utc};
+use futures_util::{StreamExt, TryStreamExt, stream};
 use serde_json::json;
-use sqlx::{Column, Row};
+use sqlx::sqlite::{Sqlite, SqliteRow};
+use sqlx::{Column, QueryBuilder, Row};
 
 use crate::api::{error, server_error};
 use crate::auth::Caller;
@@ -293,6 +295,313 @@ pub async fn recent(AxumState(st): AxumState<State>, caller: Caller) -> Response
     Json(json!({ "events": events })).into_response()
 }
 
+// The rows the Activity view and its export read: every recorded request, newest first, narrowed by the filters a
+// caller gives. A member reads only its own account's rows, the same scope the recent rows and the live stream
+// keep, and is told so if it asks for another's rather than given its own under that account's name.
+#[derive(Clone, Default)]
+struct ActivityFilter {
+    user: Option<i64>,
+    key: Option<i64>,
+    connection: Option<i64>,
+    model: Option<String>,
+    // Answered without an error, or with one.
+    failed: Option<bool>,
+    // Whole days in UTC, both included, as the rows' times are UTC.
+    since: Option<String>,
+    until: Option<String>,
+}
+
+const ACTIVITY_PAGE: i64 = 50;
+const ACTIVITY_PAGE_MOST: i64 = 500;
+const EXPORT_PAGE: i64 = 1000;
+
+fn activity_filter(
+    caller: &Caller,
+    query: &HashMap<String, String>,
+) -> Result<ActivityFilter, Box<Response>> {
+    let refuse =
+        |message: String| Box::new(error(StatusCode::BAD_REQUEST, "invalid_request", message));
+    let given = |name: &str| {
+        query
+            .get(name)
+            .map(|value| value.trim())
+            .filter(|value| !value.is_empty())
+    };
+    let id = |name: &str| -> Result<Option<i64>, Box<Response>> {
+        given(name)
+            .map(|value| {
+                value
+                    .parse::<i64>()
+                    .map_err(|_| refuse(format!("{name} must be a number")))
+            })
+            .transpose()
+    };
+    let day = |name: &str, next: bool| -> Result<Option<String>, Box<Response>> {
+        given(name)
+            .map(|value| {
+                let date = NaiveDate::parse_from_str(value, "%Y-%m-%d")
+                    .map_err(|_| refuse(format!("{name} must be a date written YYYY-MM-DD")))?;
+                // The rows are RFC 3339 text in UTC, so a day's bounds compare as text: from its first second,
+                // and up to but not including the first second of the day after it.
+                let date = if next {
+                    date.succ_opt().unwrap_or(date)
+                } else {
+                    date
+                };
+                Ok(format!("{}T00:00:00Z", date.format("%Y-%m-%d")))
+            })
+            .transpose()
+    };
+    let mut filter = ActivityFilter {
+        user: id("user")?,
+        key: id("key")?,
+        connection: id("connection")?,
+        model: given("model").map(str::to_string),
+        failed: match given("outcome") {
+            None => None,
+            Some("ok") => Some(false),
+            Some("error") => Some(true),
+            Some(_) => return Err(refuse("outcome must be ok or error".to_string())),
+        },
+        since: day("since", false)?,
+        until: day("until", true)?,
+    };
+    if caller.role != "admin" {
+        if filter.user.is_some_and(|user| user != caller.id) {
+            return Err(Box::new(error(
+                StatusCode::FORBIDDEN,
+                "forbidden",
+                "only an admin can read another account's activity",
+            )));
+        }
+        filter.user = Some(caller.id);
+    }
+    Ok(filter)
+}
+
+// One page of rows older than `before`, built with every value bound rather than written into the statement.
+fn activity_query(
+    filter: &ActivityFilter,
+    before: Option<i64>,
+    limit: i64,
+) -> QueryBuilder<Sqlite> {
+    let mut sql = QueryBuilder::new(
+        "SELECT r.id, r.created_at, u.username AS user_name, k.name AS key_name, c.name AS connection_name, \
+                r.model, r.prompt_tokens, r.completion_tokens, r.total_tokens, r.cached_tokens, r.latency_ms, \
+                r.prompt_ms, r.generation_ms, r.status, r.streamed, r.estimated \
+         FROM usage r LEFT JOIN api_keys k ON k.id = r.api_key_id JOIN users u ON u.id = r.user_id \
+         LEFT JOIN connections c ON c.id = r.connection_id WHERE 1 = 1",
+    );
+    if let Some(user) = filter.user {
+        sql.push(" AND r.user_id = ").push_bind(user);
+    }
+    if let Some(key) = filter.key {
+        sql.push(" AND r.api_key_id = ").push_bind(key);
+    }
+    if let Some(connection) = filter.connection {
+        sql.push(" AND r.connection_id = ").push_bind(connection);
+    }
+    if let Some(model) = &filter.model {
+        sql.push(" AND r.model = ").push_bind(model.clone());
+    }
+    match filter.failed {
+        Some(true) => {
+            sql.push(" AND r.status >= 400");
+        }
+        Some(false) => {
+            sql.push(" AND r.status < 400");
+        }
+        None => {}
+    }
+    if let Some(since) = &filter.since {
+        sql.push(" AND r.created_at >= ").push_bind(since.clone());
+    }
+    if let Some(until) = &filter.until {
+        sql.push(" AND r.created_at < ").push_bind(until.clone());
+    }
+    if let Some(before) = before {
+        sql.push(" AND r.id < ").push_bind(before);
+    }
+    sql.push(" ORDER BY r.id DESC LIMIT ").push_bind(limit);
+    sql
+}
+
+fn activity_row(row: &SqliteRow) -> serde_json::Value {
+    json!({
+        "id": row.get::<i64, _>("id"),
+        "created_at": row.get::<String, _>("created_at"),
+        "user": row.get::<String, _>("user_name"),
+        "key": row.get::<Option<String>, _>("key_name"),
+        "connection": row.get::<Option<String>, _>("connection_name"),
+        "model": row.get::<Option<String>, _>("model"),
+        "prompt_tokens": row.get::<i64, _>("prompt_tokens"),
+        "completion_tokens": row.get::<i64, _>("completion_tokens"),
+        "total_tokens": row.get::<i64, _>("total_tokens"),
+        "cached_tokens": row.get::<Option<i64>, _>("cached_tokens"),
+        "latency_ms": row.get::<i64, _>("latency_ms"),
+        "prompt_ms": row.get::<Option<i64>, _>("prompt_ms"),
+        "generation_ms": row.get::<Option<i64>, _>("generation_ms"),
+        "status": row.get::<i64, _>("status"),
+        "streamed": row.get::<i64, _>("streamed") != 0,
+        "estimated": row.get::<i64, _>("estimated") != 0,
+    })
+}
+
+// A page of the history, and the id to ask for the page after it, which is none when there is no older row.
+pub async fn activity(
+    AxumState(st): AxumState<State>,
+    caller: Caller,
+    Query(query): Query<HashMap<String, String>>,
+) -> Response {
+    let filter = match activity_filter(&caller, &query) {
+        Ok(filter) => filter,
+        Err(refused) => return *refused,
+    };
+    let before = match query.get("before").map(|value| value.trim().parse::<i64>()) {
+        None => None,
+        Some(Ok(before)) => Some(before),
+        Some(Err(_)) => {
+            return error(
+                StatusCode::BAD_REQUEST,
+                "invalid_request",
+                "before must be a number",
+            );
+        }
+    };
+    let limit = query
+        .get("limit")
+        .and_then(|value| value.trim().parse::<i64>().ok())
+        .unwrap_or(ACTIVITY_PAGE)
+        .clamp(1, ACTIVITY_PAGE_MOST);
+    // One more than the page is read, so whether there is an older page is known without a second query.
+    let rows = match activity_query(&filter, before, limit + 1)
+        .build()
+        .fetch_all(&st.pool)
+        .await
+    {
+        Ok(rows) => rows,
+        Err(err) => return server_error(err),
+    };
+    let more = rows.len() as i64 > limit;
+    let events: Vec<serde_json::Value> =
+        rows.iter().take(limit as usize).map(activity_row).collect();
+    let next = more
+        .then(|| events.last().and_then(|event| event["id"].as_i64()))
+        .flatten();
+    Json(json!({ "events": events, "next": next })).into_response()
+}
+
+const EXPORT_COLUMNS: [&str; 16] = [
+    "id",
+    "created_at",
+    "account",
+    "key",
+    "connection",
+    "model",
+    "status",
+    "streamed",
+    "estimated",
+    "prompt_tokens",
+    "completion_tokens",
+    "total_tokens",
+    "cached_tokens",
+    "latency_ms",
+    "prompt_ms",
+    "generation_ms",
+];
+
+// The same rows as a CSV file, every one that matches rather than a page, read a thousand at a time so a long
+// history is written as it is read rather than held whole. A figure nothing reported is an empty cell rather
+// than a zero, and `estimated` says which counts the gateway worked out itself.
+pub async fn activity_export(
+    AxumState(st): AxumState<State>,
+    caller: Caller,
+    Query(query): Query<HashMap<String, String>>,
+) -> Response {
+    let filter = match activity_filter(&caller, &query) {
+        Ok(filter) => filter,
+        Err(refused) => return *refused,
+    };
+    let header_line = format!("{}\r\n", EXPORT_COLUMNS.join(","));
+    let pages = stream::unfold(Some(None), move |cursor: Option<Option<i64>>| {
+        let st = st.clone();
+        let filter = filter.clone();
+        async move {
+            let before = cursor?;
+            let rows = match activity_query(&filter, before, EXPORT_PAGE)
+                .build()
+                .fetch_all(&st.pool)
+                .await
+            {
+                Ok(rows) => rows,
+                Err(err) => {
+                    // The answer has begun, so there is no status left to change: the file ends as an error,
+                    // which a client sees as a download that broke off rather than one that finished short.
+                    tracing::error!("the activity export could not read the rows: {err}");
+                    return Some((
+                        Err(std::io::Error::other("the rows could not be read")),
+                        None,
+                    ));
+                }
+            };
+            if rows.is_empty() {
+                return None;
+            }
+            let next = (rows.len() as i64 == EXPORT_PAGE)
+                .then(|| rows.last().map(|row| row.get::<i64, _>("id")))
+                .flatten();
+            let mut chunk = String::new();
+            for row in &rows {
+                chunk.push_str(&csv_line(&activity_row(row)));
+            }
+            Some((Ok(chunk), next.map(Some)))
+        }
+    });
+    let body = stream::once(async move { Ok::<_, std::io::Error>(header_line) }).chain(pages);
+    (
+        [
+            (header::CONTENT_TYPE, "text/csv; charset=utf-8"),
+            (
+                header::CONTENT_DISPOSITION,
+                "attachment; filename=\"dreamgate-activity.csv\"",
+            ),
+        ],
+        Body::from_stream(body),
+    )
+        .into_response()
+}
+
+fn csv_line(event: &serde_json::Value) -> String {
+    let cells: Vec<String> = EXPORT_COLUMNS
+        .iter()
+        .map(|column| {
+            let field = if *column == "account" { "user" } else { column };
+            match &event[field] {
+                serde_json::Value::Null => String::new(),
+                serde_json::Value::String(text) => csv_text(text),
+                value => value.to_string(),
+            }
+        })
+        .collect();
+    format!("{}\r\n", cells.join(","))
+}
+
+// A cell is quoted when it holds what would end it, the way RFC 4180 writes one. A name starting with what a
+// spreadsheet reads as a formula is written with an apostrophe before it, because key and model names are chosen
+// by whoever made them and the file is opened by an admin.
+fn csv_text(text: &str) -> String {
+    let text = if text.starts_with(['=', '+', '-', '@', '\t', '\r']) {
+        format!("'{text}")
+    } else {
+        text.to_string()
+    };
+    if text.contains([',', '"', '\n', '\r']) {
+        format!("\"{}\"", text.replace('"', "\"\""))
+    } else {
+        text
+    }
+}
+
 // How far back the figures for each connection look: long enough to cover a night, short enough that what
 // they say is about the connection as it is now.
 pub const CONNECTION_WINDOW_HOURS: i64 = 24;
@@ -434,7 +743,16 @@ fn rank(sorted: &[i64], share: f64) -> Option<i64> {
 
 #[cfg(test)]
 mod tests {
-    use super::rank;
+    use super::{csv_text, rank};
+
+    #[test]
+    fn a_csv_cell_is_quoted_when_it_must_be_and_a_formula_is_not_one() {
+        assert_eq!(csv_text("plain"), "plain");
+        assert_eq!(csv_text("a,b"), "\"a,b\"");
+        assert_eq!(csv_text("say \"hi\""), "\"say \"\"hi\"\"\"");
+        assert_eq!(csv_text("=SUM(A1)"), "'=SUM(A1)");
+        assert_eq!(csv_text("-1,2"), "\"'-1,2\"");
+    }
 
     #[test]
     fn a_percentile_is_the_nearest_rank_and_none_for_nothing() {

@@ -492,9 +492,21 @@ URL hash (`#/overview`, `#/activity`, `#/keys`, `#/connections`, `#/connect`, `#
   request, and the speed is measured over the rows whose counts an upstream reported rather than over
   estimated ones; when nothing reported timings those rows are not shown. Totals across accounts are in
   the Accounts view.
-- **Activity** — the last 50 recorded requests, newest first, with each one's input and output tokens,
-  plus usage by model for the eight models with the most tokens, input and output together, each split
-  into the two: every account's for an admin, and otherwise this account's own. The page says which.
+- **Activity** — the recorded requests, newest first, with each one's date and time in UTC, its input and
+  output tokens, latency and status, fifty to a page with older pages loaded on request, plus usage by model
+  for the eight models with the most tokens, input and output together, each split into the two: every
+  account's for an admin, and otherwise this account's own. The page says which. The requests can be
+  narrowed by key, account (for an admin), connection, model, outcome — answered, or an error status — and
+  whole days in UTC, both included; while a filter is set, a row that arrives is not put at the top, because
+  it may not match. **Export CSV** downloads every request the filters match, not only the pages shown, with
+  the account, key, connection, model, status, whether it streamed, whether the counts are the gateway's
+  estimate, the tokens, the cache hit and the times; a figure nothing reported is an empty cell rather than
+  a zero, and a name that starts like a spreadsheet formula is written with an apostrophe before it so it
+  opens as text. The history is `/api/stats/activity`, with `key`, `user`, `connection`, `model`, `outcome`
+  (`ok` or `error`), `since` and `until` (`YYYY-MM-DD`), `limit` (up to 500) and `before` (the `next` the
+  previous page gave); the file is `/api/stats/activity.csv` with the same filters. A member's history is
+  its own account's, and asking for another account's is refused; a filter that cannot be read is answered
+  400 rather than ignored.
 - **Keys** — create, copy, disable and delete keys, with per-key usage split into input and output
   tokens (a key's token cap counts the two together), and a note when a key's binding points at a
   connection that is turned off. A key that is turned off stays listed and reads dimmer than the keys
@@ -710,7 +722,11 @@ marked down that lists it going ahead of one that is up and does not, a connecti
 model being the ones matched, a connection's default moving no other connection for a model no list names,
 `:latest` matched both ways, a list with an entry without an id read as none and an empty one kept, a list that
 breaks off leaving the last one, the model list merging the lists in the order a key reaches them with the dates
-a check read and a connection marked down included, each connection's figures for the last day — a failure it
+a check read and a connection marked down included, the activity history paged by row with each page naming the
+next, narrowed by key, account, model, outcome and whole UTC days, a member's history being its own and another
+account's refused, a filter that cannot be read refused, the CSV export carrying every matching row across the
+pages it is read in with empty cells for what nothing reported, quoting and a formula written as text, each
+connection's figures for the last day — a failure it
 passed on and one it could not, a failure before a full connection still passed on, a model list's failure
 never passed on, a single answer that broke off passed on and a stream that broke off counted as a failure and
 not as an answer, an error answer counted and left out of the times, rows older than the day left out, the
