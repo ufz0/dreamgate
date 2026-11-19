@@ -5,15 +5,20 @@ use serde::Deserialize;
 use serde_json::json;
 use sqlx::Row;
 
-use crate::api::error;
+use crate::api::{error, server_error};
 use crate::auth::Caller;
 use crate::state::State;
 
-const KEY: &str = "open_registration";
-const APPROVAL_KEY: &str = "require_approval";
+// Registration also reads both settings inside the insert that makes an account (`auth::register`).
+// It binds these names and defaults rather than writing its own, so the two cannot drift apart.
+pub(crate) const KEY: &str = "open_registration";
+pub(crate) const APPROVAL_KEY: &str = "require_approval";
+pub(crate) const OPEN_BY_DEFAULT: &str = "0";
+pub(crate) const APPROVAL_BY_DEFAULT: &str = "1";
 
 // The first account is always allowed, which is how an instance gets its admin. After that,
-// self-registration stays closed until an admin opens it.
+// self-registration stays closed until an admin opens it. This is read before the insert, so it
+// can only be an early answer: the insert decides again, in the same step as it writes.
 pub async fn can_register(st: &State) -> bool {
     let accounts = count_accounts(st).await;
     if accounts == 0 {
@@ -25,7 +30,7 @@ pub async fn can_register(st: &State) -> bool {
 // New accounts wait for an admin until the setting is turned off. The first account is never
 // held back, because there is no one to approve it.
 pub async fn requires_approval(st: &State) -> bool {
-    value(st, APPROVAL_KEY, "1").await
+    value(st, APPROVAL_KEY, APPROVAL_BY_DEFAULT).await
 }
 
 async fn count_accounts(st: &State) -> i64 {
@@ -37,7 +42,7 @@ async fn count_accounts(st: &State) -> i64 {
 }
 
 async fn is_open(st: &State) -> bool {
-    value(st, KEY, "0").await
+    value(st, KEY, OPEN_BY_DEFAULT).await
 }
 
 async fn value(st: &State, key: &str, default: &str) -> bool {
@@ -104,11 +109,7 @@ pub async fn update(
         .execute(&st.pool)
         .await;
         if let Err(err) = result {
-            return error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "server_error",
-                err.to_string(),
-            );
+            return server_error(err);
         }
     }
     Json(json!({

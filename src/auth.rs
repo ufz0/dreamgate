@@ -12,7 +12,7 @@ use serde_json::json;
 use sqlx::Row;
 use uuid::Uuid;
 
-use crate::api::error;
+use crate::api::{error, server_error};
 use crate::state::State;
 
 pub const COOKIE_NAME: &str = "dg_session";
@@ -32,6 +32,9 @@ pub struct Caller {
     pub id: i64,
     pub username: String,
     pub role: String,
+    // The session the request came with, so an action that ends an account's sessions can keep the one the
+    // caller is using.
+    pub token: String,
 }
 
 // The session middleware resolves the account once; handlers take Caller as an
@@ -83,11 +86,7 @@ pub async fn require_session(
     {
         Ok(row) => row,
         Err(err) => {
-            return error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "server_error",
-                err.to_string(),
-            );
+            return server_error(err);
         }
     };
     let Some(row) = row else {
@@ -101,19 +100,42 @@ pub async fn require_session(
         id: row.get::<i64, _>("id"),
         username: row.get::<String, _>("username"),
         role: row.get::<String, _>("role"),
+        token,
     });
     next.run(req).await
 }
+
+// One cost for every hash, the one nothing matches included, so a refusal takes as long as a wrong password.
+const BCRYPT_COST: u32 = 10;
 
 // Bcrypt is genuinely CPU-bound: a cost-10 hash takes tens of milliseconds, which is long enough to
 // hold the runtime worker an async handler is standing on while other requests are only waiting for an
 // upstream. It is moved to the blocking pool, which is the one place this code uses it.
 pub async fn hash_password(password: &str) -> Result<String, String> {
     let password = password.to_string();
-    let joined = tokio::task::spawn_blocking(move || bcrypt::hash(&password, 10))
+    let joined = tokio::task::spawn_blocking(move || bcrypt::hash(&password, BCRYPT_COST))
         .await
         .map_err(|err| err.to_string())?;
     joined.map_err(|err| err.to_string())
+}
+
+// A hash nothing matches, checked where a sign-in has nothing to check against: no account by that name, no
+// password yet, no code given out. A wrong password costs one bcrypt check, so every refusal costs one, and the
+// time an answer takes does not say which usernames exist or which accounts are waiting for a code. It is made
+// on the blocking pool at the start, by `prepare_refusals`.
+static NOTHING_TO_CHECK: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    bcrypt::hash("there is nothing to check this against", BCRYPT_COST).unwrap_or_default()
+});
+
+// Made at the start, on the blocking pool, so the first refusal after a start does not take longer than the
+// others by the time making it takes.
+pub fn prepare_refusals() {
+    tokio::task::spawn_blocking(|| std::sync::LazyLock::force(&NOTHING_TO_CHECK));
+}
+
+async fn check_nothing(given: &str) {
+    let given = given.to_string();
+    let _ = tokio::task::spawn_blocking(move || bcrypt::verify(&given, &NOTHING_TO_CHECK)).await;
 }
 
 pub async fn password_matches(password: &str, hash: &str) -> bool {
@@ -184,6 +206,14 @@ fn with_cookie(mut resp: Response, token: &str, secure: bool) -> Response {
     resp
 }
 
+fn registration_closed() -> Response {
+    error(
+        StatusCode::FORBIDDEN,
+        "registration_closed",
+        "self-registration is closed. Ask an admin to open it.",
+    )
+}
+
 #[derive(Deserialize)]
 pub struct RegisterBody {
     pub username: String,
@@ -210,50 +240,47 @@ pub async fn register(
             "password must be at least 8 characters",
         );
     }
+    // Only an early answer, so a closed instance does not spend a hash on every attempt: whether the
+    // account may be made is decided again by the insert below.
     if !crate::settings::can_register(&st).await {
-        return error(
-            StatusCode::FORBIDDEN,
-            "registration_closed",
-            "self-registration is closed. Ask an admin to open it.",
-        );
+        return registration_closed();
     }
-
-    let count = match sqlx::query("SELECT COUNT(*) AS n FROM users")
-        .fetch_one(&st.pool)
-        .await
-    {
-        Ok(row) => row.get::<i64, _>("n"),
-        Err(err) => {
-            return error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "server_error",
-                err.to_string(),
-            );
-        }
-    };
-    // The first account to register owns the instance.
-    let role = if count == 0 { "admin" } else { "user" };
-    // The first account is never held back, because there is no one to approve it.
-    let pending = count > 0 && crate::settings::requires_approval(&st).await;
     let hash = match hash_password(&body.password).await {
         Ok(hash) => hash,
         Err(err) => {
-            return error(StatusCode::INTERNAL_SERVER_ERROR, "server_error", err);
+            return server_error(err);
         }
     };
 
+    // Whether the account may be made, its role and whether it waits are all decided by the statement
+    // that makes it. Counted before the hash, registrations that arrived together on an empty instance
+    // all counted none and were all made admin; a writing statement takes the write lock before it
+    // reads, so only the first insert finds no accounts. The first account owns the instance and is
+    // never held back, because there is no one to approve it; after it, registration has to be open,
+    // and a new account waits unless approval is turned off, read with the names and defaults
+    // `settings` uses.
     let row = match sqlx::query(
-        "INSERT INTO users (username, password_hash, role, created_at, pending) VALUES (?, ?, ?, ?, ?) RETURNING id",
+        "INSERT INTO users (username, password_hash, role, created_at, pending) \
+         SELECT ?, ?, CASE WHEN EXISTS (SELECT 1 FROM users) THEN 'user' ELSE 'admin' END, ?, \
+                EXISTS (SELECT 1 FROM users) \
+                AND COALESCE((SELECT value FROM settings WHERE key = ?), ?) = '1' \
+         WHERE NOT EXISTS (SELECT 1 FROM users) \
+            OR COALESCE((SELECT value FROM settings WHERE key = ?), ?) = '1' \
+         RETURNING id, role, pending",
     )
     .bind(&username)
     .bind(&hash)
-    .bind(role)
     .bind(crate::clock::now())
-    .bind(pending as i64)
-    .fetch_one(&st.pool)
+    .bind(crate::settings::APPROVAL_KEY)
+    .bind(crate::settings::APPROVAL_BY_DEFAULT)
+    .bind(crate::settings::KEY)
+    .bind(crate::settings::OPEN_BY_DEFAULT)
+    .fetch_optional(&st.pool)
     .await
     {
-        Ok(row) => row,
+        Ok(Some(row)) => row,
+        // Registration was closed by the time the account would have been made.
+        Ok(None) => return registration_closed(),
         // A name that is taken is named rather than answered with the driver text. The username is the
         // only unique column on users, so a unique violation here can only mean that; a failure for any
         // other reason is not dressed up as a taken name.
@@ -265,15 +292,12 @@ pub async fn register(
             );
         }
         Err(err) => {
-            return error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "server_error",
-                err.to_string(),
-            );
+            return server_error(err);
         }
     };
     let id = row.get::<i64, _>("id");
-    if pending {
+    let role = row.get::<String, _>("role");
+    if row.get::<i64, _>("pending") != 0 {
         // No session yet: the account is signed in after an admin approves it.
         return Json(json!({ "id": id, "username": username, "role": role, "pending": true }))
             .into_response();
@@ -281,11 +305,7 @@ pub async fn register(
     let token = match create_session(&st, id).await {
         Ok(token) => token,
         Err(err) => {
-            return error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "server_error",
-                err.to_string(),
-            );
+            return server_error(err);
         }
     };
     let resp = Json(json!({ "id": id, "username": username, "role": role })).into_response();
@@ -296,6 +316,9 @@ pub async fn register(
 pub struct LoginBody {
     pub username: String,
     pub password: String,
+    // A one-time code an admin gave out: with it, the password is the new one to set rather than one to check.
+    #[serde(default)]
+    pub setup_code: Option<String>,
 }
 
 pub async fn login(
@@ -304,6 +327,20 @@ pub async fn login(
     Json(body): Json<LoginBody>,
 ) -> Response {
     let username = body.username.trim().to_string();
+    let setup_code = body
+        .setup_code
+        .as_deref()
+        .map(crate::users::plain_setup_code)
+        .filter(|code| !code.is_empty());
+    // A password that is too short to set is answered before the account is read, so the answer is the same
+    // whether the username exists or not.
+    if setup_code.is_some() && body.password.len() < 8 {
+        return error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "password must be at least 8 characters",
+        );
+    }
     if !attempt_allowed(&st, &username) {
         return error(
             StatusCode::TOO_MANY_REQUESTS,
@@ -312,7 +349,8 @@ pub async fn login(
         );
     }
     let row = match sqlx::query(
-        "SELECT id, username, password_hash, role, enabled, pending FROM users WHERE username = ?",
+        "SELECT id, username, password_hash, role, enabled, pending, setup_code_hash, setup_code_expires_at \
+         FROM users WHERE username = ?",
     )
     .bind(&username)
     .fetch_optional(&st.pool)
@@ -320,21 +358,31 @@ pub async fn login(
     {
         Ok(row) => row,
         Err(err) => {
-            return error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "server_error",
-                err.to_string(),
-            );
+            return server_error(err);
         }
     };
     // The same answer for an account that does not exist and a password that does not match, so a
     // sign-in attempt cannot be used to find out which usernames the instance has.
+    let with_code = setup_code.is_some();
+    let refused = || {
+        if with_code {
+            error(
+                StatusCode::UNAUTHORIZED,
+                "invalid_credentials",
+                "username or setup code is not correct, or the code has expired",
+            )
+        } else {
+            error(
+                StatusCode::UNAUTHORIZED,
+                "invalid_credentials",
+                "username or password is not correct",
+            )
+        }
+    };
+    let given = setup_code.as_deref().unwrap_or(&body.password).to_string();
     let Some(row) = row else {
-        return error(
-            StatusCode::UNAUTHORIZED,
-            "invalid_credentials",
-            "username or password is not correct",
-        );
+        check_nothing(&given).await;
+        return refused();
     };
     if row.get::<i64, _>("pending") == 1 {
         return error(
@@ -354,55 +402,86 @@ pub async fn login(
             "this account is disabled",
         );
     }
-    // An account made by an admin has no password until the person signs in for the first time;
-    // what they enter then becomes their own password.
-    match row.get::<Option<String>, _>("password_hash") {
-        Some(hash) => {
-            if !password_matches(&body.password, &hash).await {
-                return error(
-                    StatusCode::UNAUTHORIZED,
-                    "invalid_credentials",
-                    "username or password is not correct",
-                );
-            }
-        }
-        None => {
-            if body.password.len() < 8 {
-                return error(
-                    StatusCode::BAD_REQUEST,
-                    "invalid_request",
-                    "password must be at least 8 characters",
-                );
+    match (setup_code, row.get::<Option<String>, _>("password_hash")) {
+        // A setup code sets the password, on an account that has none yet or as a reset of one that has.
+        (Some(code), _) => {
+            let Some(stored) = row.get::<Option<String>, _>("setup_code_hash") else {
+                check_nothing(&code).await;
+                return refused();
+            };
+            // The code is checked whether or not it has expired, so an expired code takes as long to refuse as
+            // a wrong one. The expiry is RFC 3339 text in UTC, written by `clock`, so the two compare as text.
+            let expires_at = row.get::<Option<String>, _>("setup_code_expires_at");
+            let matched = password_matches(&code, &stored).await;
+            let now = crate::clock::now();
+            if !matched || expires_at.as_deref().is_none_or(|at| at <= now.as_str()) {
+                return refused();
             }
             let hash = match hash_password(&body.password).await {
                 Ok(hash) => hash,
                 Err(err) => {
-                    return error(StatusCode::INTERNAL_SERVER_ERROR, "server_error", err);
+                    return server_error(err);
                 }
             };
-            if let Err(err) = sqlx::query("UPDATE users SET password_hash = ? WHERE id = ?")
-                .bind(&hash)
+            // Two sign-ins with the same code both read it. Only the write that still finds the code it
+            // checked sets the password and uses the code up, and the other is answered as what it now is: a
+            // code that does not work. The write also has to find the account still enabled and not held,
+            // because an admin can change either while the password is being hashed, and a sign-in that lands
+            // after that is not let in on what it read before.
+            // The code is checked again for its time as well, which may have passed while the password was hashed.
+            // A new password ends the sign-ins made with the old one, because a reset is most often asked for when
+            // the old one is lost or known to someone else, and the two writes land together or not at all, so a
+            // password is never changed with the old sessions left in place.
+            let mut tx = match st.pool.begin().await {
+                Ok(tx) => tx,
+                Err(err) => return server_error(err),
+            };
+            match sqlx::query(
+                "UPDATE users SET password_hash = ?, setup_code_hash = NULL, setup_code_expires_at = NULL \
+                 WHERE id = ? AND setup_code_hash = ? AND setup_code_expires_at > ? AND enabled = 1 \
+                 AND pending = 0",
+            )
+            .bind(&hash)
+            .bind(id)
+            .bind(&stored)
+            .bind(crate::clock::now())
+            .execute(&mut *tx)
+            .await
+            {
+                Ok(done) if done.rows_affected() == 1 => {}
+                Ok(_) => return refused(),
+                Err(err) => {
+                    return server_error(err);
+                }
+            }
+            if let Err(err) = sqlx::query("DELETE FROM sessions WHERE user_id = ?")
                 .bind(id)
-                .execute(&st.pool)
+                .execute(&mut *tx)
                 .await
             {
-                return error(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "server_error",
-                    err.to_string(),
-                );
+                return server_error(err);
             }
+            if let Err(err) = tx.commit().await {
+                return server_error(err);
+            }
+        }
+        (None, Some(hash)) => {
+            if !password_matches(&body.password, &hash).await {
+                return refused();
+            }
+        }
+        // An account with no password is signed into only with a setup code. Without one it is answered as a
+        // wrong password, so the answer does not say which accounts are waiting for a code.
+        (None, None) => {
+            check_nothing(&body.password).await;
+            return refused();
         }
     }
 
     let token = match create_session(&st, id).await {
         Ok(token) => token,
         Err(err) => {
-            return error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "server_error",
-                err.to_string(),
-            );
+            return server_error(err);
         }
     };
     let resp = Json(json!({

@@ -23,9 +23,11 @@
       <button type="button" id="mode-login" aria-pressed="true">Sign in</button>
     </div>
     <p class="note" id="register-note" hidden>Self-registration is closed, so an admin has to open it before a new account can be made.</p>
-    <p class="note" id="first-password-note" hidden>For an account an admin made, the first password you enter here becomes your own.</p>
+    <p class="note" id="first-password-note" hidden>For an account an admin made, or a password an admin reset, sign in with the setup code they gave you and choose your password.</p>
     <label>Username<input name="username" autocomplete="username" required></label>
-    <label>Password<input name="password" type="password" minlength="8" required></label>
+    <label id="setup-code-field" hidden>Setup code<input name="setup_code" autocomplete="one-time-code" spellcheck="false"></label>
+    <label><span id="password-label">Password</span><input name="password" id="auth-password" type="password" minlength="8" autocomplete="current-password" required></label>
+    <button type="button" class="link" id="setup-code-toggle" aria-expanded="false" hidden>I have a setup code</button>
     <button type="submit" id="auth-submit">Sign in</button>
     <p class="notice" id="auth-error" role="status"></p>
   </form>
@@ -126,12 +128,27 @@
       <section class="view" data-view="activity" hidden>
         <h1>Activity</h1>
         <p class="lede" id="activity-lede"></p>
+        <form id="activity-filters" class="filters">
+          <label class="field">Key<select name="key" id="activity-key"></select></label>
+          <label class="field" id="activity-user-field">Account<select name="user" id="activity-user"></select></label>
+          <label class="field">Connection<select name="connection" id="activity-connection"></select></label>
+          <label class="field">Model<input name="model" list="activity-models" autocomplete="off"><datalist id="activity-models"></datalist></label>
+          <label class="field">Outcome<select name="outcome"><option value="">Any</option><option value="ok">Answered</option><option value="error">Errors</option></select></label>
+          <label class="field">From<input name="since" type="date"></label>
+          <label class="field">To<input name="until" type="date"></label>
+          <div class="filter-actions">
+            <button type="submit">Show</button>
+            <button type="button" class="secondary" id="activity-clear">Clear</button>
+            <button type="button" class="secondary" id="activity-export">Export CSV</button>
+          </div>
+        </form>
         <div class="table">
           <table id="activity">
             <thead id="activity-head"></thead>
             <tbody id="activity-body"></tbody>
           </table>
         </div>
+        <p class="value-line"><button type="button" class="link" id="activity-older" hidden>Load older requests</button></p>
         <h2>Usage by model, the eight with the most tokens, input and output together</h2>
         <div class="table">
           <table id="models">
@@ -147,7 +164,7 @@
         <form id="key-form">
           <label class="field">Key name<input name="name" required></label>
           <button type="button" class="expand" id="key-advanced" aria-expanded="false">
-            <span class="icon" data-icon="chevron"></span><span>Connection, model and limits</span>
+            <span class="icon" data-icon="chevron"></span><span>Connection, model, limits and expiry</span>
           </button>
           <div id="key-advanced-fields" hidden>
             <div class="field">
@@ -165,6 +182,21 @@
               <label for="key-token-cap">Token cap</label>
               <p class="help" id="key-token-cap-help">Counted against the input and output tokens this key has already used, together, so it does not reset. An account's daily limit, which an admin sets, counts one day and applies on top of it.</p>
               <input id="key-token-cap" name="token_cap" type="number" min="1" aria-describedby="key-token-cap-help">
+            </div>
+            <div class="field">
+              <label for="key-daily-cap">Daily token limit</label>
+              <p class="help" id="key-daily-cap-help">Input and output tokens this key may use in a day, counted from 00:00 UTC.</p>
+              <input id="key-daily-cap" name="daily_token_cap" type="number" min="1" aria-describedby="key-daily-cap-help">
+            </div>
+            <div class="field">
+              <label for="key-monthly-cap">Monthly token limit</label>
+              <p class="help" id="key-monthly-cap-help">Input and output tokens this key may use in a calendar month in UTC.</p>
+              <input id="key-monthly-cap" name="monthly_token_cap" type="number" min="1" aria-describedby="key-monthly-cap-help">
+            </div>
+            <div class="field">
+              <label for="key-expires">Expires</label>
+              <p class="help" id="key-expires-help">The key works through this day in UTC and is refused after it. Leave it empty for a key that does not expire.</p>
+              <input id="key-expires" name="expires_at" type="date" max="9999-12-30" aria-describedby="key-expires-help">
             </div>
           </div>
           <button type="submit">Create key</button>
@@ -198,6 +230,14 @@
         <p class="lede">Any endpoint that speaks the OpenAI API. A key with no connection bound to it uses the healthiest highest-priority one.</p>
         <form id="connection-form">
           <label class="field">Connection name<input name="name" required></label>
+          <div class="field">
+            <label for="connection-kind">Type</label>
+            <p class="help" id="connection-kind-help">OpenCode Go also gets the user agent and the session header it asks every client for.</p>
+            <select id="connection-kind" name="kind" aria-describedby="connection-kind-help">
+              <option value="openai">OpenAI-compatible</option>
+              <option value="opencode-go">OpenCode Go</option>
+            </select>
+          </div>
           <label class="field">Base URL<input name="base_url" placeholder="http://127.0.0.1:11434" required></label>
           <button type="button" class="expand" id="connection-advanced" aria-expanded="false">
             <span class="icon" data-icon="chevron"></span><span>Upstream key, default model and priority</span>
@@ -220,12 +260,12 @@
         <div class="table">
           <table id="connections">
             <thead>
-              <tr><th>Connection</th><th>Base URL</th><th>Default model</th><th>Priority</th><th>Health</th><th><span class="visually-hidden">Actions</span></th></tr>
+              <tr><th>Connection</th><th>Base URL</th><th>Default model</th><th>Priority</th><th>Health</th><th>Last 24 hours</th><th><span class="visually-hidden">Actions</span></th></tr>
             </thead>
             <tbody id="connections-body"></tbody>
           </table>
         </div>
-        <p class="note">Checked every 30 seconds. A connection that fails at the transport level falls over to the next one.</p>
+        <p class="note">Checked every 30 seconds. A connection that fails at the transport level falls over to the next one. One marked down is not skipped: it is tried after every connection that is not, because it may be answering again.</p>
       </section>
 
       <section class="view" data-view="connect" hidden>
@@ -309,6 +349,15 @@
 </div>
 
 <div class="scrim" id="scrim"></div>
+
+<dialog id="setup-code">
+  <h2 id="setup-code-title">Setup code</h2>
+  <p id="setup-code-text"></p>
+  <p class="value-line"><code id="setup-code-value"></code><button type="button" class="link" data-copy-from="setup-code-value">Copy code</button></p>
+  <div class="actions">
+    <button type="button" class="link" id="setup-code-close">Done</button>
+  </div>
+</dialog>
 
 <dialog id="confirm">
   <h2 id="confirm-title">Confirm</h2>

@@ -1,3 +1,4 @@
+use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 
 use axum::body::{Body, Bytes};
@@ -9,13 +10,16 @@ use serde_json::{Value, json};
 use sqlx::Row;
 use sqlx::sqlite::SqliteRow;
 
-use crate::api::error;
+use crate::api::{error, logged};
 use crate::limits::Admission;
 use crate::presence::{self, Active};
 use crate::registry::{self, Connection};
+use crate::reservations::{Ask, Left, Reading, Refusal, Reservation, Window};
+use crate::shutdown::Phase;
 use crate::state::State;
 use crate::tokens;
 use crate::usage::{self, UsageRow};
+use chrono::Utc;
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
@@ -29,6 +33,9 @@ pub struct KeyInfo {
     pub enabled: bool,
     pub rpm_limit: Option<i64>,
     pub token_cap: Option<i64>,
+    pub daily_token_cap: Option<i64>,
+    pub monthly_token_cap: Option<i64>,
+    pub expires_at: Option<String>,
 }
 
 fn virtual_key(headers: &HeaderMap) -> Option<String> {
@@ -45,17 +52,15 @@ fn virtual_key(headers: &HeaderMap) -> Option<String> {
         .map(|v| v.trim().to_string())
 }
 
-async fn lookup_key(st: &State, raw: &str) -> Option<KeyInfo> {
+async fn lookup_key(st: &State, raw: &str) -> Result<Option<KeyInfo>, sqlx::Error> {
     let row = sqlx::query(
-        "SELECT id, user_id, name, connection_id, model, enabled, rpm_limit, token_cap \
-         FROM api_keys WHERE key = ?",
+        "SELECT id, user_id, name, connection_id, model, enabled, rpm_limit, token_cap, daily_token_cap, \
+         monthly_token_cap, expires_at FROM api_keys WHERE key = ?",
     )
     .bind(raw)
     .fetch_optional(&st.pool)
-    .await
-    .ok()
-    .flatten()?;
-    Some(KeyInfo {
+    .await?;
+    Ok(row.map(|row| KeyInfo {
         id: row.get::<i64, _>("id"),
         user_id: row.get::<i64, _>("user_id"),
         name: row.get::<String, _>("name"),
@@ -64,18 +69,100 @@ async fn lookup_key(st: &State, raw: &str) -> Option<KeyInfo> {
         enabled: row.get::<i64, _>("enabled") != 0,
         rpm_limit: row.get::<Option<i64>, _>("rpm_limit"),
         token_cap: row.get::<Option<i64>, _>("token_cap"),
-    })
+        daily_token_cap: row.get::<Option<i64>, _>("daily_token_cap"),
+        monthly_token_cap: row.get::<Option<i64>, _>("monthly_token_cap"),
+        expires_at: row.get::<Option<String>, _>("expires_at"),
+    }))
 }
 
-// A disabled account cannot use a key at all. Both gateway endpoints read the account the same
-// way, so a key on its own cannot reach an upstream for an account that is turned off.
-async fn account_row(st: &State, user_id: i64) -> Option<SqliteRow> {
+// A key that is turned off, or whose time has passed, is refused before anything else is read about it. The
+// expiry is written the way `clock` writes a moment, so the two compare as text.
+fn key_refused(key: &KeyInfo) -> Option<Response> {
+    if !key.enabled {
+        return Some(error(
+            StatusCode::FORBIDDEN,
+            "key_disabled",
+            "this key is disabled",
+        ));
+    }
+    if let Some(at) = &key.expires_at
+        && at.as_str() <= crate::clock::now().as_str()
+    {
+        return Some(error(
+            StatusCode::FORBIDDEN,
+            "key_expired",
+            format!("this key expired at {at}"),
+        ));
+    }
+    None
+}
+
+// A request that arrives while the process is stopping is turned away rather than started, because it
+// could not be given the time to finish. 503 tells a client to try again, which reaches the process that
+// comes next. The same answer goes to a request the gateway ended because it was stopping.
+fn shutting_down() -> Response {
+    error(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "shutting_down",
+        "the gateway is shutting down; try again in a moment",
+    )
+}
+
+fn unknown_key() -> Response {
+    error(
+        StatusCode::UNAUTHORIZED,
+        "invalid_api_key",
+        "unknown virtual key",
+    )
+}
+
+// The key, its account and its limits are read on every request, and a read that fails (a write
+// holding the database past the busy timeout, a disk that fails) refuses the request. A limit that
+// could not be read is not a limit that was not reached: letting the request through would let a
+// disabled account, or a key past its cap, reach an upstream whenever the database was slow. The
+// answer is 503 because the refusal is the gateway's and passes, so a client that retries is right to.
+#[track_caller]
+fn unreadable(err: sqlx::Error) -> Response {
+    logged(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "unavailable",
+        "the gateway could not read this key's account and limits; try again",
+        err,
+    )
+}
+
+// What a client is told about a failed upstream is its connection's name and the first line of the
+// error, without the address. The log is where an admin looks for why, so it gets the whole chain of
+// causes — refused, a name that did not resolve, a certificate, a timeout — which the first line
+// leaves out. The failure is also kept with the request's others, for the connection's figures.
+fn upstream_failed(
+    st: &State,
+    conn: &Connection,
+    err: &(dyn std::error::Error + Send + Sync + 'static),
+    failures: &mut registry::Failures,
+    kind: &'static str,
+) {
+    st.metrics.upstream_failure(&conn.name);
+    let mut causes = err.to_string();
+    let mut source = err.source();
+    while let Some(cause) = source {
+        causes.push_str(": ");
+        causes.push_str(&cause.to_string());
+        source = cause.source();
+    }
+    tracing::warn!(connection = %conn.name, "upstream failed: {causes}");
+    failures.push(conn.id, kind);
+}
+
+// A disabled account cannot use a key at all. Every gateway endpoint reads the account the same
+// way, so a key on its own cannot reach an upstream for an account that is turned off. Deleting an
+// account deletes its keys with it, so a key whose account is gone is a key that is being deleted,
+// and every endpoint answers it the way it answers a key that no longer exists.
+async fn account_row(st: &State, user_id: i64) -> Result<Option<SqliteRow>, sqlx::Error> {
     sqlx::query("SELECT username, enabled, daily_token_cap FROM users WHERE id = ?")
         .bind(user_id)
         .fetch_optional(&st.pool)
         .await
-        .ok()
-        .flatten()
 }
 
 fn disabled_account(row: &SqliteRow) -> Option<Response> {
@@ -89,95 +176,396 @@ fn disabled_account(row: &SqliteRow) -> Option<Response> {
     None
 }
 
-async fn enforce_limits(st: &State, key: &KeyInfo) -> Option<Response> {
-    if let Some(limit) = key.rpm_limit {
-        let recent = sqlx::query(
-            "SELECT COUNT(*) AS n FROM usage WHERE api_key_id = ? \
-             AND strftime('%Y-%m-%d %H:%M:%S', created_at) >= datetime('now', '-1 minute')",
-        )
-        .bind(key.id)
-        .fetch_one(&st.pool)
-        .await
-        .map(|row| row.get::<i64, _>("n"))
-        .unwrap_or(0);
-        if recent >= limit {
-            return Some(error(
+// What the rows say a key and its account have used, read here and then checked together with the requests
+// the rows cannot show yet in one step (`reservations`), so requests sent at the same moment cannot all pass on
+// the same reading. A limit the rows alone have reached refuses at once, without the reads after it. What comes
+// back is the request's hold, settled once its row is written; a refusal is the answer the request is given,
+// boxed because an answer is large and is only built when one is refused.
+async fn enforce_limits(
+    st: &State,
+    key: &KeyInfo,
+    prompt_tokens: i64,
+) -> Result<Reservation, Box<Response>> {
+    // The account is checked before its limits, because a disabled account cannot use a key at
+    // all. The account limit counts the current day only and resets at 00:00 UTC, matching the
+    // UTC text the usage rows are stored as. It is checked after the key cap, so a key cannot
+    // be used to work around it.
+    let account = match account_row(st, key.user_id).await {
+        Ok(Some(account)) => account,
+        Ok(None) => return Err(Box::new(unknown_key())),
+        Err(err) => return Err(Box::new(unreadable(err))),
+    };
+    if let Some(blocked) = disabled_account(&account) {
+        return Err(Box::new(blocked));
+    }
+    let refuse = |refusal: Refusal| -> Box<Response> {
+        Box::new(match refusal {
+            Refusal::RateLimit { limit } => error(
                 StatusCode::TOO_MANY_REQUESTS,
                 "rate_limit",
                 format!(
                     "key '{}' is limited to {limit} requests per minute",
                     key.name
                 ),
-            ));
-        }
-    }
-    if let Some(cap) = key.token_cap {
-        let used = sqlx::query(
-            "SELECT COALESCE(SUM(total_tokens), 0) AS used FROM usage WHERE api_key_id = ?",
+            ),
+            Refusal::KeyCap { cap, in_flight } => error(
+                StatusCode::TOO_MANY_REQUESTS,
+                "token_cap",
+                format!(
+                    "key '{}' has reached its token cap of {cap} input and output tokens{}",
+                    key.name,
+                    in_flight_note(in_flight)
+                ),
+            ),
+            Refusal::KeyDayCap { cap, in_flight } => error(
+                StatusCode::TOO_MANY_REQUESTS,
+                "token_cap",
+                format!(
+                    "key '{}' has used its daily token limit of {cap} input and output tokens{}",
+                    key.name,
+                    in_flight_note(in_flight)
+                ),
+            ),
+            Refusal::KeyMonthCap { cap, in_flight } => error(
+                StatusCode::TOO_MANY_REQUESTS,
+                "token_cap",
+                format!(
+                    "key '{}' has used its monthly token limit of {cap} input and output tokens{}",
+                    key.name,
+                    in_flight_note(in_flight)
+                ),
+            ),
+            Refusal::DayCap { cap, in_flight } => error(
+                StatusCode::TOO_MANY_REQUESTS,
+                "token_cap",
+                format!(
+                    "account '{}' has used its daily token limit of {cap} input and output tokens{}",
+                    account.get::<String, _>("username"),
+                    in_flight_note(in_flight)
+                ),
+            ),
+            // As with a limit that could not be read: a limit not known to be unreached is not one that was
+            // not reached.
+            Refusal::Stale => {
+                tracing::warn!(
+                    "the limits of key '{}' took too long to read to be checked against the requests in flight",
+                    key.name
+                );
+                error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "unavailable",
+                    "this key's limits could not be read in time; try again",
+                )
+            }
+        })
+    };
+    // Each limit is read together with the highest row id at that moment, in one statement and so in one
+    // snapshot, which is how the holds know which requests that reading already counted.
+    let read_at = Instant::now();
+    let reading = |limit: i64, row: sqlx::sqlite::SqliteRow| Reading {
+        limit,
+        used: row.get::<i64, _>("used"),
+        seen: row.get::<i64, _>("seen"),
+    };
+    let rpm = match key.rpm_limit {
+        Some(limit) => match sqlx::query(
+            "SELECT COUNT(*) AS used, (SELECT COALESCE(MAX(id), 0) FROM usage) AS seen \
+             FROM usage WHERE api_key_id = ? \
+             AND strftime('%Y-%m-%d %H:%M:%S', created_at) >= datetime('now', '-1 minute')",
         )
         .bind(key.id)
         .fetch_one(&st.pool)
         .await
-        .map(|row| row.get::<i64, _>("used"))
-        .unwrap_or(0);
-        if used >= cap {
-            return Some(error(
-                StatusCode::TOO_MANY_REQUESTS,
-                "token_cap",
-                format!(
-                    "key '{}' has reached its token cap of {cap} input and output tokens",
-                    key.name
-                ),
-            ));
+        {
+            Ok(row) => Some(reading(limit, row)),
+            Err(err) => return Err(Box::new(unreadable(err))),
+        },
+        None => None,
+    };
+    if let Some(rpm) = rpm
+        && rpm.used >= rpm.limit
+    {
+        return Err(refuse(Refusal::RateLimit { limit: rpm.limit }));
+    }
+    let key_cap = match key.token_cap {
+        Some(cap) => match sqlx::query(
+            "SELECT COALESCE(SUM(total_tokens), 0) AS used, \
+             (SELECT COALESCE(MAX(id), 0) FROM usage) AS seen FROM usage WHERE api_key_id = ?",
+        )
+        .bind(key.id)
+        .fetch_one(&st.pool)
+        .await
+        {
+            Ok(row) => Some(reading(cap, row)),
+            Err(err) => return Err(Box::new(unreadable(err))),
+        },
+        None => None,
+    };
+    if let Some(cap) = key_cap
+        && cap.used >= cap.limit
+    {
+        return Err(refuse(Refusal::KeyCap {
+            cap: cap.limit,
+            in_flight: 0,
+        }));
+    }
+    // A key's day and month are UTC, as the account's day is, and begin at their first moment written as the rows
+    // write a moment, so the comparison is one of text and the rows are found through the index on the key and the
+    // time. The day lies within the month, so one read of the month gives both.
+    let (key_day_cap, key_month_cap) = match (key.daily_token_cap, key.monthly_token_cap) {
+        (None, None) => (None, None),
+        (day, month) => {
+            let now = Utc::now();
+            let row = match sqlx::query(
+                "SELECT COALESCE(SUM(CASE WHEN created_at >= ? THEN total_tokens END), 0) AS day, \
+                 COALESCE(SUM(total_tokens), 0) AS month, \
+                 (SELECT COALESCE(MAX(id), 0) FROM usage) AS seen FROM usage \
+                 WHERE api_key_id = ? AND created_at >= ?",
+            )
+            .bind(format!("{}T00:00:00Z", now.format("%Y-%m-%d")))
+            .bind(key.id)
+            .bind(format!("{}-01T00:00:00Z", now.format("%Y-%m")))
+            .fetch_one(&st.pool)
+            .await
+            {
+                Ok(row) => row,
+                Err(err) => return Err(Box::new(unreadable(err))),
+            };
+            let seen = row.get::<i64, _>("seen");
+            let day = day.map(|limit| Reading {
+                limit,
+                used: row.get::<i64, _>("day"),
+                seen,
+            });
+            let month = month.map(|limit| Reading {
+                limit,
+                used: row.get::<i64, _>("month"),
+                seen,
+            });
+            if let Some(read) = day
+                && read.used >= read.limit
+            {
+                return Err(refuse(Refusal::KeyDayCap {
+                    cap: read.limit,
+                    in_flight: 0,
+                }));
+            }
+            if let Some(read) = month
+                && read.used >= read.limit
+            {
+                return Err(refuse(Refusal::KeyMonthCap {
+                    cap: read.limit,
+                    in_flight: 0,
+                }));
+            }
+            (day, month)
         }
-    }
-    // The account is checked before its limits, because a disabled account cannot use a key at
-    // all. The account limit counts the current day only and resets at 00:00 UTC, matching the
-    // UTC text the usage rows are stored as. It is checked after the key cap, so a key cannot
-    // be used to work around it.
-    let account = account_row(st, key.user_id).await?;
-    if let Some(blocked) = disabled_account(&account) {
-        return Some(blocked);
-    }
-    if let Some(cap) = account.get::<Option<i64>, _>("daily_token_cap") {
-        let used = sqlx::query(
-            "SELECT COALESCE(SUM(total_tokens), 0) AS used FROM usage \
+    };
+    let day_cap = match account.get::<Option<i64>, _>("daily_token_cap") {
+        Some(cap) => match sqlx::query(
+            "SELECT COALESCE(SUM(total_tokens), 0) AS used, \
+             (SELECT COALESCE(MAX(id), 0) FROM usage) AS seen FROM usage \
              WHERE user_id = ? AND strftime('%Y-%m-%d', created_at) = date('now')",
         )
         .bind(key.user_id)
         .fetch_one(&st.pool)
         .await
-        .map(|row| row.get::<i64, _>("used"))
-        .unwrap_or(0);
-        if used >= cap {
-            return Some(error(
-                StatusCode::TOO_MANY_REQUESTS,
-                "token_cap",
-                format!(
-                    "account '{}' has used its daily token limit of {cap} input and output tokens",
-                    account.get::<String, _>("username")
-                ),
-            ));
-        }
+        {
+            Ok(row) => Some(reading(cap, row)),
+            Err(err) => return Err(Box::new(unreadable(err))),
+        },
+        None => None,
+    };
+    if let Some(cap) = day_cap
+        && cap.used >= cap.limit
+    {
+        return Err(refuse(Refusal::DayCap {
+            cap: cap.limit,
+            in_flight: 0,
+        }));
     }
-    None
+    let ask = Ask {
+        key_id: key.id,
+        user_id: key.user_id,
+        prompt_tokens,
+        read_at,
+        rpm,
+        key_cap,
+        key_day_cap,
+        key_month_cap,
+        day_cap,
+    };
+    st.reservations.reserve(ask).map_err(refuse)
 }
 
-fn resolve_model(key_model: Option<&str>, conn: &Connection, requested: Option<&str>) -> String {
+// What was left of the limits when the request was admitted, before it, so a client can slow down before it is
+// refused rather than after. The token figure is the limit with the least left, named by its window; requests
+// still running count by their estimated input, as they do for the limit itself. A warning is added once a
+// fifth or less of a token limit is left. The names are the gateway's own: the `x-ratelimit-*` an OpenAI client
+// may read mean a window of a minute, and these windows are a day, a month, or a key's whole life.
+const WARN_BELOW_PERCENT: i64 = 20;
+
+fn left_headers(response: &mut Response, left: Left) {
+    let headers = response.headers_mut();
+    let number = |value: i64| HeaderValue::from(value.max(0));
+    if let Some((limit, remaining)) = left.requests {
+        headers.insert("x-dreamgate-requests-limit", number(limit));
+        headers.insert("x-dreamgate-requests-remaining", number(remaining));
+    }
+    if let Some((window, limit, remaining)) = left.tokens {
+        headers.insert("x-dreamgate-tokens-limit", number(limit));
+        headers.insert("x-dreamgate-tokens-remaining", number(remaining));
+        headers.insert(
+            "x-dreamgate-tokens-window",
+            HeaderValue::from_static(window.label()),
+        );
+        if remaining.saturating_mul(100) <= limit.saturating_mul(WARN_BELOW_PERCENT) {
+            // The limit is named by what it is rather than by the key's name, which is the account's own text and
+            // could carry what a header cannot, or arrive garbled in a client that reads a header as Latin-1.
+            let whose = match window {
+                Window::AccountDay => "the account's daily token limit",
+                Window::Key => "the key's token cap",
+                Window::KeyDay => "the key's daily token limit",
+                Window::KeyMonth => "the key's monthly token limit",
+            };
+            let warning = format!(
+                "{} input and output tokens of {whose} of {limit} were left before this request",
+                remaining.max(0)
+            );
+            if let Ok(value) = HeaderValue::from_str(&warning) {
+                headers.insert("x-dreamgate-budget-warning", value);
+            }
+        }
+    }
+}
+
+// A cap reached with requests still running counts their input as the gateway estimated it, so the answer
+// says how much of what it counted is that estimate rather than a number an upstream reported.
+fn in_flight_note(in_flight: i64) -> String {
+    if in_flight == 0 {
+        String::new()
+    } else {
+        format!(", counting an estimated {in_flight} input tokens of requests still in flight")
+    }
+}
+
+// A model the client left blank names none, as leaving it out does.
+fn named(requested: Option<&str>) -> Option<&str> {
+    requested.filter(|model| !model.trim().is_empty())
+}
+
+// A generation is sent with the key's own model first, then the connection's default, and the model the
+// client asks for only when neither is set. An embedding is not: its vectors only mean something next to the
+// ones the same model made, and a key's or a connection's model is a model that generates, so the one the
+// client names is sent, and the other two fill in only when it names none.
+fn resolve_model(
+    endpoint: Endpoint,
+    key_model: Option<&str>,
+    conn: &Connection,
+    requested: Option<&str>,
+) -> Option<String> {
+    if endpoint == Endpoint::Embeddings
+        && let Some(requested) = named(requested)
+    {
+        return Some(requested.to_string());
+    }
     key_model
         .map(String::from)
         .or_else(|| conn.default_model.clone())
-        .unwrap_or_else(|| requested.unwrap_or("unknown").to_string())
+        .or_else(|| requested.map(String::from))
 }
 
-fn build_payload(body: &Value, model: &str) -> Value {
+// The OpenAI-compatible endpoints the gateway forwards. They share everything but where a request's input is,
+// where an answer's text is, and whether they stream; the rest of the path is the same for all three.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Endpoint {
+    Chat,
+    Completions,
+    Embeddings,
+}
+
+impl Endpoint {
+    fn path(self) -> &'static str {
+        match self {
+            Endpoint::Chat => "chat/completions",
+            Endpoint::Completions => "completions",
+            Endpoint::Embeddings => "embeddings",
+        }
+    }
+
+    // The estimate of what was sent in, used until an upstream reports its own count. A completion's input
+    // is its prompt and, for an editor filling in the middle of a file, the text after the cursor as well. Some
+    // servers take an embedding's input as chat messages, so those are read when there is no `input`.
+    fn prompt_tokens(self, body: &Value) -> i64 {
+        let field = |name: &str| body.get(name).unwrap_or(&Value::Null);
+        match self {
+            Endpoint::Chat => tokens::prompt_estimate(field("messages")),
+            Endpoint::Completions => {
+                tokens::input_estimate(field("prompt")) + tokens::input_estimate(field("suffix"))
+            }
+            Endpoint::Embeddings => match body.get("input").filter(|input| !input.is_null()) {
+                Some(input) => tokens::input_estimate(input),
+                None => tokens::prompt_estimate(field("messages")),
+            },
+        }
+    }
+
+    // An embedding is not a stream, whatever a request asks for, so nothing about streaming is added to it.
+    fn wants_stream(self, body: &Value) -> bool {
+        self != Endpoint::Embeddings && body.get("stream").and_then(Value::as_bool).unwrap_or(false)
+    }
+
+    // A single answer, read for what it reports and what it generated. An embedding's answer is mostly its
+    // vectors, which can be megabytes of numbers nothing here reads, so only the two fields the report comes
+    // from are kept and the rest is skipped without being built into a value.
+    fn parse_answer(self, bytes: &[u8]) -> Option<Value> {
+        if self == Endpoint::Embeddings {
+            #[derive(serde::Deserialize)]
+            struct Reported {
+                usage: Option<Value>,
+                timings: Option<Value>,
+            }
+            let reported = serde_json::from_slice::<Reported>(bytes).ok()?;
+            return Some(json!({ "usage": reported.usage, "timings": reported.timings }));
+        }
+        serde_json::from_str::<Value>(&String::from_utf8_lossy(bytes)).ok()
+    }
+
+    // The text a single answer generated, for the estimate when the upstream reports nothing. A chat answer
+    // is a message, a completion is text, and an embedding generates no text at all.
+    fn answer_text(self, parsed: Option<&Value>) -> String {
+        let choices = parsed
+            .and_then(|value| value.get("choices").and_then(Value::as_array))
+            .into_iter()
+            .flatten();
+        let texts: Vec<String> = match self {
+            Endpoint::Chat => choices
+                .filter_map(|choice| choice.get("message").map(text_of))
+                .collect(),
+            Endpoint::Completions => choices
+                .filter_map(|choice| choice.get("text").and_then(Value::as_str))
+                .map(str::to_string)
+                .collect(),
+            Endpoint::Embeddings => Vec::new(),
+        };
+        texts
+            .into_iter()
+            .filter(|text| !text.is_empty())
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+}
+
+fn build_payload(body: &Value, model: Option<&str>, wants_stream: bool) -> Value {
     let mut payload = body.clone();
-    payload["model"] = Value::String(model.to_string());
+    // When nothing names a model the body keeps what the client sent, so the upstream answers with its own
+    // default rather than with a name nobody chose.
+    if let Some(model) = model {
+        payload["model"] = Value::String(model.to_string());
+    }
     // Upstreams that support stream_options report real usage at the end of the
     // stream; without it the gateway has to estimate completion tokens.
-    if body.get("stream").and_then(Value::as_bool).unwrap_or(false)
-        && payload.get("stream_options").is_none()
-    {
+    if wants_stream && payload.get("stream_options").is_none() {
         payload["stream_options"] = json!({ "include_usage": true });
     }
     payload
@@ -313,10 +701,15 @@ fn scan_line(line: &[u8], generated: &mut String, report: &mut Report) {
         .into_iter()
         .flatten()
     {
-        let Some(delta) = choice.get("delta") else {
-            continue;
+        // A chat stream sends a delta; a completions stream sends the text itself.
+        let text = match choice.get("delta") {
+            Some(delta) => text_of(delta),
+            None => choice
+                .get("text")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
         };
-        let text = text_of(delta);
         if text.is_empty() {
             continue;
         }
@@ -334,10 +727,30 @@ fn drain_buffer(buffer: &mut Vec<u8>, generated: &mut String, report: &mut Repor
     }
 }
 
-async fn record(st: &State, row: &UsageRow) {
-    if let Err(err) = usage::record(st, row).await {
-        tracing::warn!("usage record failed: {err}");
-    }
+// The row is written on a task of its own, which holds the request's hold and its slots until the row is in. A
+// client that leaves drops the handler and whatever the handler was waiting on: dropped in the middle of the
+// write, the row could land without its hold learning of it, which would count the request twice for a minute,
+// and the slots would come back before the row, which is what a stop waits for. A row that could not be written
+// leaves the hold unsettled, so a request that reached a connection keeps its place in the minute.
+async fn record(
+    st: &State,
+    row: UsageRow,
+    mut reservation: Reservation,
+    mut failures: registry::Failures,
+    slots: impl Send + 'static,
+) {
+    let st = st.clone();
+    let write = tokio::spawn(async move {
+        st.metrics.recorded(&row);
+        if let Err(err) = usage::record(&st, &row, |id| reservation.settle(id)).await {
+            st.metrics.usage_write_failure();
+            tracing::error!("usage record failed: {err}");
+        }
+        failures.write().await;
+        drop(reservation);
+        drop(slots);
+    });
+    let _ = write.await;
 }
 
 // What the stream task still needs after the handler has returned, passed as one value rather
@@ -349,15 +762,23 @@ struct StreamContext {
     model: String,
     present: Active,
     admission: Admission,
+    reservation: Reservation,
+    failures: registry::Failures,
 }
 
 fn stream_body(
-    ctx: StreamContext,
+    mut ctx: StreamContext,
     upstream: reqwest::Response,
     started: Instant,
     prompt_tokens: i64,
 ) -> impl futures_util::Stream<Item = Result<Bytes, BoxError>> {
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, BoxError>>(64);
+    // Why the stream was ended, when it was ended rather than finished. It is not sent down the channel: a
+    // client that has stopped reading leaves the channel full, and waiting to hand it the error would keep the
+    // row from being written. It is given to the client after whatever is still queued instead, when the
+    // channel closes, so a client that is reading sees it in the same place it always did.
+    let ending: Arc<OnceLock<String>> = Arc::default();
+    let ended = ending.clone();
     tokio::spawn(async move {
         let mut buffer: Vec<u8> = Vec::new();
         let mut generated = String::new();
@@ -380,11 +801,35 @@ fn stream_body(
         // socket dying on the client's side. Silence for the window is a dead connection, and the request
         // should not hold its slot for one forever.
         let stall = ctx.st.limits.stream_stall();
+        // A stream still running when the grace window for stopping has passed is ended, so the process
+        // can stop with its row written rather than lost. It is read first, so a stream that keeps
+        // producing cannot keep the stop waiting.
+        let closing = ctx.st.shutdown.reached(Phase::Closing);
+        tokio::pin!(closing);
+        // As with a stream that went quiet, the client already has a 200, so the stream ends as an error and
+        // the client can tell the answer was cut.
+        let cut_short = |ctx: &StreamContext| {
+            tracing::warn!(
+                "the gateway is stopping and the stream was ended: {}",
+                ctx.model
+            );
+            let _ = ended.set(String::from("the gateway is shutting down"));
+        };
         loop {
-            let chunk = match tokio::time::timeout(stall, incoming.next()).await {
+            let next = tokio::select! {
+                biased;
+                _ = &mut closing => {
+                    cut_short(&ctx);
+                    break;
+                }
+                next = tokio::time::timeout(stall, incoming.next()) => next,
+            };
+            let chunk = match next {
                 Ok(Some(chunk)) => chunk,
                 Ok(None) => break,
                 Err(_) => {
+                    ctx.st.metrics.stream_stall();
+                    ctx.failures.push(ctx.conn.id, "stalled");
                     tracing::warn!(
                         "upstream went quiet for {stall:?} and the stream was closed: {}",
                         ctx.model
@@ -392,9 +837,7 @@ fn stream_body(
                     // The client has already been sent a 200, so there is no status left to change: the stream
                     // ends as an error rather than as a completed answer, which is what lets a client tell an
                     // answer that was cut from one that finished.
-                    let _ = tx
-                        .send(Err(BoxError::from("the upstream went quiet")))
-                        .await;
+                    let _ = ended.set(String::from("the upstream went quiet"));
                     break;
                 }
             };
@@ -414,7 +857,17 @@ fn stream_body(
                         report.prompt.is_none(),
                         report.completion.is_none(),
                     );
-                    if tx.send(Ok(bytes)).await.is_err() {
+                    // A client that has stopped reading without leaving fills the channel, and the send waits
+                    // for it; the stop does not, so a stream held up that way is still ended and recorded.
+                    let sent = tokio::select! {
+                        biased;
+                        _ = &mut closing => {
+                            cut_short(&ctx);
+                            break;
+                        }
+                        sent = tx.send(Ok(bytes)) => sent,
+                    };
+                    if sent.is_err() {
                         // The client disconnected mid-stream. The row is still written, with whatever
                         // the upstream had reported up to there; the final usage chunk, which is where a
                         // cache hit and the timings appear, is not.
@@ -422,7 +875,9 @@ fn stream_body(
                     }
                 }
                 Err(err) => {
-                    let _ = tx.send(Err(BoxError::from(err))).await;
+                    let err = err.without_url();
+                    upstream_failed(&ctx.st, &ctx.conn, &err, &mut ctx.failures, "broken");
+                    let _ = ended.set(err.to_string());
                     break;
                 }
             }
@@ -456,23 +911,51 @@ fn stream_body(
             stream: Some(stream),
         };
         // The stream stays on the list while its row is written, and leaves it in the step that sends the
-        // row's event, so a page goes from one to the other without a moment showing neither.
-        let event = match usage::write(&ctx.st, &row).await {
+        // row's event, so a page goes from one to the other without a moment showing neither. The row is
+        // counted for `/metrics` here as well, because it does not go through `record`.
+        ctx.st.metrics.recorded(&row);
+        let mut row_id = None;
+        let written = usage::write(&ctx.st, &row, |id| {
+            row_id = Some(id);
+            ctx.reservation.settle(id);
+        })
+        .await;
+        let event = match written {
             Ok(event) => Some(event),
             Err(err) => {
-                tracing::warn!("usage record failed: {err}");
+                ctx.st.metrics.usage_write_failure();
+                tracing::error!("usage record failed: {err}");
                 None
             }
         };
+        // A stream that broke off or went quiet is named by its row, so its figures count it as a failure. The
+        // stream is settled first, so its row's event and the client's end of the stream do not wait for this
+        // write; the slots, which a stop waits for, are still held until it is done.
+        if let Some(id) = row_id {
+            ctx.failures.cut_short(id);
+        }
         inflight.settle(event);
+        // The sender goes with the stream: the client reads the end of it once the sender is gone, and the task
+        // would otherwise keep it until the write below is done.
+        drop(tx);
+        ctx.failures.write().await;
         // Released here rather than when the handler returned, so a stream is still counted
         // while it is running. The connection slot is given back at the same point, because the request
         // is still in flight for as long as the stream is being read.
         drop(ctx.present);
         drop(ctx.admission);
     });
-    stream::unfold(rx, |mut rx| async move {
-        rx.recv().await.map(|item| (item, rx))
+    stream::unfold(Some(rx), move |rx| {
+        let ending = ending.clone();
+        async move {
+            let mut rx = rx?;
+            match rx.recv().await {
+                Some(item) => Some((item, Some(rx))),
+                None => ending
+                    .get()
+                    .map(|reason| (Err(BoxError::from(reason.clone())), None)),
+            }
+        }
     })
 }
 
@@ -481,7 +964,53 @@ pub async fn chat_completions(
     headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> Response {
+    forward(st, headers, body, Endpoint::Chat).await
+}
+
+pub async fn completions(
+    AxumState(st): AxumState<State>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Response {
+    forward(st, headers, body, Endpoint::Completions).await
+}
+
+pub async fn embeddings(
+    AxumState(st): AxumState<State>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Response {
+    forward(st, headers, body, Endpoint::Embeddings).await
+}
+
+// A path under /v1 that the gateway does not serve is answered the way an OpenAI-compatible server answers
+// one, as JSON a client can read, rather than as the empty answer of the dashboard's file server.
+pub async fn not_found(uri: axum::http::Uri) -> Response {
+    error(
+        StatusCode::NOT_FOUND,
+        "not_found",
+        format!(
+            "{} is not served here; the gateway serves /v1/chat/completions, /v1/completions, \
+             /v1/embeddings and /v1/models",
+            uri.path()
+        ),
+    )
+}
+
+// A served path asked for with a method it does not take.
+pub async fn method_not_allowed(uri: axum::http::Uri) -> Response {
+    error(
+        StatusCode::METHOD_NOT_ALLOWED,
+        "invalid_request",
+        format!("{} does not take this method", uri.path()),
+    )
+}
+
+async fn forward(st: State, headers: HeaderMap, body: Value, endpoint: Endpoint) -> Response {
     let started = Instant::now();
+    if st.shutdown.phase() != Phase::Running {
+        return shutting_down();
+    }
     let Some(raw) = virtual_key(&headers) else {
         return error(
             StatusCode::UNAUTHORIZED,
@@ -489,28 +1018,66 @@ pub async fn chat_completions(
             "missing Authorization: Bearer <virtual key>",
         );
     };
-    let Some(key) = lookup_key(&st, &raw).await else {
-        return error(
-            StatusCode::UNAUTHORIZED,
-            "invalid_api_key",
-            "unknown virtual key",
-        );
+    let key = match lookup_key(&st, &raw).await {
+        Ok(Some(key)) => key,
+        Ok(None) => return unknown_key(),
+        Err(err) => return unreadable(err),
     };
-    if !key.enabled {
-        return error(
-            StatusCode::FORBIDDEN,
-            "key_disabled",
-            "this key is disabled",
-        );
+    if let Some(refused) = key_refused(&key) {
+        return refused;
     }
     // Counted from here, so a request that is refused by a limit still marks the account as
     // active; the guard is released when the request finishes, including for a stream.
     let present = presence::track(&st, key.user_id);
-    if let Some(blocked) = enforce_limits(&st, &key).await {
-        return blocked;
-    }
+    let prompt_tokens = endpoint.prompt_tokens(&body);
+    // Dropped without being settled, as on every early answer below, the hold is given back.
+    let reservation = match enforce_limits(&st, &key, prompt_tokens).await {
+        Ok(reservation) => reservation,
+        Err(blocked) => return *blocked,
+    };
+    // Every answer from here on carries what was left of the key's and the account's limits when the request was
+    // admitted, so the rest of the request is a function of its own whose answer the headers are added to,
+    // whichever way it ends.
+    let left = reservation.left();
+    let admitted = Admitted {
+        key,
+        started,
+        prompt_tokens,
+        present,
+        reservation,
+        session: registry::client_session(&headers),
+    };
+    let mut response = admitted_request(st, body, endpoint, admitted).await;
+    left_headers(&mut response, left);
+    response
+}
 
-    let candidates = registry::candidates(&st, key.connection_id).await;
+// What admission produced, handed on as one so the request after it is not a function of eight arguments.
+struct Admitted {
+    key: KeyInfo,
+    started: Instant,
+    prompt_tokens: i64,
+    present: Active,
+    reservation: Reservation,
+    // The session the client sent, passed on to a connection whose kind asks for one.
+    session: Option<HeaderValue>,
+}
+
+async fn admitted_request(
+    st: State,
+    body: Value,
+    endpoint: Endpoint,
+    admitted: Admitted,
+) -> Response {
+    let Admitted {
+        key,
+        started,
+        prompt_tokens,
+        present,
+        mut reservation,
+        session,
+    } = admitted;
+    let mut candidates = registry::candidates(&st, key.connection_id).await;
     if candidates.is_empty() {
         return error(
             StatusCode::BAD_GATEWAY,
@@ -518,15 +1085,51 @@ pub async fn chat_completions(
             "no enabled connection is available for this key",
         );
     }
-    let wants_stream = body.get("stream").and_then(Value::as_bool).unwrap_or(false);
-    let prompt_tokens = tokens::prompt_estimate(body.get("messages").unwrap_or(&Value::Null));
+    let wants_stream = endpoint.wants_stream(&body);
     let requested = body.get("model").and_then(Value::as_str);
+    // An upstream's answer is passed on as it is, a 404 for a model it does not have included, so the order is
+    // what decides whether a request for a model reaches one that serves it. A connection whose last list does
+    // not name the model it would be sent is tried after the others rather than left out, because a list is
+    // only read every 30 seconds and some servers answer to any name. That is only done when another connection
+    // would be sent the same model and its list names it: with nothing known for the model, moving one back would
+    // only hand the request to a connection known no better, whose 404 would then end it, and a connection whose
+    // own default it lists says nothing about a model it is not sent. The key's own connection is never moved,
+    // because binding a key is how a client is sent to the connection that serves it. The sort is stable, so the
+    // order within each part is the one `registry::candidates` gave, a connection marked down after the others;
+    // one marked down whose list names the model goes ahead of one that is up and does not.
+    let sent: Vec<Option<String>> = candidates
+        .iter()
+        .map(|conn| resolve_model(endpoint, key.model.as_deref(), conn, requested))
+        .collect();
+    let served = |model: &str| {
+        candidates.iter().zip(&sent).any(|(conn, sent)| {
+            sent.as_deref()
+                .is_some_and(|sent| registry::same_model(sent, model))
+                && conn.lists(model)
+        })
+    };
+    let moved: std::collections::HashSet<i64> = candidates
+        .iter()
+        .zip(&sent)
+        .filter(|(conn, sent)| {
+            Some(conn.id) != key.connection_id
+                && sent
+                    .as_deref()
+                    .is_some_and(|model| conn.lists_without(model) && served(model))
+        })
+        .map(|(conn, _)| conn.id)
+        .collect();
+    candidates.sort_by_key(|conn| moved.contains(&conn.id));
     // The request is admitted as a whole, before anything is asked of a connection, and the slots are held for
     // as long as it runs. Nothing is queued here: a connection that is full is skipped, so one slow
     // connection cannot hold unrelated requests behind it. Admitting once, at the start, is also what keeps a
     // request that has already reached a connection answering as that connection failed: once something has
     // crossed the gate it is recorded, so it cannot be turned into an overload on the next attempt.
     let Some(global) = st.limits.try_global() else {
+        // A gateway that is full while it stops says it is stopping, which is the answer that lasts.
+        if st.shutdown.phase() != Phase::Running {
+            return shutting_down();
+        }
         return error(
             StatusCode::SERVICE_UNAVAILABLE,
             "overloaded",
@@ -536,17 +1139,28 @@ pub async fn chat_completions(
             ),
         );
     };
+    // The check at the top can be passed just before the process starts to stop, by a request that then waits
+    // on the database for its key and its limits. Admitted after the drain has found every slot back, nothing
+    // would wait for it or end it, so the phase is read again once the request holds its slot.
+    if st.shutdown.phase() != Phase::Running {
+        return shutting_down();
+    }
     let mut last_error = String::from("no connection responded");
     // Connections that were already at their limit when this request arrived. They are remembered so that a
     // request which never reached an upstream can be answered as an overload rather than as a failure of an
     // upstream that was never asked.
     let mut full: Vec<String> = Vec::new();
     let mut attempted = false;
+    // The failures of connections this request was sent to, marked passed on when it is sent to another one,
+    // which is what makes them failovers.
+    let mut failures = registry::Failures::new(&st);
+    // The connection a request was waiting on when the gateway ended it because it was stopping, and the model
+    // it was sent there with.
+    let mut cut: Option<(i64, String)> = None;
 
+    // The connections come in the order they are tried: the key's own first, then priority, with the ones
+    // marked down after the rest (`registry::candidates`). Each is tried once.
     for conn in &candidates {
-        if conn.health == "down" && candidates.len() > 1 {
-            continue;
-        }
         let Ok(slot) = st
             .limits
             .for_connection(conn.id, conn.max_concurrent)
@@ -555,18 +1169,19 @@ pub async fn chat_completions(
             full.push(conn.name.clone());
             continue;
         };
-        let model = resolve_model(key.model.as_deref(), conn, requested);
-        let url = registry::endpoint(&conn.base_url, "chat/completions");
-        let payload = build_payload(&body, &model);
+        let model = resolve_model(endpoint, key.model.as_deref(), conn, requested);
+        let url = registry::endpoint(&conn.base_url, endpoint.path());
+        let payload = build_payload(&body, model.as_deref(), wants_stream);
+        // The row and the stream in flight name the model the gateway sent, and say unknown when it sent none.
+        // The upstream's answer says which model it used, but that is not read here.
+        let model = model.unwrap_or_else(|| String::from("unknown"));
         attempted = true;
-        let mut request = st
-            .http
-            .post(&url)
-            .header(
-                header::AUTHORIZATION,
-                format!("Bearer {}", conn.api_key.clone().unwrap_or_default()),
-            )
-            .json(&payload);
+        failures.passed_on();
+        // From here the upstream is asked, so the request keeps its place in the minute even if its client
+        // leaves before a row is written.
+        reservation.sent();
+        let mut request =
+            registry::authorized(st.http.post(&url), conn, session.as_ref()).json(&payload);
         // Only a single answer is given a deadline for the whole of it, because for that there is an end. A
         // stream is bounded by how long it goes quiet instead, and the same window is what bounds the wait for
         // its head: a connection that takes the request and never answers is a dead connection, not a slow
@@ -575,17 +1190,36 @@ pub async fn chat_completions(
         if !wants_stream {
             request = request.timeout(st.limits.request_timeout());
         }
-        let sent = if wants_stream {
-            tokio::time::timeout(st.limits.stream_stall(), request.send())
-                .await
-                .map_err(|_| BoxError::from("nothing arrived within the stall window"))
-                .and_then(|result| result.map_err(BoxError::from))
-        } else {
-            request.send().await.map_err(BoxError::from)
+        // The error is what the client is told, so the URL is taken out of it first: it names an internal
+        // host and port, and a credential when a connection carries one in its address. The connection is
+        // named instead.
+        let sending = async {
+            if wants_stream {
+                tokio::time::timeout(st.limits.stream_stall(), request.send())
+                    .await
+                    .map_err(|_| BoxError::from("nothing arrived within the stall window"))
+                    .and_then(|result| result.map_err(|err| BoxError::from(err.without_url())))
+            } else {
+                request
+                    .send()
+                    .await
+                    .map_err(|err| BoxError::from(err.without_url()))
+            }
+        };
+        // A request still waiting on its answer when the grace window for stopping has passed is ended, so
+        // the process can stop with its row written rather than lost.
+        let sent = tokio::select! {
+            biased;
+            sent = sending => sent,
+            _ = st.shutdown.reached(Phase::Closing) => {
+                cut = Some((conn.id, model.clone()));
+                break;
+            }
         };
         let upstream = match sent {
             Ok(upstream) => upstream,
             Err(err) => {
+                upstream_failed(&st, conn, &*err, &mut failures, "unreachable");
                 last_error = format!("{}: {err}", conn.name);
                 continue;
             }
@@ -601,6 +1235,10 @@ pub async fn chat_completions(
             );
             out.headers_mut()
                 .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-cache"));
+            // nginx holds a response back until its buffer fills unless it is told not to, which would turn a
+            // stream into one late answer; this header tells it so for this response alone.
+            out.headers_mut()
+                .insert("x-accel-buffering", HeaderValue::from_static("no"));
             // The slots are handed to the stream task, so they are held until the stream ends rather than
             // until this handler returns.
             let ctx = StreamContext {
@@ -613,32 +1251,36 @@ pub async fn chat_completions(
                     global,
                     connection: slot,
                 },
+                reservation,
+                failures,
             };
             *out.body_mut() = Body::from_stream(stream_body(ctx, upstream, started, prompt_tokens));
             return out;
         }
 
-        let bytes = match upstream.bytes().await {
+        let read = tokio::select! {
+            biased;
+            read = upstream.bytes() => read,
+            _ = st.shutdown.reached(Phase::Closing) => {
+                cut = Some((conn.id, model.clone()));
+                break;
+            }
+        };
+        let bytes = match read {
             Ok(bytes) => bytes,
             Err(err) => {
+                let err = err.without_url();
+                upstream_failed(&st, conn, &err, &mut failures, "broken");
                 last_error = format!("{}: {err}", conn.name);
                 continue;
             }
         };
-        let parsed = serde_json::from_str::<Value>(&String::from_utf8_lossy(&bytes)).ok();
+        let parsed = endpoint.parse_answer(&bytes);
         let mut report = Report::default();
         if let Some(value) = parsed.as_ref() {
             read_report(value, &mut report);
         }
-        let completion_text = parsed
-            .as_ref()
-            .and_then(|value| value.get("choices").and_then(Value::as_array))
-            .into_iter()
-            .flatten()
-            .filter_map(|choice| choice.get("message").map(text_of))
-            .filter(|text| !text.is_empty())
-            .collect::<Vec<_>>()
-            .join(" ");
+        let completion_text = endpoint.answer_text(parsed.as_ref());
         let (prompt, completion, estimated) = if report.reported() {
             (
                 report.prompt.unwrap_or(prompt_tokens),
@@ -654,7 +1296,7 @@ pub async fn chat_completions(
         };
         record(
             &st,
-            &UsageRow {
+            UsageRow {
                 api_key_id: key.id,
                 user_id: key.user_id,
                 connection_id: Some(conn.id),
@@ -672,6 +1314,9 @@ pub async fn chat_completions(
                 created_at: crate::clock::now(),
                 stream: None,
             },
+            reservation,
+            failures,
+            (global, slot),
         )
         .await;
 
@@ -704,31 +1349,82 @@ pub async fn chat_completions(
 
     record(
         &st,
-        &UsageRow {
+        UsageRow {
             api_key_id: key.id,
             user_id: key.user_id,
-            connection_id: None,
-            model: key.model.clone().or_else(|| requested.map(String::from)),
+            // The connection that was working on the request when the gateway ended it, with the model it was
+            // sent there with, and none when no connection answered.
+            connection_id: cut.as_ref().map(|(id, _)| *id),
+            model: match &cut {
+                Some((_, model)) => Some(model.clone()),
+                // No connection answered, so no one connection's default can be named; for an embedding the model
+                // the client named was sent to every connection tried, ahead of the key's.
+                None if endpoint == Endpoint::Embeddings => named(requested)
+                    .map(String::from)
+                    .or_else(|| key.model.clone()),
+                None => key.model.clone().or_else(|| requested.map(String::from)),
+            },
             prompt_tokens,
             completion_tokens: 0,
             total_tokens: prompt_tokens,
-            // Nothing reached an engine, so there is nothing it could have reported about the request.
+            // No answer came back, so there is nothing an engine reported about the request.
             cached_tokens: None,
             prompt_ms: None,
             generation_ms: None,
             latency_ms: started.elapsed().as_millis() as i64,
-            status: 502,
+            status: if cut.is_some() { 503 } else { 502 },
             streamed: wants_stream,
             estimated: true,
             created_at: crate::clock::now(),
             stream: None,
         },
+        reservation,
+        failures,
+        global,
     )
     .await;
+    // Ended by the gateway because it was stopping, not by a connection that failed.
+    if cut.is_some() {
+        return shutting_down();
+    }
+    // A connection that was full was passed over for one that then failed, which can be one marked down,
+    // tried last. The answer is what that one did, and the full ones are named beside it, so the client is
+    // not told only half of why nothing answered.
+    if !full.is_empty() {
+        last_error = format!(
+            "{last_error}; at their limit of requests at once: {}",
+            full.join(", ")
+        );
+    }
     error(StatusCode::BAD_GATEWAY, "upstream_unavailable", last_error)
 }
 
+// The models the connections listed at their last checks, each once, in the order of the key's connections,
+// and named after the first connection that lists it. A connection whose list has not been read is left out,
+// because what it serves is not known; nothing is made up for it. What is written is what that connection's list
+// said: the id and the time the model was made, when it gave one, and the connection as its owner in place of
+// the upstream's, which differs between upstreams for the same model.
+fn merged_models(candidates: &[registry::Connection]) -> Response {
+    let mut seen = std::collections::HashSet::new();
+    let mut data = Vec::new();
+    for conn in candidates {
+        for model in conn.models.iter().flatten() {
+            if seen.insert(model.id.as_str()) {
+                let mut entry = json!({ "id": model.id, "object": "model", "owned_by": conn.name });
+                if let Some(created) = model.created {
+                    entry["created"] = json!(created);
+                }
+                data.push(entry);
+            }
+        }
+    }
+    Json(json!({ "object": "list", "data": data })).into_response()
+}
+
 pub async fn list_models(AxumState(st): AxumState<State>, headers: HeaderMap) -> Response {
+    if st.shutdown.phase() != Phase::Running {
+        return shutting_down();
+    }
     let Some(raw) = virtual_key(&headers) else {
         return error(
             StatusCode::UNAUTHORIZED,
@@ -736,56 +1432,57 @@ pub async fn list_models(AxumState(st): AxumState<State>, headers: HeaderMap) ->
             "missing Authorization: Bearer <virtual key>",
         );
     };
-    let Some(key) = lookup_key(&st, &raw).await else {
-        return error(
-            StatusCode::UNAUTHORIZED,
-            "invalid_api_key",
-            "unknown virtual key",
-        );
+    let key = match lookup_key(&st, &raw).await {
+        Ok(Some(key)) => key,
+        Ok(None) => return unknown_key(),
+        Err(err) => return unreadable(err),
     };
-    if !key.enabled {
-        return error(
-            StatusCode::FORBIDDEN,
-            "key_disabled",
-            "this key is disabled",
-        );
+    if let Some(refused) = key_refused(&key) {
+        return refused;
     }
-    if let Some(blocked) = account_row(&st, key.user_id)
-        .await
-        .as_ref()
-        .and_then(disabled_account)
-    {
-        return blocked;
+    match account_row(&st, key.user_id).await {
+        Ok(Some(account)) => {
+            if let Some(blocked) = disabled_account(&account) {
+                return blocked;
+            }
+        }
+        Ok(None) => return unknown_key(),
+        Err(err) => return unreadable(err),
     }
-    let Some(conn) = registry::candidates(&st, key.connection_id)
-        .await
-        .first()
-        .cloned()
-    else {
+    let candidates = registry::candidates(&st, key.connection_id).await;
+    let Some(conn) = candidates.first().cloned() else {
         return error(
             StatusCode::BAD_GATEWAY,
             "no_upstream",
             "no enabled connection is available for this key",
         );
     };
+    if candidates.iter().any(|conn| conn.models.is_some()) {
+        return merged_models(&candidates);
+    }
+    // No list has been read yet, before the first round of checks or from upstreams whose list is not in the
+    // OpenAI shape, so the first connection is asked for its own.
     // The model list is a single answer, not a stream, so the same deadline covers it as covers any single
     // answer, as the client's total deadline did before this change.
-    let result = st
-        .http
-        .get(registry::endpoint(&conn.base_url, "models"))
-        .header(
-            header::AUTHORIZATION,
-            format!("Bearer {}", conn.api_key.clone().unwrap_or_default()),
-        )
-        .timeout(st.limits.request_timeout())
-        .send()
-        .await;
+    let result = registry::authorized(
+        st.http.get(registry::endpoint(&conn.base_url, "models")),
+        &conn,
+        registry::client_session(&headers).as_ref(),
+    )
+    .timeout(st.limits.request_timeout())
+    .send()
+    .await;
     match result {
         Ok(upstream) => {
             let status = upstream.status();
             let bytes = match upstream.bytes().await {
                 Ok(bytes) => bytes,
                 Err(err) => {
+                    let err = err.without_url();
+                    // Left to be written as it drops, on a task of its own, so a client that leaves cannot cut
+                    // the write short.
+                    let mut failures = registry::Failures::new(&st);
+                    upstream_failed(&st, &conn, &err, &mut failures, "broken");
                     return error(
                         StatusCode::BAD_GATEWAY,
                         "upstream_unavailable",
@@ -802,10 +1499,16 @@ pub async fn list_models(AxumState(st): AxumState<State>, headers: HeaderMap) ->
             *out.body_mut() = Body::from(bytes);
             out.into_response()
         }
-        Err(err) => error(
-            StatusCode::BAD_GATEWAY,
-            "upstream_unavailable",
-            format!("{}: {err}", conn.name),
-        ),
+        // As on the completion path, the connection is named and its address is not.
+        Err(err) => {
+            let err = err.without_url();
+            let mut failures = registry::Failures::new(&st);
+            upstream_failed(&st, &conn, &err, &mut failures, "unreachable");
+            error(
+                StatusCode::BAD_GATEWAY,
+                "upstream_unavailable",
+                format!("{}: {err}", conn.name),
+            )
+        }
     }
 }
