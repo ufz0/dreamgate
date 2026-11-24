@@ -91,6 +91,13 @@ which starts the drain (see Stopping); the stop timeout has to be longer than th
 seconds — up to ten for the connections still open and five for the last rows — or Docker kills the process
 while those rows are written. In Compose that is `stop_grace_period: 60s`.
 
+`compose.yml` at the root runs the same container under Compose: the image built from this `Dockerfile`, the port
+on loopback, the database on the `dreamgate-data` volume and the container named `dreamgate`, and it sets
+`restart: unless-stopped`, so a crash or a reboot brings the gateway back while a stopped instance stays
+stopped. Start it with `docker compose up -d`; the drain is given the `stop_grace_period: 60s` above, and a
+longer `DREAMGATE_SHUTDOWN_GRACE_SECS` needs a longer one there too. Settings that are secrets are added as an
+`environment` entry or through an `env_file`, which is kept out of the repository.
+
 **systemd.** `deploy/dreamgate.service` is an example unit: the binary in `/usr/local/bin`, the dashboard's
 files in `/opt/dreamgate/web`, the database in the state directory systemd makes for the service, bound to
 loopback for a reverse proxy in front, with `TimeoutStopSec` longer than the drain and the usual hardening.
