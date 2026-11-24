@@ -3,8 +3,9 @@
 # The same container as the `docker run` in the README: the image is the one the Dockerfile at the root
 # builds, the port is published on loopback for a reverse proxy on the same host that terminates TLS, and
 # the database is on the volume that command names, so moving from one to the other keeps it. Stop the
-# container that command made before starting this one (`docker rm -f dreamgate`), because both are named
-# dreamgate; the volume stays.
+# container that command made before starting this one (`docker stop dreamgate && docker rm dreamgate`),
+# because both are named dreamgate; the stop drains it as the run command's stop timeout allows, and the
+# volume stays.
 
 services:
   dreamgate:
@@ -22,9 +23,9 @@ services:
       - "127.0.0.1:8787:8787"
     volumes:
       - dreamgate-data:/data
-    # A setting that is a secret, DREAMGATE_METRICS_TOKEN among them, goes in dreamgate.env beside this
-    # file, which is kept out of the repository, and never as a value written below, because this file is
-    # committed. The systemd unit reads /etc/dreamgate.env the same way.
+    # A setting that is a secret, such as DREAMGATE_METRICS_TOKEN, goes in dreamgate.env beside this file,
+    # which is kept out of the repository, never as a literal here, because this file is committed. The
+    # systemd unit reads /etc/dreamgate.env the same way.
     env_file:
       - path: dreamgate.env
         required: false

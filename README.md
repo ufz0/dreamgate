@@ -95,13 +95,14 @@ while those rows are written. In Compose that is `stop_grace_period: 60s`.
 on loopback, the database on the `dreamgate-data` volume and the container named `dreamgate`, with
 `restart: unless-stopped`, so a crash or a reboot brings the gateway back while a stopped instance stays
 stopped. `docker compose up -d` starts it on a fresh checkout and `docker compose up -d --build` rebuilds it after
-a change to the source or the `Dockerfile`; `docker compose down` removes the container but keeps the volume, and
-`down -v` removes the volume and the database in it. The container the `docker run` above made has the same name, so it is
-removed first (`docker rm -f dreamgate`); that container shares the `dreamgate-data` volume, so removing it keeps
-the database.
+a change to the source or the `Dockerfile`; `docker compose down` removes the container but keeps the volume,
+and `down -v` removes the volume and the database in it. The container the `docker run` above made has the
+same name, so it is stopped and removed first (`docker stop dreamgate && docker rm dreamgate`), which drains it
+as the stop timeout the run command gave it allows, rather than killing it with the last rows unwritten; that
+container shares the `dreamgate-data` volume, so removing it keeps the database.
 
-A longer `DREAMGATE_SHUTDOWN_GRACE_SECS` than the default needs a longer `stop_grace_period` there too.
-`DREAMGATE_ADDR` is left at the image's `0.0.0.0:8787`: the port is published on the host's loopback, and a
+A longer `DREAMGATE_SHUTDOWN_GRACE_SECS` than the default needs a longer `stop_grace_period` in `compose.yml`
+too. `DREAMGATE_ADDR` is left at the image's `0.0.0.0:8787`: the port is published on the host's loopback, and a
 gateway bound to the container's own loopback would not receive what Docker forwards to it. Settings that are
 secrets are read from `dreamgate.env` beside the file, which is kept out of the repository, rather than written
 into `compose.yml` itself.
