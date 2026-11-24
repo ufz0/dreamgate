@@ -92,19 +92,28 @@ seconds — up to ten for the connections still open and five for the last rows 
 while those rows are written. In Compose that is `stop_grace_period: 60s`.
 
 `compose.yml` at the root runs the same container under Compose: the image built from this `Dockerfile`, the port
-on loopback, the database on the `dreamgate-data` volume and the container named `dreamgate`, and it sets
+on loopback, the database on the `dreamgate-data` volume and the container named `dreamgate`, with
 `restart: unless-stopped`, so a crash or a reboot brings the gateway back while a stopped instance stays
-stopped. Start it with `docker compose up -d`; the drain is given the `stop_grace_period: 60s` above, and a
-longer `DREAMGATE_SHUTDOWN_GRACE_SECS` needs a longer one there too. Settings that are secrets are added as an
-`environment` entry or through an `env_file`, which is kept out of the repository.
+stopped. `docker compose up -d` starts it on a fresh checkout and `docker compose up -d --build` rebuilds it after
+a change to the source or the `Dockerfile`; `docker compose down` removes the container but keeps the volume, and
+`down -v` removes the volume and the database in it. The container the `docker run` above made has the same name, so it is
+removed first (`docker rm -f dreamgate`); that container shares the `dreamgate-data` volume, so removing it keeps
+the database.
+
+A longer `DREAMGATE_SHUTDOWN_GRACE_SECS` than the default needs a longer `stop_grace_period` there too.
+`DREAMGATE_ADDR` is left at the image's `0.0.0.0:8787`: the port is published on the host's loopback, and a
+gateway bound to the container's own loopback would not receive what Docker forwards to it. Settings that are
+secrets are read from `dreamgate.env` beside the file, which is kept out of the repository, rather than written
+into `compose.yml` itself.
 
 **systemd.** `deploy/dreamgate.service` is an example unit: the binary in `/usr/local/bin`, the dashboard's
 files in `/opt/dreamgate/web`, the database in the state directory systemd makes for the service, bound to
 loopback for a reverse proxy in front, with `TimeoutStopSec` longer than the drain and the usual hardening.
 Settings that are secrets go in `/etc/dreamgate.env`, mode 0600, which the unit reads if it is there.
 
-**Behind a reverse proxy.** DreamGate does not terminate TLS itself, so a production instance sits behind a
-proxy that does, with `DREAMGATE_ADDR=127.0.0.1:8787` so only the proxy reaches it. Three things matter to the
+**Behind a reverse proxy.** DreamGate does not terminate TLS itself, so a production instance that runs
+directly on the host sits behind a proxy that does, with `DREAMGATE_ADDR=127.0.0.1:8787` so only the proxy
+reaches it; in Docker the publication on the host's loopback does that, as above. Three things matter to the
 proxy: it has to pass a stream on as it arrives rather than buffer it, it has to wait at least as long as a
 stream may go quiet (`DREAMGATE_STREAM_STALL_SECS`) and as long as a single answer may take, which sends nothing
 until it is done (`DREAMGATE_REQUEST_TIMEOUT_SECS`), both 120 by default, and it has to send
