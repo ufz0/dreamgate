@@ -91,21 +91,28 @@ which starts the drain (see Stopping); the stop timeout has to be longer than th
 seconds — up to ten for the connections still open and five for the last rows — or Docker kills the process
 while those rows are written. In Compose that is `stop_grace_period: 60s`.
 
-`compose.yml` at the root runs the same container under Compose: the image built from this `Dockerfile`, the port
-on loopback, the database on the `dreamgate-data` volume and the container named `dreamgate`, with
-`restart: unless-stopped`, so a crash or a reboot brings the gateway back while a stopped instance stays
-stopped. `docker compose up -d` starts it on a fresh checkout and `docker compose up -d --build` rebuilds it after
-a change to the source or the `Dockerfile`; `docker compose down` removes the container but keeps the volume,
-and `down -v` removes the volume and the database in it. The container the `docker run` above made has the
-same name, so it is stopped and removed first (`docker stop dreamgate && docker rm dreamgate`), which drains it
-as the stop timeout the run command gave it allows, rather than killing it with the last rows unwritten; that
-container shares the `dreamgate-data` volume, so removing it keeps the database.
+`compose.yml` at the root runs the same container under Compose: the image built from this `Dockerfile` and the
+container named `dreamgate`, with `restart: unless-stopped`, so a crash or a reboot brings the gateway back while
+a stopped instance stays stopped. It publishes the port on every interface, not on loopback as the `docker run`
+above does, and it keeps the database in `./data` beside the file, bind-mounted at `/data`; that directory has
+to exist and be writable by uid 10001 before the first start, because Docker makes a missing one `root:root`, so
+create it with `mkdir -p data && chown -R 10001:10001 data` as root on a fresh checkout. It stays on the host
+when the container is removed, and `docker compose down` removes the container and leaves `./data` where it was.
+`docker compose up -d` starts it once that directory is writable and `docker compose up -d --build` rebuilds it
+after a change to the source or the `Dockerfile`.
+
+The container the `docker run` above made has the same name, so it is stopped and removed before Compose starts;
+its database is in the `dreamgate-data` volume, not in `./data`, so the two paths keep separate databases. To
+keep the one the `docker run` made, stop it first (`docker stop dreamgate`), which drains it as the stop timeout
+the run command gave it allows, rather than killing it with the last rows unwritten, then copy the directory
+across (`mkdir -p data && docker cp dreamgate:/data/. data/`), remove the container (`docker rm dreamgate`), and
+make the copy writable by uid 10001 as above. The volume keeps a second copy then, which `docker volume
+rm dreamgate-data` removes if the `docker run` path is not used again.
 
 A longer `DREAMGATE_SHUTDOWN_GRACE_SECS` than the default needs a longer `stop_grace_period` in `compose.yml`
-too. `DREAMGATE_ADDR` is left at the image's `0.0.0.0:8787`: the port is published on the host's loopback, and a
-gateway bound to the container's own loopback would not receive what Docker forwards to it. Settings that are
-secrets are read from `dreamgate.env` beside the file, which is kept out of the repository, rather than written
-into `compose.yml` itself.
+too. `DREAMGATE_ADDR` is left at the image's `0.0.0.0:8787`: a gateway bound to the container's own loopback
+would not receive what Docker forwards to it. Settings that are secrets are read from `dreamgate.env` beside
+the file if it is there, which is kept out of the repository, rather than written into `compose.yml` itself.
 
 **systemd.** `deploy/dreamgate.service` is an example unit: the binary in `/usr/local/bin`, the dashboard's
 files in `/opt/dreamgate/web`, the database in the state directory systemd makes for the service, bound to
@@ -114,10 +121,12 @@ Settings that are secrets go in `/etc/dreamgate.env`, mode 0600, which the unit 
 
 **Behind a reverse proxy.** DreamGate does not terminate TLS itself, so a production instance that runs
 directly on the host sits behind a proxy that does, with `DREAMGATE_ADDR=127.0.0.1:8787` so only the proxy
-reaches it; in Docker the publication on the host's loopback does that, as above. Three things matter to the
-proxy: it has to pass a stream on as it arrives rather than buffer it, it has to wait at least as long as a
-stream may go quiet (`DREAMGATE_STREAM_STALL_SECS`) and as long as a single answer may take, which sends nothing
-until it is done (`DREAMGATE_REQUEST_TIMEOUT_SECS`), both 120 by default, and it has to send
+reaches it; in Docker the `docker run` above publishes the port on the host's loopback, and `compose.yml`
+publishes it on every interface, which Docker's own rules open past a host firewall; publish
+`127.0.0.1:8787:8787` there, or add a rule to Docker's own chain, to keep it to the proxy's path. Three things
+matter to the proxy: it has to pass a stream on as it arrives rather than buffer it, it has to wait at least as
+long as a stream may go quiet (`DREAMGATE_STREAM_STALL_SECS`) and as long as a single answer may take, which
+sends nothing until it is done (`DREAMGATE_REQUEST_TIMEOUT_SECS`), both 120 by default, and it has to send
 `X-Forwarded-Proto`, which is how the session cookie is marked `Secure`. Both kinds of event stream
 already send `X-Accel-Buffering: no`, which nginx reads per response. Caddy does all of it as it is:
 
@@ -159,7 +168,7 @@ secret: it holds every DreamGate key and every upstream key in the clear. With t
 `deploy/dreamgate-backup.service` and `deploy/dreamgate-backup.timer` take one a day into
 `/var/backups/dreamgate`, which they make, and remove the copies older than two weeks; in Docker, `docker exec
 dreamgate dreamgate backup /data/backup.db`, then `docker cp dreamgate:/data/backup.db .` to take it off the
-volume the database is on, and remove it from there.
+container, and `docker exec dreamgate rm /data/backup.db`, which leaves the directory the database is in.
 
 **Restoring.** Stop the gateway first, and make sure no `dreamgate.db-wal` or `dreamgate.db-shm` is left beside
 the database: a database put in place under a write-ahead log that belongs to another one is how SQLite

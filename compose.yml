@@ -1,42 +1,14 @@
-# docker compose up -d
-#
-# The same container as the `docker run` in the README: the image is the one the Dockerfile at the root
-# builds, the port is published on loopback for a reverse proxy on the same host that terminates TLS, and
-# the database is on the volume that command names, so moving from one to the other keeps it. Stop the
-# container that command made before starting this one (`docker stop dreamgate && docker rm dreamgate`),
-# because both are named dreamgate; the stop drains it as the run command's stop timeout allows, and the
-# volume stays.
-
 services:
   dreamgate:
     build: .
     image: dreamgate
-    # Named for the `docker exec dreamgate dreamgate backup ...` the README gives.
     container_name: dreamgate
-    # Back after a crash or a reboot, but not after `docker compose stop` or `down`, which is how an
-    # instance someone stopped stays stopped.
     restart: unless-stopped
     ports:
-      # On every interface this is plain HTTP, passwords and session cookies included, and Docker's own
-      # rules open it past a host firewall. The image listens on 0.0.0.0:8787 for it; a DREAMGATE_ADDR that
-      # bound the container's own loopback would not receive what Docker forwards here.
-      - "127.0.0.1:8787:8787"
+      - "8787:8787"
     volumes:
-      - dreamgate-data:/data
-    # A setting that is a secret, such as DREAMGATE_METRICS_TOKEN, goes in dreamgate.env beside this file,
-    # which is kept out of the repository, never as a literal here, because this file is committed. The
-    # systemd unit reads /etc/dreamgate.env the same way.
+      - ./data:/data
     env_file:
       - path: dreamgate.env
         required: false
-    # Has to be longer than DREAMGATE_SHUTDOWN_GRACE_SECS (30 by default) plus fifteen seconds: up to ten
-    # for the connections still open and five for the last rows. Compose's default of ten seconds would
-    # kill the process while those rows are written, and a raised grace window needs a longer one here.
     stop_grace_period: 60s
-
-volumes:
-  # The name the documented `docker run` gives it, so the two share one database rather than leaving one
-  # behind in a volume Compose would have prefixed with the project's name. Plain `docker compose down`
-  # keeps it; `down -v` removes it and the database in it.
-  dreamgate-data:
-    name: dreamgate-data
